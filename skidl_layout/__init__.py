@@ -74,3 +74,11 @@ from .scoring import LayoutScore, score_placement, score_placement_quick
 from .spatial import SpatialGrid
 from .validator import ValidationResult, find_kicad_cli, run_kicad_drc, validate
 from .writer import PlacedPart, load_footprint_bboxes, parse_fp_lib_table, validate_footprints, write_kicad_pcb
+from .metrics import (
+    LayoutMetrics,
+    discover_footprint_dir,
+    discover_symbol_dir,
+    evaluate_circuit,
+    evaluate_circuit_dir,
+    summary_table,
+)

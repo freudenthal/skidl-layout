@@ -20,9 +20,17 @@ imports internally and reaches skidl core only via `skidl.net.NCNet` and
 
 Original SKiDL authorship (the `skidl` dependency): Dave Vandenbout.
 
+## `skidl_layout/metrics.py`
+
+Adapted from Lachlan Fysh's `benchmarks/evaluate_layout.py` and
+`benchmarks/score.py` (same repo/commit as the engine above). Reworked to drive
+this package's high-level `plan_layout` entry (which already computes HPWL) and
+to auto-discover KiCad libraries instead of hardcoded `/usr/share/kicad` paths.
+
 ## Packaging / integration
 
-- John Freudenthal — peer-package scaffolding and circ-synth integration.
+- John Freudenthal — peer-package scaffolding, the `metrics` adaptation, and
+  circ-synth integration.
 
 Both the upstream SKiDL project and Lachlan's fork are MIT-licensed; see
 `LICENSE`.

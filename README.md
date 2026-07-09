@@ -46,6 +46,26 @@ result = plan_layout(circuit)      # LayoutResult: scored placement, no copper
 attributes (defensively, via `getattr`) — the same loop-boundary shape the
 circ-synth SPICE path uses.
 
+## Layout-quality metrics
+
+`skidl_layout.metrics` scores a placement quantitatively (adapted from the
+upstream `benchmarks/evaluate_layout.py` + `score.py`):
+
+```python
+from skidl_layout import evaluate_circuit
+m = evaluate_circuit(circuit)      # LayoutMetrics
+print(m.layout_ok, m.overlaps, m.outline_violations,
+      m.missing_refs, m.hpwl_total_mm, m.layout_score)  # 0-100
+```
+
+- `evaluate_circuit(circuit, *, write_pcb_path=...)` — plan a layout and return
+  a `LayoutMetrics` (overlaps, outline violations, missing refs, total HPWL,
+  placed-part count, plus a 0-100 `layout_score`); optionally emit a `.kicad_pcb`.
+- `evaluate_circuit_dir(dir)` / `python -m skidl_layout.metrics <dir>` — execute
+  a generated `<dir>/circuit.py`, score its layout, and write `layout_score.json`
+  (+ `board.kicad_pcb`). KiCad symbol/footprint libraries are auto-discovered.
+- `summary_table(rows)` — markdown scoreboard for a batch of boards.
+
 ## Optional external tools
 
 - **KiCad `kicad-cli`** — DRC feedback (`validator.run_kicad_drc`,
