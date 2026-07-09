@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+# scratch test-run artifacts
+out.txt
+err.txt
+*_out.txt
+*_err.txt
+hier_out.txt
+hier_err.txt
+smoke_*.kicad_pcb
+# skidl ERC run artifacts
+*.erc
+*.log
