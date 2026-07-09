@@ -30,7 +30,7 @@ to auto-discover KiCad libraries instead of hardcoded `/usr/share/kicad` paths.
 ## Packaging / integration
 
 - John Freudenthal — peer-package scaffolding, the `metrics` adaptation, and
-  circ-synth integration.
+  circuit-synth integration.
 
 Both the upstream SKiDL project and Lachlan's fork are MIT-licensed; see
 `LICENSE`.

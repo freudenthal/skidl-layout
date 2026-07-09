@@ -6,14 +6,12 @@ circuits, packaged as a standalone peer tool.
 This is a code-only snapshot of the `layout/` package from
 [`lachlanfysh/skidl`](https://github.com/lachlanfysh/skidl) (commit
 `11e45996`), lifted into its own package so it can be used as an external tool
-over a SKiDL `Circuit` — matching the "keep placement/routing/sim external,
-driven via netlist/CLI/MCP" direction from
-[devbisme/skidl #315](https://github.com/devbisme/skidl/discussions/315). See
-[`AUTHORS.md`](AUTHORS.md) for full provenance.
+over a SKiDL `Circuit`, keeping placement / routing / sim as external tools
+driven via netlist / CLI / MCP. See [`AUTHORS.md`](AUTHORS.md) for full
+provenance.
 
-It is **complementary** to the circ-synth schematic path: circ-synth emits a
-schematic + netlist; `skidl-layout` consumes the same SKiDL `Circuit` and plans
-a board placement.
+It is **complementary** to a schematic-generation path: given a SKiDL `Circuit`,
+`skidl-layout` consumes the same object and plans a board placement.
 
 ## What it does
 
@@ -44,7 +42,7 @@ result = plan_layout(circuit)      # LayoutResult: scored placement, no copper
 
 `plan_layout(circuit, ...)` reads only `circuit.parts` and duck-typed `Part`
 attributes (defensively, via `getattr`) — the same loop-boundary shape the
-circ-synth SPICE path uses.
+SPICE path uses.
 
 ## Layout-quality metrics
 
@@ -85,5 +83,5 @@ for this layout-only package.
 
 ## Status
 
-Local, unpublished peer package. Not pushed anywhere; no PR to devbisme/skidl or
-lachlanfysh/skidl without explicit maintainer permission.
+A standalone peer package derived from the MIT-licensed `layout/` snapshot; see
+[`AUTHORS.md`](AUTHORS.md) and [`LICENSE`](LICENSE) for provenance and terms.
