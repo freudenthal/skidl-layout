@@ -24,11 +24,22 @@ It is **complementary** to a schematic-generation path: given a SKiDL `Circuit`,
 
 ## Install
 
+Editable install from local checkouts (Python 3.10+; verified on 3.13). Run from
+**inside this `skidl-layout/` directory** — the `../skidl` path assumes the flat
+layout where the `skidl` fork checkout sits directly beside this one. The base
+dependency is the **`skidl` fork** (the KiCad-10 backend the loop uses is not on
+PyPI), so install it editable from the sibling checkout:
+
 ```bash
-pip install -e .            # core (skidl + simp_sexp)
-pip install -e ".[shapely]" # exact polygon containment in the validator
-pip install -e ".[test]"    # pytest
+uv venv --python 3.13 .venv
+uv pip install -e ../skidl        # the fork (Circuit/Part/Net loop-boundary + KICAD10)
+uv pip install -e .               # skidl-layout core (adds simp_sexp)
+uv pip install -e ".[shapely]"    # exact polygon containment in the validator
+uv pip install -e ".[test]"       # pytest
 ```
+
+(plain `pip` works the same in an activated venv. If you already built the
+`skidl-eda` environment, that venv has `skidl-layout` installed too.)
 
 ## Usage sketch
 
