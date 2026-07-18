@@ -387,8 +387,70 @@ def _count_segment_crossings_loop(segments) -> int:
     return crossings
 
 
+# Vectorize only when the O(S^2) loop actually costs something.
+_VECTORIZED_CROSSINGS_MIN = 40
+
+
+def _count_segment_crossings_numpy(segments):
+    """Vectorized exact equivalent of _count_segment_crossings_loop.
+
+    Returns the crossing count, or None if numpy is unavailable so the caller
+    falls back to the loop. Mirrors _segment_intersects exactly: a pair counts
+    iff o1*o2 < 0 and o3*o4 < 0 (strict — collinear/touching never counts). The
+    orientation products are computed in the same operand order as the scalar
+    predicate, so the float64 result is bit-identical.
+    """
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    n = len(segments)
+    # Endpoints and integer ref ids per segment.
+    a1x = np.empty(n); a1y = np.empty(n)
+    a2x = np.empty(n); a2y = np.empty(n)
+    ref_ids: dict[str, int] = {}
+    sa = np.empty(n, dtype=np.int64)
+    sb = np.empty(n, dtype=np.int64)
+    for i, (a_ref, b_ref, p1, p2) in enumerate(segments):
+        a1x[i], a1y[i] = p1
+        a2x[i], a2y[i] = p2
+        sa[i] = ref_ids.setdefault(a_ref, len(ref_ids))
+        sb[i] = ref_ids.setdefault(b_ref, len(ref_ids))
+
+    dx = a2x - a1x            # (S,) segment direction x
+    dy = a2y - a1y            # (S,) segment direction y
+
+    # [i,j] deltas. dA1{x,y}[i,j] = A1[j] - A1[i]; b{x,y}[i,j] = A2[i] - A1[j].
+    dA1x = a1x[None, :] - a1x[:, None]
+    dA1y = a1y[None, :] - a1y[:, None]
+    dA2x1 = a2x[None, :] - a1x[:, None]
+    dA2y1 = a2y[None, :] - a1y[:, None]
+    bx = a2x[:, None] - a1x[None, :]
+    by = a2y[:, None] - a1y[None, :]
+
+    o1 = dx[:, None] * dA1y - dy[:, None] * dA1x   # orient(a1_i,a2_i, a1_j)
+    o2 = dx[:, None] * dA2y1 - dy[:, None] * dA2x1  # orient(a1_i,a2_i, a2_j)
+    o3 = -dx[None, :] * dA1y + dy[None, :] * dA1x   # orient(a1_j,a2_j, a1_i)
+    o4 = dx[None, :] * by - dy[None, :] * bx        # orient(a1_j,a2_j, a2_i)
+
+    cross = (o1 * o2 < 0) & (o3 * o4 < 0)
+    shared = (
+        (sa[:, None] == sa[None, :])
+        | (sa[:, None] == sb[None, :])
+        | (sb[:, None] == sa[None, :])
+        | (sb[:, None] == sb[None, :])
+    )
+    hits = cross & ~shared
+    return int(np.triu(hits, k=1).sum())
+
+
 def _count_segment_crossings(segments) -> int:
     """Exact star-topology crossing count. Pairs sharing a ref are skipped."""
+    if len(segments) >= _VECTORIZED_CROSSINGS_MIN:
+        vectorized = _count_segment_crossings_numpy(segments)
+        if vectorized is not None:
+            return vectorized
     return _count_segment_crossings_loop(segments)
 
 

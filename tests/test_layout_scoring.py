@@ -584,3 +584,53 @@ def test_ctx_cached_quick_score_is_numerically_identical():
     no_ctx = score_placement_quick(placed, circuit, BBOXES, outline=outline)
     with_ctx = score_placement_quick(placed, circuit, BBOXES, outline=outline, ctx=ctx)
     assert no_ctx.to_dict() == with_ctx.to_dict()
+
+
+def test_vectorized_crossings_matches_reference():
+    import random
+
+    from skidl_layout.scoring import (
+        _count_segment_crossings_loop,
+        _count_segment_crossings_numpy,
+    )
+
+    rng = random.Random(20260718)
+    refs = ["U1", "R1", "R2", "C1", "C2", "J1", "Q1", "D1"]
+
+    for trial in range(200):
+        n = rng.randint(2, 60)
+        # Small integer grid maximizes collinear / shared-endpoint / touching
+        # degenerate cases; occasional zero-length segments.
+        coords = [0.0, 1.0, 2.0, 3.0]
+        segments = []
+        for _ in range(n):
+            a_ref = rng.choice(refs)
+            b_ref = rng.choice(refs)
+            p1 = (rng.choice(coords), rng.choice(coords))
+            p2 = p1 if rng.random() < 0.1 else (rng.choice(coords), rng.choice(coords))
+            segments.append((a_ref, b_ref, p1, p2))
+
+        loop = _count_segment_crossings_loop(segments)
+        vec = _count_segment_crossings_numpy(segments)
+        assert vec is not None, "numpy expected in test env"
+        assert vec == loop, (trial, n, loop, vec)
+
+
+def test_vectorized_crossings_handles_edge_cases():
+    from skidl_layout.scoring import (
+        _count_segment_crossings_loop,
+        _count_segment_crossings_numpy,
+    )
+
+    cases = [
+        [],
+        [("A", "B", (0.0, 0.0), (0.0, 0.0))],  # single zero-length
+        # collinear overlapping (touching) -> not a proper crossing
+        [("A", "B", (0.0, 0.0), (2.0, 0.0)), ("C", "D", (1.0, 0.0), (3.0, 0.0))],
+        # shared endpoint ref -> skipped
+        [("A", "B", (0.0, 0.0), (2.0, 2.0)), ("A", "C", (0.0, 2.0), (2.0, 0.0))],
+        # clean proper crossing
+        [("A", "B", (0.0, 0.0), (2.0, 2.0)), ("C", "D", (0.0, 2.0), (2.0, 0.0))],
+    ]
+    for segments in cases:
+        assert _count_segment_crossings_numpy(segments) == _count_segment_crossings_loop(segments)
