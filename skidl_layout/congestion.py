@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 from .constraints import BoardOutline, KeepOut
 from .power import PowerRoutePlan, plan_power_routes
-from .roles import GND_NET_RE, POWER_NET_RE, classify_parts
+from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_nc_net
 from .writer import PlacedPart
 
 
@@ -176,14 +176,10 @@ def _net_refs(
         return result
     if circuit is None:
         return []
-    try:
-        from skidl.net import NCNet
-    except Exception:
-        NCNet = None
 
     result = []
     for net in circuit.get_nets():
-        if NCNet is not None and isinstance(net, NCNet):
+        if is_nc_net(net):
             continue
         name = str(getattr(net, "name", "") or "")
         refs = []

@@ -61,6 +61,35 @@ CONNECTOR_METADATA_RE = re.compile(
 )
 
 
+# The NCNet class, cached once at import (roles sits at the bottom of the
+# skidl_layout import graph, so importing skidl here creates no cycle). The
+# lookup is a plain module attribute — cheaper than the old per-call
+# ``from skidl.net import NCNet`` inside every hot net-walk loop.
+try:
+    from skidl.net import NCNet as _NCNet
+except Exception:  # pragma: no cover - skidl always present in practice
+    _NCNet = None
+
+
+def is_nc_net(net) -> bool:
+    """Duck-typed no-connect test used everywhere in place of
+    ``isinstance(net, NCNet)``.
+
+    A :class:`skidl_layout.snapshot.SnapshotNet` carries an explicit
+    ``is_ncnet`` marker (it can never be a live ``NCNet`` instance); a live net
+    still falls through to the real ``isinstance`` check, so behaviour is
+    identical on the sequential path.
+    """
+    # ``is True`` (not just truthy) so a MagicMock net — whose ``is_ncnet``
+    # attribute auto-vivifies to a truthy Mock — is not mistaken for an NC net.
+    # SnapshotNet always stores a real bool here.
+    if getattr(net, "is_ncnet", False) is True:
+        return True
+    if _NCNet is None:
+        return False
+    return isinstance(net, _NCNet)
+
+
 @dataclass
 class PartRole:
     ref: str
@@ -104,17 +133,12 @@ def _pin_count(part) -> int:
 
 def pin_net_names(part) -> list[str]:
     names = []
-    try:
-        from skidl.net import NCNet
-
-        for pin in getattr(part, "pins", []) or []:
-            net = getattr(pin, "net", None)
-            if net is not None and not isinstance(net, NCNet):
-                name = getattr(net, "name", None)
-                if name:
-                    names.append(str(name))
-    except Exception:
-        pass
+    for pin in getattr(part, "pins", []) or []:
+        net = getattr(pin, "net", None)
+        if net is not None and not is_nc_net(net):
+            name = getattr(net, "name", None)
+            if name:
+                names.append(str(name))
     return names
 
 

@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass, field
 
 from .geometry import FootprintGeometry
+from .roles import is_nc_net
 from .writer import PlacedPart
 
 
@@ -355,13 +356,11 @@ def _compute_hpwl(
     placed: list[PlacedPart],
     circuit,
 ) -> list[tuple[str, float, list[str]]]:
-    from skidl.net import NCNet
-
     pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed}
     net_hpwl: list[tuple[str, float]] = []
 
     for net in circuit.get_nets():
-        if isinstance(net, NCNet):
+        if is_nc_net(net):
             continue
         xs, ys = [], []
         refs = []

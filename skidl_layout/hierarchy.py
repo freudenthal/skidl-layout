@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from skidl.net import NCNet
 from skidl.node import HIER_SEP
+
+from .roles import is_nc_net
 
 
 __all__ = ["PlacementGroup", "extract_groups"]
@@ -37,7 +38,7 @@ def extract_groups(circuit) -> dict:
         groups[key].parts.append(part)
 
     for net in circuit.nets:
-        if isinstance(net, NCNet):
+        if is_nc_net(net):
             continue
         pins = net.get_pins()
         parts_on_net = {pin.part for pin in pins if pin.part is not None}

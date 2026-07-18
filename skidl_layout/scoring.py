@@ -16,6 +16,7 @@ from .roles import (
     _alpha_tokens,  # re-exported for backward compat (defined in roles.py)
     _part_tokens,  # re-exported for backward compat (defined in roles.py)
     classify_parts,
+    is_nc_net,
     is_ui_grid_part,
     pin_net_names,
 )
@@ -148,14 +149,10 @@ def _net_ref_lists(circuit, ctx=None) -> list[tuple[str, list[str]]]:
         return ctx.net_ref_lists
     if circuit is None:
         return []
-    try:
-        from skidl.net import NCNet
-    except Exception:
-        NCNet = None
 
     result: list[tuple[str, list[str]]] = []
     for net in circuit.get_nets():
-        if NCNet is not None and isinstance(net, NCNet):
+        if is_nc_net(net):
             continue
         name = str(getattr(net, "name", "") or "")
         refs: list[str] = []
@@ -662,16 +659,11 @@ def _front_panel_trace_metrics(
     if not front_panel_refs:
         return {"count": 0, "span_mm": 0.0, "warnings": []}
 
-    try:
-        from skidl.net import NCNet
-    except Exception:
-        NCNet = None
-
     count = 0
     total_span = 0.0
     warnings: list[str] = []
     for net in circuit.get_nets():
-        if NCNet is not None and isinstance(net, NCNet):
+        if is_nc_net(net):
             continue
         refs: list[str] = []
         for pin in net.get_pins():

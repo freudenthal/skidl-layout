@@ -8,6 +8,7 @@ from .roles import (
     PartRole,
     _part_tokens,
     classify_parts,
+    is_nc_net,
     pin_net_names,
 )
 
@@ -116,14 +117,10 @@ def _build_net_ref_lists(circuit) -> list[tuple[str, list[str]]]:
     per-placement filter (positions vary; topology does not)."""
     if circuit is None:
         return []
-    try:
-        from skidl.net import NCNet
-    except Exception:
-        NCNet = None
 
     result: list[tuple[str, list[str]]] = []
     for net in circuit.get_nets():
-        if NCNet is not None and isinstance(net, NCNet):
+        if is_nc_net(net):
             continue
         name = str(getattr(net, "name", "") or "")
         refs: list[str] = []

@@ -13,7 +13,7 @@ from .constraints import (
     LayoutConstraints,
 )
 from .hierarchy import PlacementGroup
-from .roles import DECAP_VALUE_RE, GND_NET_RE, POWER_NET_RE, is_ui_grid_part
+from .roles import DECAP_VALUE_RE, GND_NET_RE, POWER_NET_RE, is_nc_net, is_ui_grid_part
 from .spatial import SpatialGrid
 from .writer import PlacedPart
 
@@ -39,16 +39,12 @@ def _footprint_name(part) -> str:
 
 def _pin_net_names(part) -> list[str]:
     names = []
-    try:
-        from skidl.net import NCNet
-        for pin in part.pins:
-            net = getattr(pin, 'net', None)
-            if net is not None and not isinstance(net, NCNet):
-                name = getattr(net, 'name', None)
-                if name:
-                    names.append(name)
-    except Exception:
-        pass
+    for pin in part.pins:
+        net = getattr(pin, 'net', None)
+        if net is not None and not is_nc_net(net):
+            name = getattr(net, 'name', None)
+            if name:
+                names.append(name)
     return names
 
 

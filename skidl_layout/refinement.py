@@ -8,7 +8,7 @@ from .candidates import PlacementCandidate
 from .constraints import LayoutConstraints
 from .geometry import FootprintGeometry, PadGeometry, transform_point
 from .placer import _find_clear_position, _overlaps_any
-from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_ui_grid_part
+from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_nc_net, is_ui_grid_part
 from .scoring import LayoutScore, _net_ref_lists, score_placement
 from .validator import _same_physical_side, _through_board_pads_collide, validate
 from .writer import PlacedPart
@@ -915,13 +915,8 @@ def _ref_neighbors(circuit, placed_by_ref: dict[str, PlacedPart]):
     if circuit is None:
         return neighbors, degrees
 
-    try:
-        from skidl.net import NCNet
-    except Exception:
-        NCNet = None
-
     for net in circuit.get_nets():
-        if NCNet is not None and isinstance(net, NCNet):
+        if is_nc_net(net):
             continue
         refs: list[str] = []
         for pin in net.get_pins():
