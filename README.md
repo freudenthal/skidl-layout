@@ -74,25 +74,29 @@ refined. The seed score is a heuristic predictor, not the refined quality — us
 it for iteration, not the final board. `max_candidates` composes with
 `candidate_names` (filter first, then cap).
 
-To keep the full breadth but spend less wall-clock, refine the unique
-candidates concurrently with `plan_layout(circuit, parallel_workers=4)` (or set
-`SKIDL_LAYOUT_PARALLEL=4`; an explicit kwarg wins, and only a value `>= 2`
-engages it). The same knob parallelizes **both** heavy phases — the pass-1
-refinement trio and the finalize / post-anchor pass — each running the unique
-candidates in a `spawn` worker pool over a picklable snapshot of the circuit, so
-the **output is identical to the sequential default** — this is a speed knob,
-not a quality one — and any worker/pickling error falls back silently to the
-sequential path. Two caveats on Windows/`spawn`:
+To keep the full breadth but spend less wall-clock, the unique candidates are
+refined concurrently. **This is the default on boards of 30 parts or more**
+(`min(4, cpu_count)` workers) — no knob needed. The parallel path covers
+**both** heavy phases — the pass-1 refinement trio and the finalize /
+post-anchor pass — each running the unique candidates over a picklable snapshot
+of the circuit, so the **output is identical to the sequential default** — this
+is a speed knob, not a quality one — and any worker/pickling/subprocess error
+falls back silently to the sequential path.
 
-- **The calling script must be import-safe** — wrap its top level in
-  `if __name__ == "__main__":`. `multiprocessing` re-imports the script in every
-  worker; an unguarded script would re-enter `plan_layout` recursively.
+- **Kill switch:** `plan_layout(circuit, parallel_workers=1)` (or
+  `SKIDL_LAYOUT_PARALLEL=1`) forces the fully sequential path.
+- **Override:** `parallel_workers=N` / `SKIDL_LAYOUT_PARALLEL=N` sets the worker
+  count explicitly and is honored regardless of part count. Precedence is
+  explicit kwarg > env > implicit default; only a resolved value `>= 2` (with
+  `>= 2` unique candidates) engages parallelism.
+- **No `__main__` guard required.** Workers are plain
+  `python -m skidl_layout._worker_main` subprocesses that never re-import the
+  calling script (round-7 WS25), so unguarded driver scripts are safe.
 - Per-ref `progress` lines are suppressed in parallel mode (candidate-level
   messages still emit).
 
 `parallel_workers` composes with `candidate_names` / `max_candidates` (the cap
-happens first, then the survivors refine in parallel). The default is fully
-sequential.
+happens first, then the survivors refine in parallel).
 
 When redirecting output, run with `python -u` and pass a `progress=` callback
 (below) so a long placement stays observable.

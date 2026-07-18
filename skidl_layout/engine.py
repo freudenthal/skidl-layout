@@ -3496,6 +3496,13 @@ def _spread_grid_subjects_on_generous_outline(
     return [replacements.get(placed.ref, placed) for placed in placed_parts], moved_refs
 
 
+# Round-7 WS26: implicit default-on threshold. Below this part count the
+# subprocess+interpreter-import overhead (~2-4 s) dwarfs the plan time, so tiny
+# boards and the test suites stay sequential unless an explicit kwarg/env asks
+# for parallelism. An explicit request is always honored regardless of size.
+_PARALLEL_DEFAULT_MIN_PARTS = 30
+
+
 def _resolve_parallel_workers(parallel_workers: int | None) -> int | None:
     """Explicit kwarg wins, else SKIDL_LAYOUT_PARALLEL env default."""
     if parallel_workers is not None:
@@ -3509,6 +3516,25 @@ def _resolve_parallel_workers(parallel_workers: int | None) -> int | None:
                 f"SKIDL_LAYOUT_PARALLEL must be an integer, got {env!r}"
             )
     return None
+
+
+def _effective_parallel_workers(parallel_workers: int | None, circuit) -> int | None:
+    """Resolve the worker count with round-7 WS26 default-on semantics.
+
+    Precedence: explicit kwarg > ``SKIDL_LAYOUT_PARALLEL`` env > implicit
+    default. When neither kwarg nor env is set, engage parallelism implicitly on
+    boards with ``>= _PARALLEL_DEFAULT_MIN_PARTS`` parts using
+    ``min(4, cpu_count)`` workers (4 is where DPSG plateaus; only unique
+    candidates parallelize, so more buys nothing). Smaller boards stay ``None``
+    (sequential). ``parallel_workers=1`` / env ``1`` is the kill switch (returns
+    a value ``< 2`` that the caller's ``>= 2`` engage check leaves sequential).
+    """
+    resolved = _resolve_parallel_workers(parallel_workers)
+    if resolved is None:
+        part_count = len(getattr(circuit, "parts", []) or [])
+        if part_count >= _PARALLEL_DEFAULT_MIN_PARTS:
+            resolved = min(4, os.cpu_count() or 1)
+    return resolved
 
 
 def _refine_candidate_trio(
@@ -3757,18 +3783,21 @@ def plan_layout(
     effect. Placement can take minutes on a large board; a callback that prints
     (with ``flush=True``) makes it observable when stdout is redirected.
 
-    ``parallel_workers`` opts into refining the unique candidates' pass-1 trio
-    (orientation/decap/placement) concurrently in a spawn worker pool. The
-    ``SKIDL_LAYOUT_PARALLEL`` env var is the default; an explicit kwarg wins;
-    only a resolved value ``>= 2`` (with ``>= 2`` unique candidates) engages it.
-    Output is **identical** to the sequential default (each worker refines a
-    picklable :class:`~skidl_layout.snapshot.SnapshotCircuit`, proven
-    byte-identical), and ANY worker/pickling/spawn error falls back silently to
-    the sequential loop. Two caveats: (1) the **calling script must be
-    import-safe** — wrap its top level in ``if __name__ == "__main__":`` —
-    because ``multiprocessing`` on Windows re-imports it in every worker;
-    (2) per-ref ``progress`` lines are suppressed in parallel mode. Default
-    ``None`` stays fully sequential.
+    ``parallel_workers`` controls refining the unique candidates' pass-1 trio
+    (orientation/decap/placement) and their post-anchor finalize concurrently in
+    plain subprocess workers. **Parallelism is the DEFAULT on boards >= 30
+    parts** (``min(4, cpu_count)`` workers); pass ``parallel_workers=1`` (or set
+    ``SKIDL_LAYOUT_PARALLEL=1``) to force sequential — that is the kill switch.
+    Precedence is explicit kwarg > ``SKIDL_LAYOUT_PARALLEL`` env > implicit
+    default; only a resolved value ``>= 2`` (with ``>= 2`` unique candidates)
+    engages it, so tiny boards stay sequential. Output is **identical** to the
+    sequential default (each worker refines a picklable
+    :class:`~skidl_layout.snapshot.SnapshotCircuit`, proven byte-identical), and
+    ANY worker/pickling/subprocess error falls back silently to the sequential
+    loop. The workers are plain ``python -m skidl_layout._worker_main``
+    subprocesses that never re-import the calling script, so **no
+    ``if __name__ == "__main__":`` guard is required** (round-7 WS25). Per-ref
+    ``progress`` lines are suppressed in parallel mode.
     """
     def _emit(message: str) -> None:
         if progress is not None:
@@ -3857,7 +3886,13 @@ def plan_layout(
     # and leaves both phases sequential (byte-identical). `resolved_workers` and
     # `layout_snapshot` are hoisted here so the finalize dispatch below reuses
     # them.
-    resolved_workers = _resolve_parallel_workers(parallel_workers)
+    # Round-7 WS26: default-on. With no explicit kwarg/env, parallelism engages
+    # implicitly on boards >= 30 parts (min(4, cpu_count) workers). Precedence is
+    # kwarg > env > implicit default; parallel_workers=1 / SKIDL_LAYOUT_PARALLEL=1
+    # is the documented kill switch (falls out of the >= 2 engage check). Plain
+    # subprocess workers (WS25) never re-import the calling script, so no
+    # __main__-guard is required.
+    resolved_workers = _effective_parallel_workers(parallel_workers, circuit)
     parallel_enabled = resolved_workers is not None and resolved_workers >= 2
     layout_snapshot = None
     if parallel_enabled:
