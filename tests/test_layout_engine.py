@@ -2480,3 +2480,91 @@ def test_compact_auto_outline_seed_shrinks_visible_mechanical_heavy_circuit():
 
     assert compact.width_mm < seed.width_mm
     assert compact.height_mm < seed.height_mm
+
+
+def _placement_signature(parts):
+    return [
+        (p.ref, round(p.x_mm, 4), round(p.y_mm, 4), round(p.rot_deg, 4))
+        for p in parts
+    ]
+
+
+def test_plan_layout_dedups_identical_candidates():
+    """WS1: candidates whose seed placement + constraints match an
+    already-refined candidate are reused instead of re-refined, and the reused
+    candidate's placement is byte-identical to its canonical."""
+    result = plan_layout(_circuit(), fp_bboxes=BBOXES)
+
+    by_name = {c.name: c for c in result.candidates}
+    reused = [
+        c
+        for c in result.candidates
+        if any("refinement reused" in reason for reason in c.reasons)
+    ]
+    # A plain circuit (no power chains / module sockets / repeated channels)
+    # collapses several strategies onto the same constraints, so dedup must fire.
+    assert reused, "expected at least one deduped candidate"
+
+    for candidate in reused:
+        canon_name = next(
+            reason.split("'")[1]
+            for reason in candidate.reasons
+            if "refinement reused" in reason
+        )
+        canonical = by_name[canon_name]
+        assert _placement_signature(candidate.placed_parts) == (
+            _placement_signature(canonical.placed_parts)
+        )
+
+    # Dedup must not corrupt the selected placement.
+    assert result.validation.ok
+    assert len(result.placed_parts) == len(_circuit().parts)
+
+
+def test_plan_layout_candidate_names_filters_strategies():
+    """WS5: candidate_names restricts which strategies are planned."""
+    result = plan_layout(
+        _circuit(), fp_bboxes=BBOXES, candidate_names=["baseline"]
+    )
+    names = {c.name for c in result.candidates}
+    assert names == {"baseline"}
+    assert result.validation.ok
+
+
+def test_plan_layout_candidate_names_rejects_unknown():
+    with pytest.raises(ValueError, match="unknown candidate name"):
+        plan_layout(
+            _circuit(), fp_bboxes=BBOXES, candidate_names=["does_not_exist"]
+        )
+
+
+def test_plan_layout_candidate_names_env_default(monkeypatch):
+    monkeypatch.setenv("SKIDL_LAYOUT_CANDIDATES", "baseline, connector_edge_first")
+    result = plan_layout(_circuit(), fp_bboxes=BBOXES)
+    assert {c.name for c in result.candidates} == {
+        "baseline",
+        "connector_edge_first",
+    }
+    # explicit kwarg overrides the env var
+    result2 = plan_layout(
+        _circuit(), fp_bboxes=BBOXES, candidate_names=["baseline"]
+    )
+    assert {c.name for c in result2.candidates} == {"baseline"}
+
+
+def test_plan_layout_progress_callback_emits_stages():
+    """WS6: progress callback fires at stage boundaries; default None is silent
+    and unchanged."""
+    messages = []
+    result = plan_layout(
+        _circuit(), fp_bboxes=BBOXES, candidate_names=["baseline"],
+        progress=messages.append,
+    )
+    joined = "\n".join(messages)
+    assert any("candidate strategy" in m for m in messages)
+    assert any("refining baseline" in m for m in messages)
+    assert any(m.startswith("selected 'baseline'") for m in messages)
+    # silent default must produce an identical placement
+    silent = plan_layout(_circuit(), fp_bboxes=BBOXES, candidate_names=["baseline"])
+    sig = lambda r: [(p.ref, round(p.x_mm, 4), round(p.y_mm, 4)) for p in r.placed_parts]
+    assert sig(result) == sig(silent)

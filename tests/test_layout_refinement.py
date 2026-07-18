@@ -4,6 +4,7 @@ import pytest
 
 from skidl_layout.candidates import PlacementCandidate
 from skidl_layout.constraints import (
+    BoardCutout,
     BoardOutline,
     EdgeAnchor,
     FixedPosition,
@@ -15,6 +16,7 @@ from skidl_layout.geometry import FootprintGeometry, PadGeometry
 from skidl_layout.refinement import (
     _best_pin_gravity_trial,
     _is_better,
+    _score,
     refine_candidate_placement,
     refine_placement,
 )
@@ -783,18 +785,44 @@ def test_refinement_passive_pin_gravity_avoids_mounting_hole_and_edge_keepouts()
 
 
 def test_refinement_better_gate_prioritizes_hard_violations():
+    # Hard-violation count dominates: fewer overlaps wins regardless of penalty.
     assert _is_better(
-        LayoutScore(score=60.0, overlap_count=2),
-        LayoutScore(score=55.0, overlap_count=1),
+        LayoutScore(score=60.0, penalty=40.0, overlap_count=2),
+        LayoutScore(score=55.0, penalty=45.0, overlap_count=1),
     )
     assert not _is_better(
-        LayoutScore(score=60.0, overlap_count=1),
-        LayoutScore(score=90.0, overlap_count=2),
+        LayoutScore(score=60.0, penalty=40.0, overlap_count=1),
+        LayoutScore(score=90.0, penalty=10.0, overlap_count=2),
     )
+    # Equal hard count -> lower (raw, unclamped) penalty wins. The score field
+    # is 0-clamped and can tie at 0 on dense boards, so the gate reads penalty.
     assert _is_better(
-        LayoutScore(score=60.0, overlap_count=1),
-        LayoutScore(score=65.0, overlap_count=1),
+        LayoutScore(score=60.0, penalty=40.0, overlap_count=1),
+        LayoutScore(score=65.0, penalty=35.0, overlap_count=1),
     )
+
+
+def test_score_reports_unclamped_penalty_invariant():
+    """WS3: LayoutScore carries the raw penalty, and score == clamp(100-penalty)."""
+    circuit = _connected_circuit()
+    constraints = LayoutConstraints(outline=BoardOutline(100.0, 50.0))
+    placed = [
+        PlacedPart("U1", 30.0, 25.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 45.0, 25.0, 0.0, "Package_QFP:MCU"),
+    ]
+    s = _score(placed, circuit, BBOXES, constraints, None, 0.5, 2)
+    assert s.penalty >= 0.0
+    assert s.score == pytest.approx(max(0.0, 100.0 - s.penalty))
+
+
+def test_is_better_keeps_gradient_when_score_clamps_to_zero():
+    """WS3 core: on a saturated board both placements clamp to score 0.0, but the
+    refiner must still prefer the lower-penalty one via the raw penalty."""
+    worse = LayoutScore(score=0.0, penalty=180.0, overlap_count=0)
+    better = LayoutScore(score=0.0, penalty=140.0, overlap_count=0)
+    # Old (clamped-score) gate: 0.0 > 0.0 is False -> blind. New gate: penalty wins.
+    assert _is_better(worse, better)
+    assert not _is_better(better, worse)
 
 
 def test_refinement_legalizes_overlap_without_net_centroid():
@@ -1044,3 +1072,29 @@ def test_refinement_is_deterministic():
 
     assert _signature(first.placed_parts) == _signature(second.placed_parts)
     assert first.final_score == pytest.approx(second.final_score)
+
+
+def test_refinement_score_sees_cutout_violations():
+    """WS2 regression: the refinement _score must pass constraints.cutouts to
+    score_placement, or the local search is blind to a part sitting on a cutout
+    even though _is_better gates on cutout_violation_count."""
+    circuit = _connected_circuit()
+    constraints = LayoutConstraints(
+        outline=BoardOutline(100.0, 50.0),
+        cutouts=[
+            BoardCutout(x_min=6.0, y_min=6.0, x_max=14.0, y_max=14.0,
+                        name="window"),
+        ],
+    )
+    # U1 sits squarely on the cutout window.
+    placed = [
+        PlacedPart("U1", 10.0, 10.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 80.0, 10.0, 0.0, "Package_QFP:MCU"),
+    ]
+    score = _score(placed, circuit, BBOXES, constraints, None, 0.5, 2)
+    assert score.cutout_violation_count == 1
+
+    # ... and a cutout-free constraints set reports none (no false positives).
+    clean = LayoutConstraints(outline=BoardOutline(100.0, 50.0))
+    clean_score = _score(placed, circuit, BBOXES, clean, None, 0.5, 2)
+    assert clean_score.cutout_violation_count == 0

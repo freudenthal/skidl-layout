@@ -77,6 +77,7 @@ def _score(
     fp_geometries: dict[str, FootprintGeometry] | None,
     clearance_mm: float,
     board_layers: int,
+    ctx=None,
 ) -> LayoutScore:
     return score_placement(
         placed_parts,
@@ -84,9 +85,11 @@ def _score(
         fp_bboxes,
         outline=constraints.outline if constraints is not None else None,
         keepouts=constraints.keepouts if constraints is not None else None,
+        cutouts=constraints.cutouts if constraints is not None else None,
         fp_geometries=fp_geometries,
         clearance_mm=clearance_mm,
         board_layers=board_layers,
+        ctx=ctx,
     )
 
 
@@ -106,7 +109,11 @@ def _is_better(current: LayoutScore, trial: LayoutScore) -> bool:
         return True
     if trial_hard > current_hard:
         return False
-    return trial.score > current.score + 1e-6
+    # Compare on the raw (unclamped) penalty rather than the 0-clamped score:
+    # on dense boards the soft penalties saturate past 100, so every legal
+    # placement clamps to score 0.0 and the local search would go blind to
+    # HPWL/congestion/warning improvements. Lower penalty is strictly better.
+    return trial.penalty < current.penalty - 1e-6
 
 
 def _replace_ref(
@@ -1090,6 +1097,7 @@ def _best_single_ref_trial(
     fp_geometries: dict[str, FootprintGeometry] | None,
     clearance_mm: float,
     board_layers: int,
+    ctx=None,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
     best_parts = None
     best_score = current_score
@@ -1104,6 +1112,7 @@ def _best_single_ref_trial(
             fp_geometries,
             clearance_mm,
             board_layers,
+            ctx,
         )
         if _is_better(best_score, trial_score):
             best_parts = trial_parts
@@ -1136,6 +1145,7 @@ def _best_pin_gravity_trial(
     fp_geometries: dict[str, FootprintGeometry] | None,
     clearance_mm: float,
     board_layers: int,
+    ctx=None,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
     current_distance = math.hypot(
         placed.x_mm - target_xy[0],
@@ -1191,11 +1201,12 @@ def _best_pin_gravity_trial(
             fp_geometries,
             clearance_mm,
             board_layers,
+            ctx,
         )
         scored_candidates += 1
         if _hard_violation_key(trial_score) > current_hard:
             continue
-        key = (target_distance, -trial_score.score)
+        key = (target_distance, trial_score.penalty)
         if best is None or key < best[0]:
             best = (key, trial_parts, trial_score, trial)
         if best is not None and scored_candidates >= 3:
@@ -1324,6 +1335,7 @@ def _legalize_one_overlap(
     board_layers: int,
     position_locked: set[str],
     degrees: dict[str, int],
+    ctx=None,
 ) -> tuple[list[PlacedPart], LayoutScore, str, str] | None:
     validation = validate(
         placed_parts,
@@ -1332,6 +1344,7 @@ def _legalize_one_overlap(
         clearance_mm=clearance_mm,
         outline=constraints.outline if constraints is not None else None,
         keepouts=constraints.keepouts if constraints is not None else None,
+        cutouts=constraints.cutouts if constraints is not None else None,
         fp_geometries=fp_geometries,
     )
     if not validation.overlaps:
@@ -1391,6 +1404,7 @@ def _legalize_one_overlap(
                 fp_geometries,
                 clearance_mm,
                 board_layers,
+                ctx,
             )
             if _is_better(current_score, trial_score):
                 other = ref_b if ref == ref_a else ref_a
@@ -1427,6 +1441,7 @@ def refine_placement(
     max_pair_swaps: int = 16,
     max_legalization_moves: int = 64,
     preanchored_refs: set[str] | None = None,
+    ctx=None,
 ) -> RefinementResult:
     """Apply deterministic score-gated local placement adjustments."""
     current_parts = _clone_placed(placed_parts)
@@ -1438,13 +1453,18 @@ def refine_placement(
         fp_geometries,
         clearance_mm,
         board_layers,
+        ctx,
     )
     start_score = current_score.score
     position_locked = _locked_position_refs(constraints, circuit)
     rotation_locked = _locked_rotation_refs(constraints)
     preanchored_refs = set(preanchored_refs or ())
     rotation_locked.update(preanchored_refs)
-    roles = classify_parts(circuit) if circuit is not None else {}
+    roles = (
+        ctx.roles
+        if ctx is not None
+        else (classify_parts(circuit) if circuit is not None else {})
+    )
     accepted_moves = 0
     accepted_rotations = 0
     accepted_swaps = 0
@@ -1517,6 +1537,7 @@ def refine_placement(
                     fp_geometries,
                     clearance_mm,
                     board_layers,
+                    ctx,
                 )
                 if best is not None:
                     current_parts, current_score, trial = best
@@ -1555,6 +1576,7 @@ def refine_placement(
                     fp_geometries,
                     clearance_mm,
                     board_layers,
+                    ctx,
                 )
                 if best is not None:
                     current_parts, current_score, trial = best
@@ -1585,6 +1607,7 @@ def refine_placement(
                 fp_geometries,
                 clearance_mm,
                 board_layers,
+                ctx,
             )
             if best is not None:
                 current_parts, current_score, trial = best
@@ -1625,6 +1648,7 @@ def refine_placement(
                     fp_geometries,
                     clearance_mm,
                     board_layers,
+                    ctx,
                 )
                 if not _is_better(current_score, trial_score):
                     continue
@@ -1656,6 +1680,7 @@ def refine_placement(
                 board_layers,
                 position_locked,
                 degrees,
+                ctx,
             )
             if legalized is None:
                 break
@@ -1686,6 +1711,7 @@ def refine_candidate_placement(
     fp_geometries: dict[str, FootprintGeometry] | None = None,
     clearance_mm: float = 0.5,
     board_layers: int = 2,
+    ctx=None,
 ) -> RefinementResult:
     result = refine_placement(
         candidate.placed_parts,
@@ -1696,6 +1722,7 @@ def refine_candidate_placement(
         clearance_mm=clearance_mm,
         board_layers=board_layers,
         preanchored_refs=set(candidate.pin_gravity_anchored_refs),
+        ctx=ctx,
     )
     if result.accepted_count == 0:
         return result

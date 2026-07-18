@@ -55,6 +55,20 @@ result = plan_layout(circuit)      # LayoutResult: scored placement, no copper
 attributes (defensively, via `getattr`) — the same loop-boundary shape the
 SPICE path uses.
 
+**Faster iteration.** By default `plan_layout` refines every applicable
+candidate strategy (up to ~8), which is thorough but slow on large boards. To
+trade breadth for speed while iterating, restrict the strategies:
+
+```python
+result = plan_layout(circuit, candidate_names=["baseline", "connector_edge_first"])
+```
+
+or set `SKIDL_LAYOUT_CANDIDATES="baseline,connector_edge_first"` in the
+environment (an explicit `candidate_names=` always wins). Two strategies is
+roughly 4× faster than the full set; leave it unset for the final board.
+When redirecting output, run with `python -u` and pass a `progress=` callback
+(below) so a long placement stays observable.
+
 ## Layout-quality metrics
 
 `skidl_layout.metrics` scores a placement quantitatively (adapted from the
@@ -64,12 +78,16 @@ upstream `benchmarks/evaluate_layout.py` + `score.py`):
 from skidl_layout import evaluate_circuit
 m = evaluate_circuit(circuit)      # LayoutMetrics
 print(m.layout_ok, m.overlaps, m.outline_violations,
-      m.missing_refs, m.hpwl_total_mm, m.layout_score)  # 0-100
+      m.missing_refs, m.hpwl_total_mm, m.part_count_placed, m.layout_score)  # 0-100
 ```
 
 - `evaluate_circuit(circuit, *, write_pcb_path=...)` — plan a layout and return
   a `LayoutMetrics` (overlaps, outline violations, missing refs, total HPWL,
-  placed-part count, plus a 0-100 `layout_score`); optionally emit a `.kicad_pcb`.
+  `part_count_placed`, plus a 0-100 `layout_score`); optionally emit a `.kicad_pcb`.
+- **Already have a `LayoutResult`?** Pass it to avoid a second placement pass:
+  `evaluate_circuit(circuit, result=plan_layout(circuit))`, or use the pure
+  mapping `metrics_from_result(result)` directly. The 0-100 grade is a pure
+  function of the planned result, so this is exact.
 - `evaluate_circuit_dir(dir)` / `python -m skidl_layout.metrics <dir>` — execute
   a generated `<dir>/circuit.py`, score its layout, and write `layout_score.json`
   (+ `board.kicad_pcb`). KiCad symbol/footprint libraries are auto-discovered.

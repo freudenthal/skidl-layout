@@ -148,29 +148,15 @@ class LayoutMetrics:
         return d
 
 
-def evaluate_circuit(
-    circuit,
-    *,
-    fp_lib_dirs: list[str] | None = None,
-    outline=None,
-    write_pcb_path: str | None = None,
-    **plan_kwargs,
-) -> LayoutMetrics:
-    """Plan a layout for ``circuit`` and return quantitative health metrics.
+def metrics_from_result(result, circuit=None) -> LayoutMetrics:
+    """Build :class:`LayoutMetrics` from an existing ``LayoutResult``.
 
-    ``circuit`` is any skidl ``Circuit`` (duck-typed: ``parts`` + ``get_nets``).
-    If ``write_pcb_path`` is given, also emit a ``.kicad_pcb`` (footprint
-    libraries are auto-discovered when ``fp_lib_dirs`` is omitted).
+    The 0-100 grade and the health counts are a pure function of a planned
+    result, so callers who already hold a ``plan_layout`` result can grade it
+    without paying for a second placement pass. ``circuit`` is unused today and
+    kept only for signature symmetry with :func:`evaluate_circuit`.
     """
     metrics = LayoutMetrics()
-    try:
-        result = plan_layout(
-            circuit, fp_lib_dirs=fp_lib_dirs, outline=outline, **plan_kwargs
-        )
-    except Exception:
-        metrics.errors.append(f"plan_layout failed: {traceback.format_exc()}")
-        return metrics
-
     validation = result.validation
     metrics.layout_ok = validation.ok
     metrics.overlaps = len(validation.overlaps)
@@ -178,6 +164,42 @@ def evaluate_circuit(
     metrics.missing_refs = len(validation.missing_refs)
     metrics.hpwl_total_mm = float(getattr(result.score, "total_hpwl_mm", 0.0) or 0.0)
     metrics.part_count_placed = len(result.placed_parts)
+    return metrics
+
+
+def evaluate_circuit(
+    circuit,
+    *,
+    fp_lib_dirs: list[str] | None = None,
+    outline=None,
+    write_pcb_path: str | None = None,
+    result=None,
+    progress=None,
+    **plan_kwargs,
+) -> LayoutMetrics:
+    """Plan a layout for ``circuit`` and return quantitative health metrics.
+
+    ``circuit`` is any skidl ``Circuit`` (duck-typed: ``parts`` + ``get_nets``).
+    If ``write_pcb_path`` is given, also emit a ``.kicad_pcb`` (footprint
+    libraries are auto-discovered when ``fp_lib_dirs`` is omitted).
+
+    Pass ``result=`` a precomputed ``LayoutResult`` to skip the (expensive)
+    ``plan_layout`` call and grade that result directly — the metrics are a pure
+    function of the result, so this is exact and avoids a second placement pass.
+    ``progress`` is forwarded to ``plan_layout`` (stage-boundary callback).
+    """
+    if result is None:
+        try:
+            result = plan_layout(
+                circuit, fp_lib_dirs=fp_lib_dirs, outline=outline,
+                progress=progress, **plan_kwargs
+            )
+        except Exception:
+            metrics = LayoutMetrics()
+            metrics.errors.append(f"plan_layout failed: {traceback.format_exc()}")
+            return metrics
+
+    metrics = metrics_from_result(result, circuit)
 
     if write_pcb_path:
         fp_dirs = fp_lib_dirs

@@ -80,5 +80,6 @@ from .metrics import (
     discover_symbol_dir,
     evaluate_circuit,
     evaluate_circuit_dir,
+    metrics_from_result,
     summary_table,
 )

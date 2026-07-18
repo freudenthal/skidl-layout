@@ -24,6 +24,7 @@ from .writer import PlacedPart
 @dataclass
 class LayoutScore:
     score: float
+    penalty: float = 0.0
     total_hpwl_mm: float = 0.0
     overlap_count: int = 0
     outline_violation_count: int = 0
@@ -61,6 +62,7 @@ class LayoutScore:
     def to_dict(self) -> dict:
         return {
             "score": self.score,
+            "penalty": self.penalty,
             "total_hpwl_mm": self.total_hpwl_mm,
             "overlap_count": self.overlap_count,
             "outline_violation_count": self.outline_violation_count,
@@ -928,6 +930,7 @@ def score_placement_quick(
 
     return LayoutScore(
         score=max(0.0, 100.0 - penalty),
+        penalty=penalty,
         total_hpwl_mm=total_hpwl,
         overlap_count=len(validation.overlaps),
         outline_violation_count=len(validation.outline_violations),
@@ -1028,6 +1031,7 @@ def score_placement(
 
     return LayoutScore(
         score=max(0.0, 100.0 - penalty),
+        penalty=penalty,
         total_hpwl_mm=total_hpwl,
         overlap_count=len(validation.overlaps),
         outline_violation_count=len(validation.outline_violations),

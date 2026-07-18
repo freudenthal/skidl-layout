@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 
 from skidl import Circuit, Net, Part
-from skidl_layout.metrics import LayoutMetrics, evaluate_circuit, summary_table
+from skidl_layout import plan_layout
+from skidl_layout.metrics import (
+    LayoutMetrics,
+    evaluate_circuit,
+    metrics_from_result,
+    summary_table,
+)
 
 
 def _divider_circuit() -> Circuit:
@@ -38,6 +44,20 @@ def test_evaluate_circuit_produces_clean_metrics():
     assert metrics.missing_refs == 0
     # HPWL is a real, positive wire-length estimate
     assert metrics.hpwl_total_mm > 0.0
+
+
+def test_evaluate_circuit_reuses_result_without_replanning():
+    """WS4: evaluate_circuit(result=...) must grade an existing LayoutResult and
+    return metrics identical to the re-planning path (no second placement)."""
+    ckt = _divider_circuit()
+    result = plan_layout(ckt, fp_lib_dirs=None)
+
+    reused = evaluate_circuit(ckt, result=result)
+    replanned = evaluate_circuit(ckt)
+
+    assert reused.to_dict() == replanned.to_dict()
+    # metrics_from_result is the underlying pure mapping.
+    assert metrics_from_result(result).to_dict() == reused.to_dict()
 
 
 def test_layout_score_rubric():

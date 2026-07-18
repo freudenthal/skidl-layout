@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass, replace
 
@@ -41,7 +42,11 @@ from .placer import (
 )
 from .power import PowerRoutePlan, infer_power_topology, plan_power_routes
 from .reader import read_board_outline
-from .refinement import refine_candidate_placement, refine_placement
+from .refinement import (
+    _clone_placed,
+    refine_candidate_placement,
+    refine_placement,
+)
 from .report import PlacementReport, build_placement_report
 from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_ui_grid_part
 from .routability import RoutabilityFeedback
@@ -162,6 +167,62 @@ class _FinalizedCandidate:
     validation: ValidationResult
     score: LayoutScore
     keepouts: list[KeepOut]
+
+
+def _filter_candidates(
+    candidates: list[PlacementCandidate],
+    candidate_names: list[str] | None,
+) -> list[PlacementCandidate]:
+    """Restrict candidates to a requested subset (speed knob).
+
+    Resolution order: the explicit ``candidate_names`` argument, else the
+    ``SKIDL_LAYOUT_CANDIDATES`` env var (comma-separated), else no filter.
+    Unknown names raise ``ValueError`` listing the available strategies so a
+    typo fails loudly instead of silently planning everything.
+    """
+    if candidate_names is None:
+        env = os.environ.get("SKIDL_LAYOUT_CANDIDATES")
+        if env:
+            candidate_names = [name.strip() for name in env.split(",") if name.strip()]
+    if not candidate_names:
+        return candidates
+
+    available = {candidate.name for candidate in candidates}
+    requested = list(dict.fromkeys(candidate_names))  # de-dup, keep order
+    unknown = [name for name in requested if name not in available]
+    if unknown:
+        raise ValueError(
+            f"unknown candidate name(s) {unknown}; available for this circuit: "
+            f"{sorted(available)}"
+        )
+    wanted = set(requested)
+    return [candidate for candidate in candidates if candidate.name in wanted]
+
+
+def _candidate_seed_key(candidate: PlacementCandidate) -> tuple:
+    """Dedup key for a candidate before refinement.
+
+    The whole per-candidate pipeline (orientation/decap/placement refinement →
+    finalization) is a deterministic pure function of the seed placement and the
+    candidate constraints, so two candidates with an equal key produce an equal
+    result. `optional_backend_ready` is a byte-identical rebuild of
+    `cluster_first`, and intent-less strategies collapse onto
+    `connector_edge_first`; refining those again is wasted work. Key components:
+    the seed placement (ref/x/y/rot/side/footprint) and the constraint tree's
+    repr (LayoutConstraints is a dataclass, so repr is stable and order-fixed).
+    """
+    placement = tuple(
+        (
+            part.ref,
+            round(part.x_mm, 4),
+            round(part.y_mm, 4),
+            round(part.rot_deg, 4),
+            getattr(part, "side", None),
+            part.footprint,
+        )
+        for part in candidate.placed_parts
+    )
+    return (placement, repr(candidate.constraints))
 
 
 def _copy_constraints(
@@ -2830,8 +2891,27 @@ def plan_layout(
     routability: RoutabilityFeedback | None = None,
     assembly_policy: str | None = None,
     corner_radius_mm: float | None = None,
+    candidate_names: list[str] | None = None,
+    progress=None,
 ) -> LayoutResult:
-    """Place and score a board attempt without writing copper geometry."""
+    """Place and score a board attempt without writing copper geometry.
+
+    ``candidate_names`` restricts placement to the named candidate strategies
+    (e.g. ``["baseline", "connector_edge_first"]``) for faster iteration —
+    fewer strategies refined means proportionally less time. Unknown names
+    raise ``ValueError``. When omitted, the ``SKIDL_LAYOUT_CANDIDATES`` env var
+    (comma-separated) is honored as a default; an explicit kwarg always wins.
+    Leave both unset (the default) to evaluate every strategy.
+
+    ``progress`` is an optional ``Callable[[str], None]`` invoked with a short
+    human-readable message at each stage boundary (candidate refinement,
+    finalization, selection). Default ``None`` is silent and has zero behavioral
+    effect. Placement can take minutes on a large board; a callback that prints
+    (with ``flush=True``) makes it observable when stdout is redirected.
+    """
+    def _emit(message: str) -> None:
+        if progress is not None:
+            progress(message)
     fp_geometries = _resolve_geometries(circuit, fp_lib_dirs)
     resolved_bboxes = _resolve_bboxes(circuit, fp_bboxes, fp_lib_dirs)
     geometry_boxes = geometry_bboxes(fp_geometries)
@@ -2880,12 +2960,42 @@ def plan_layout(
         power_topology=power_topology,
         fp_geometries=fp_geometries,
     )
+    candidates = _filter_candidates(candidates, candidate_names)
+    _emit(f"generated {len(candidates)} candidate strategy(ies); refining")
 
     ctx = LayoutContext.from_circuit(circuit)
 
     candidate_scores: dict[str, LayoutScore] = {}
     candidate_validations: dict[str, ValidationResult] = {}
-    for candidate in candidates:
+    # WS1: candidates whose (seed placement, constraints) match an already-refined
+    # candidate produce a byte-identical result deterministically — reuse it
+    # instead of re-refining. Maps dup name -> canonical (already-refined) name.
+    canonical_by_key: dict[tuple, PlacementCandidate] = {}
+    dup_canonical_name: dict[str, str] = {}
+    for cand_index, candidate in enumerate(candidates, start=1):
+        seed_key = _candidate_seed_key(candidate)
+        canonical = canonical_by_key.get(seed_key)
+        if canonical is not None:
+            dup_canonical_name[candidate.name] = canonical.name
+            _emit(
+                f"[{cand_index}/{len(candidates)}] {candidate.name}: "
+                f"reused refinement of '{canonical.name}'"
+            )
+            candidate.placed_parts = _clone_placed(canonical.placed_parts)
+            candidate.constraints = canonical.constraints
+            candidate.pin_gravity_anchored_refs = set(
+                canonical.pin_gravity_anchored_refs
+            )
+            candidate.score = canonical.score
+            candidate_scores[candidate.name] = candidate_scores[canonical.name]
+            candidate_validations[candidate.name] = candidate_validations[
+                canonical.name
+            ]
+            candidate.reasons.append(
+                f"identical to candidate '{canonical.name}'; refinement reused"
+            )
+            continue
+        _emit(f"[{cand_index}/{len(candidates)}] refining {candidate.name}")
         refine_candidate_orientations(candidate, circuit, fp_geometries)
         refine_candidate_decaps(
             candidate,
@@ -2900,7 +3010,9 @@ def plan_layout(
             fp_geometries=fp_geometries,
             clearance_mm=clearance_mm,
             board_layers=board_layers,
+            ctx=ctx,
         )
+        canonical_by_key[seed_key] = candidate
         candidate.placed_parts = _apply_assembly_sides(
             candidate.placed_parts,
             intent_plan,
@@ -3314,6 +3426,7 @@ def plan_layout(
             max_passes=1,
             max_movable_refs=32,
             max_pair_swaps=8,
+            ctx=ctx,
         )
         if post_refinement.accepted_count:
             placed_parts = post_refinement.placed_parts
@@ -3481,10 +3594,47 @@ def plan_layout(
             keepouts=candidate_keepouts,
         )
 
-    finalized_candidates = {
-        candidate.name: _finalize_candidate(candidate)
-        for candidate in candidates
-    }
+    # WS1: finalization is a pure function of a candidate's (post-refinement)
+    # placement + constraints, so duplicates reuse the canonical's finalized
+    # result with only the candidate identity swapped.
+    _emit("finalizing candidates (snap / legalize / re-score)")
+    finalized_candidates: dict[str, _FinalizedCandidate] = {}
+    finalized_by_canonical: dict[str, _FinalizedCandidate] = {}
+    for candidate in candidates:
+        canonical_name = dup_canonical_name.get(candidate.name)
+        if canonical_name is not None:
+            base = finalized_by_canonical[canonical_name]
+            base_candidate = base.candidate
+            # The reused placement IS the canonical's, so adopt its full
+            # placement explanation (including finalize-stage reasons like
+            # edge snapping / passive gridding), keeping this candidate's own
+            # dedup note so the reuse stays visible in the report.
+            dedup_notes = [
+                reason
+                for reason in candidate.reasons
+                if "refinement reused" in reason
+            ]
+            candidate.reasons = list(base_candidate.reasons) + dedup_notes
+            candidate.ref_reasons = {
+                ref: list(reasons)
+                for ref, reasons in base_candidate.ref_reasons.items()
+            }
+            candidate.placed_parts = _clone_placed(base.placed_parts)
+            candidate.constraints = base.constraints
+            candidate.score = base.score.score
+            finalized = _FinalizedCandidate(
+                candidate=candidate,
+                placed_parts=_clone_placed(base.placed_parts),
+                outline=base.outline,
+                constraints=base.constraints,
+                validation=base.validation,
+                score=base.score,
+                keepouts=base.keepouts,
+            )
+        else:
+            finalized = _finalize_candidate(candidate)
+            finalized_by_canonical[candidate.name] = finalized
+        finalized_candidates[candidate.name] = finalized
     candidate_validations = {
         name: finalized.validation
         for name, finalized in finalized_candidates.items()
@@ -3498,7 +3648,9 @@ def plan_layout(
         finalized_candidates.values(),
         key=lambda finalized: (
             1 if finalized.score.ok else 0,
-            finalized.score.score,
+            # Prefer lower raw penalty (finer than the 0-clamped score, which
+            # ties every legal placement at 0 on a dense board).
+            -finalized.score.penalty,
             finalized.candidate.name,
         ),
     )
@@ -3508,6 +3660,10 @@ def plan_layout(
     resolved_outline = selected_final.outline
     validation = selected_final.validation
     score = selected_final.score
+    _emit(
+        f"selected '{selected_candidate.name}' "
+        f"(ok={score.ok}, penalty={score.penalty:.1f}, hpwl={score.total_hpwl_mm:.0f}mm)"
+    )
     power_plan = plan_power_routes(
         circuit,
         placed_parts,
