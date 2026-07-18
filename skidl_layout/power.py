@@ -602,10 +602,11 @@ def _power_warnings(
     circuit,
     placed_parts: list[PlacedPart],
     power_nets: list[PowerNet],
+    roles=None,
 ) -> list[str]:
     placed = {pp.ref: pp for pp in placed_parts}
-    part_by_ref = {getattr(part, "ref", None): part for part in circuit.parts}
-    roles = classify_parts(circuit)
+    if roles is None:
+        roles = classify_parts(circuit)
     warnings: list[str] = []
     supply_nets_by_ref: dict[str, set[str]] = {}
     ground_refs: set[str] = set()
@@ -672,12 +673,19 @@ def plan_power_routes(
     circuit,
     placed_parts: list[PlacedPart],
     board_layers: int = 2,
+    ctx=None,
 ) -> PowerRoutePlan:
-    power_nets = identify_power_nets(circuit, board_layers=board_layers)
-    topology = infer_power_topology(circuit)
+    if ctx is not None:
+        power_nets = ctx.power_nets_for(circuit, board_layers)
+        topology = ctx.power_topology_for(circuit)
+        roles = ctx.roles
+    else:
+        power_nets = identify_power_nets(circuit, board_layers=board_layers)
+        topology = infer_power_topology(circuit)
+        roles = None
     route_intents = _route_intents(power_nets, placed_parts, board_layers)
     corridors = _corridors(route_intents, placed_parts)
-    warnings = _power_warnings(circuit, placed_parts, power_nets)
+    warnings = _power_warnings(circuit, placed_parts, power_nets, roles=roles)
     warnings.extend(topology.warnings)
     return PowerRoutePlan(
         nets=power_nets,

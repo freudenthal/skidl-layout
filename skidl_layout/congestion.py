@@ -256,7 +256,9 @@ def build_congestion_map(
             )
 
     if power_plan is None and circuit is not None:
-        power_plan = plan_power_routes(circuit, placed_parts, board_layers=board_layers)
+        power_plan = plan_power_routes(
+            circuit, placed_parts, board_layers=board_layers, ctx=ctx
+        )
     if power_plan is not None:
         for corridor in power_plan.corridors:
             amount = (corridor.width_mm * corridor.priority / 25.0) * layer_relief

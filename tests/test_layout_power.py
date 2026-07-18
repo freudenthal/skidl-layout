@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from skidl_layout.context import LayoutContext
 from skidl_layout.power import (
     PowerRouteIntent,
+    _power_warnings,
     identify_power_nets,
     infer_power_topology,
     plan_power_routes,
 )
+from skidl_layout.roles import classify_parts
 from skidl_layout.writer import PlacedPart
 
 
@@ -275,3 +278,73 @@ def test_two_layer_high_current_power_plan_adds_wide_trunk_intent():
     assert vbus.width_mm == 0.8
     assert vbus.ordered_refs == ["J1", "U2"]
     assert vbus.span_mm == 60.0
+
+
+def _plan_signature(plan):
+    return (
+        list(plan.warnings),
+        [n.name for n in plan.nets],
+        plan.summary(),
+        len(plan.corridors),
+        [
+            (i.net_name, i.strategy, i.refs, i.ordered_refs, i.span_mm)
+            for i in plan.route_intents
+        ],
+    )
+
+
+def test_ctx_cached_plan_power_routes_identical():
+    circuit = _power_circuit()
+    placed = [
+        PlacedPart("J1", 0.0, 0.0, 0.0, "Connector:USB"),
+        PlacedPart("U1", 20.0, 0.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 60.0, 0.0, 0.0, "Package_TO_SOT:SOT23"),
+        PlacedPart("C1", 0.0, 40.0, 0.0, "Capacitor:C_0805"),
+    ]
+
+    plain = plan_power_routes(circuit, placed)
+    ctx = LayoutContext.from_circuit(circuit)
+    cached = plan_power_routes(circuit, placed, ctx=ctx)
+
+    assert _plan_signature(cached) == _plan_signature(plain)
+
+
+def test_ctx_cached_plan_power_routes_stable_across_calls():
+    circuit = _power_circuit()
+    placed_a = [
+        PlacedPart("J1", 0.0, 0.0, 0.0, "Connector:USB"),
+        PlacedPart("U1", 20.0, 0.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 60.0, 0.0, 0.0, "Package_TO_SOT:SOT23"),
+        PlacedPart("C1", 0.0, 40.0, 0.0, "Capacitor:C_0805"),
+    ]
+    placed_b = [
+        PlacedPart("J1", 0.0, 0.0, 0.0, "Connector:USB"),
+        PlacedPart("U1", 20.0, 0.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 60.0, 0.0, 0.0, "Package_TO_SOT:SOT23"),
+        PlacedPart("C1", 67.5, 0.0, 0.0, "Capacitor:C_0805"),
+    ]
+
+    ctx = LayoutContext.from_circuit(circuit)
+    plan_power_routes(circuit, placed_a, ctx=ctx)
+    second_cached = plan_power_routes(circuit, placed_b, ctx=ctx)
+    second_plain = plan_power_routes(circuit, placed_b)
+
+    assert _plan_signature(second_cached) == _plan_signature(second_plain)
+
+
+def test_power_warnings_roles_passthrough_identical():
+    circuit = _power_circuit()
+    placed = [
+        PlacedPart("J1", 0.0, 0.0, 0.0, "Connector:USB"),
+        PlacedPart("U1", 20.0, 0.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 60.0, 0.0, 0.0, "Package_TO_SOT:SOT23"),
+        PlacedPart("C1", 0.0, 40.0, 0.0, "Capacitor:C_0805"),
+    ]
+    power_nets = identify_power_nets(circuit)
+
+    plain = _power_warnings(circuit, placed, power_nets)
+    with_roles = _power_warnings(
+        circuit, placed, power_nets, roles=classify_parts(circuit)
+    )
+
+    assert with_roles == plain

@@ -3762,6 +3762,7 @@ def plan_layout(
         circuit,
         placed_parts,
         board_layers=board_layers,
+        ctx=ctx,
     )
     candidate_validations[selected_candidate.name] = validation
     candidate_scores[selected_candidate.name] = score

@@ -38,6 +38,28 @@ class LayoutContext:
     # ref -> _part_tokens(part), the owner-affinity token set used by scoring's
     # _role_warnings. Circuit-invariant (derived from ref/name/value/footprint).
     part_tokens: dict[str, set[str]] = field(default_factory=dict)
+    # Lazy memos for plan_power_routes' circuit-invariant inputs. Built on
+    # first use (not in from_circuit) so non-power users pay nothing. The
+    # cached objects are shared across PowerRoutePlan results — read-only by
+    # contract (callers must not mutate them).
+    power_topology: object | None = None
+    power_nets_by_layers: dict[int, list] = field(default_factory=dict)
+
+    def power_nets_for(self, circuit, board_layers: int):
+        if board_layers not in self.power_nets_by_layers:
+            from .power import identify_power_nets
+
+            self.power_nets_by_layers[board_layers] = identify_power_nets(
+                circuit, board_layers=board_layers
+            )
+        return self.power_nets_by_layers[board_layers]
+
+    def power_topology_for(self, circuit):
+        if self.power_topology is None:
+            from .power import infer_power_topology
+
+            self.power_topology = infer_power_topology(circuit)
+        return self.power_topology
 
     @staticmethod
     def from_circuit(circuit) -> LayoutContext:

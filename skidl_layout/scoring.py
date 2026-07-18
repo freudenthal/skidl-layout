@@ -1067,7 +1067,9 @@ def score_placement(
     warnings.extend(front_panel_trace["warnings"])
     power_plan = None
     if circuit is not None:
-        power_plan = plan_power_routes(circuit, placed_parts, board_layers=board_layers)
+        power_plan = plan_power_routes(
+            circuit, placed_parts, board_layers=board_layers, ctx=ctx
+        )
         warnings.extend(power_plan.warnings)
     outline_metrics = _outline_utilization_metrics(placed_parts, fp_bboxes, outline)
     total_hpwl = _total_hpwl(placed_parts, circuit, ctx)
