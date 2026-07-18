@@ -3598,9 +3598,8 @@ def _prerefine_candidates_parallel(
 
     try:
         import pickle
-        from concurrent.futures import ProcessPoolExecutor
 
-        from .parallel import refine_candidate_worker
+        from .parallel import run_payloads
 
         payloads = {
             i: pickle.dumps(
@@ -3620,16 +3619,13 @@ def _prerefine_candidates_parallel(
             f"refining {len(canonical_indices)} unique candidate(s) in parallel "
             f"({k} workers); per-ref progress is suppressed in parallel mode"
         )
-        mp_ctx = multiprocessing.get_context("spawn")
-        refined_by_index: dict[int, object] = {}
-        with ProcessPoolExecutor(max_workers=k, mp_context=mp_ctx) as executor:
-            futures = {
-                executor.submit(refine_candidate_worker, payloads[i]): i
-                for i in canonical_indices
-            }
-            # Collect keyed by candidate index (NOT completion order).
-            for future, i in futures.items():
-                refined_by_index[i] = pickle.loads(future.result())
+        # Round-7 WS25: plain-subprocess transport (safe for unguarded callers).
+        # Results come back keyed by candidate index via per-index output files,
+        # so completion order cannot matter.
+        raw = run_payloads("refine", payloads, workers)
+        refined_by_index: dict[int, object] = {
+            i: pickle.loads(b) for i, b in raw.items()
+        }
     except Exception as exc:  # noqa: BLE001 - any failure -> sequential fallback
         emit(
             f"parallel refinement unavailable ({exc}); falling back to sequential"
@@ -3687,9 +3683,8 @@ def _finalize_candidates_parallel(
 
     try:
         import pickle
-        from concurrent.futures import ProcessPoolExecutor
 
-        from .parallel import finalize_candidate_worker
+        from .parallel import run_payloads
 
         payloads = {
             i: pickle.dumps((candidates[i], snapshot, params))
@@ -3700,15 +3695,11 @@ def _finalize_candidates_parallel(
             f"finalizing {len(canonical_indices)} unique candidate(s) in "
             f"parallel ({k} workers)"
         )
-        mp_ctx = multiprocessing.get_context("spawn")
-        finalized_by_index: dict[int, _FinalizedCandidate] = {}
-        with ProcessPoolExecutor(max_workers=k, mp_context=mp_ctx) as executor:
-            futures = {
-                executor.submit(finalize_candidate_worker, payloads[i]): i
-                for i in canonical_indices
-            }
-            for future, i in futures.items():
-                finalized_by_index[i] = pickle.loads(future.result())
+        # Round-7 WS25: plain-subprocess transport (safe for unguarded callers).
+        raw = run_payloads("finalize", payloads, workers)
+        finalized_by_index: dict[int, _FinalizedCandidate] = {
+            i: pickle.loads(b) for i, b in raw.items()
+        }
     except Exception as exc:  # noqa: BLE001 - any failure -> sequential fallback
         emit(
             f"parallel finalize unavailable ({exc}); falling back to sequential"

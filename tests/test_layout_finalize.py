@@ -181,18 +181,19 @@ def test_finalize_worker_roundtrip():
 
 
 def test_parallel_finalize_fallback_on_error(monkeypatch):
-    """An error raised while dispatching the finalize pool is caught inside
+    """An error raised while dispatching the finalize workers is caught inside
     _finalize_candidates_parallel -> sequential fallback, byte-identical result,
-    fallback message. Patching ProcessPoolExecutor (resolved at call time via a
-    local import) trips the internal try/except without a real spawn."""
-    import concurrent.futures as cf
+    fallback message. Patching run_payloads (resolved at call time via a local
+    import, round-7 WS25) trips the internal try/except without a real
+    subprocess."""
+    import skidl_layout.parallel as par_mod
 
     seq = plan_layout(_circuit(), fp_bboxes=BBOXES)
 
     def boom(*a, **k):
         raise RuntimeError("pool exploded")
 
-    monkeypatch.setattr(cf, "ProcessPoolExecutor", boom)
+    monkeypatch.setattr(par_mod, "run_payloads", boom)
     msgs: list[str] = []
     par = plan_layout(
         _circuit(), fp_bboxes=BBOXES, parallel_workers=2,
