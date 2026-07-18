@@ -13,6 +13,8 @@ from .roles import (
     GND_NET_RE,
     POWER_NET_RE,
     PartRole,
+    _alpha_tokens,  # re-exported for backward compat (defined in roles.py)
+    _part_tokens,  # re-exported for backward compat (defined in roles.py)
     classify_parts,
     is_ui_grid_part,
     pin_net_names,
@@ -209,45 +211,17 @@ def _role_weight(role_name: str) -> float:
     }.get(role_name, 1.0)
 
 
-def _alpha_tokens(text: str) -> set[str]:
-    generic_tokens = {
-        "CAP",
-        "CAPACITOR",
-        "DEVICE",
-        "FOOTPRINT",
-        "IC",
-        "LGA",
-        "MCU",
-        "METRIC",
-        "MODULE",
-        "PACKAGE",
-        "PKG",
-        "RESISTOR",
-        "SENSOR",
-        "SMD",
-    }
-    tokens: set[str] = set()
-    for match in re.finditer(r"[A-Za-z]{3,}", str(text or "")):
-        token = match.group(0).upper()
-        if token not in generic_tokens:
-            tokens.add(token)
-        if token[0] in {"C", "R", "L", "D", "U", "J", "Q"} and len(token) >= 4:
-            stripped = token[1:]
-            if stripped not in generic_tokens:
-                tokens.add(stripped)
-    return tokens
-
-
-def _part_tokens(part) -> set[str]:
-    tokens: set[str] = set()
-    for field_name in ("ref", "name", "value", "footprint"):
-        tokens.update(_alpha_tokens(str(getattr(part, field_name, "") or "")))
-    return tokens
-
-
-def _token_affinity(passive_part, owner_part) -> int:
-    passive_tokens = _part_tokens(passive_part)
-    owner_tokens = _part_tokens(owner_part)
+def _token_affinity(passive_part, owner_part, *, token_cache=None) -> int:
+    passive_ref = getattr(passive_part, "ref", None)
+    owner_ref = getattr(owner_part, "ref", None)
+    if token_cache is not None and passive_ref in token_cache:
+        passive_tokens = token_cache[passive_ref]
+    else:
+        passive_tokens = _part_tokens(passive_part)
+    if token_cache is not None and owner_ref in token_cache:
+        owner_tokens = token_cache[owner_ref]
+    else:
+        owner_tokens = _part_tokens(owner_part)
     if not passive_tokens or not owner_tokens:
         return 0
     best = 0
@@ -269,6 +243,7 @@ def _select_primary_owner_ref(
     *,
     require_signal: bool,
     require_power_and_ground: bool = False,
+    token_cache: dict[str, set[str]] | None = None,
 ) -> str | None:
     part = part_by_ref.get(ref)
     placed = placed_by_ref.get(ref)
@@ -307,7 +282,9 @@ def _select_primary_owner_ref(
         if require_power_and_ground:
             candidates.append(
                 (
-                    -_token_affinity(part, part_by_ref.get(other_ref)),
+                    -_token_affinity(
+                        part, part_by_ref.get(other_ref), token_cache=token_cache
+                    ),
                     distance,
                     -_role_weight(role_name),
                     other_ref,
@@ -316,7 +293,9 @@ def _select_primary_owner_ref(
         else:
             candidates.append(
                 (
-                    -_token_affinity(part, part_by_ref.get(other_ref)),
+                    -_token_affinity(
+                        part, part_by_ref.get(other_ref), token_cache=token_cache
+                    ),
                     -len(shared_signal),
                     -_role_weight(role_name),
                     distance,
@@ -737,6 +716,7 @@ def _role_warnings(
     fp_bboxes: dict[str, tuple[float, float]],
     outline=None,
     fp_geometries: dict[str, FootprintGeometry] | None = None,
+    ctx=None,
 ) -> list[str]:
     placed_by_ref = {pp.ref: pp for pp in placed_parts}
     warnings: list[str] = []
@@ -760,11 +740,31 @@ def _role_warnings(
         return warnings
 
     part_by_ref = {part.ref: part for part in circuit.parts}
-    nets_by_ref = {ref: set(pin_net_names(part)) for ref, part in part_by_ref.items()}
+    # nets_by_ref/token_cache are circuit-invariant; when a LayoutContext is
+    # supplied, reuse its precomputed caches (byte-identical to the live walk,
+    # since ctx.pin_nets[ref] IS pin_net_names(part) captured at build time).
+    # A live fallback covers any ref absent from the cache (e.g. ref=None) so
+    # the resulting dict is exactly the same as the ctx=None comprehension.
+    if ctx is not None:
+        nets_by_ref = {
+            ref: (
+                set(ctx.pin_nets[ref])
+                if ref in ctx.pin_nets
+                else set(pin_net_names(part))
+            )
+            for ref, part in part_by_ref.items()
+        }
+        token_cache = ctx.part_tokens
+    else:
+        nets_by_ref = {
+            ref: set(pin_net_names(part)) for ref, part in part_by_ref.items()
+        }
+        token_cache = None
     decap_pad_distances = measure_decap_pad_distances(
         placed_parts,
         circuit,
         fp_geometries or {},
+        roles,
     )
 
     if outline is not None:
@@ -823,6 +823,7 @@ def _role_warnings(
             placed_by_ref,
             require_signal=False,
             require_power_and_ground=True,
+            token_cache=token_cache,
         )
         nearest_ref = owner_ref or min(
             candidates,
@@ -863,6 +864,7 @@ def _role_warnings(
             roles,
             placed_by_ref,
             require_signal=True,
+            token_cache=token_cache,
         )
         nearest_ref = owner_ref or min(
             candidates,
@@ -988,6 +990,7 @@ def score_placement_quick(
         fp_bboxes,
         outline,
         fp_geometries=fp_geometries,
+        ctx=ctx,
     )
     front_panel_trace = _front_panel_trace_metrics(placed_parts, circuit, roles)
     warnings.extend(front_panel_trace["warnings"])
@@ -1058,6 +1061,7 @@ def score_placement(
         fp_bboxes,
         outline,
         fp_geometries=fp_geometries,
+        ctx=ctx,
     )
     front_panel_trace = _front_panel_trace_metrics(placed_parts, circuit, roles)
     warnings.extend(front_panel_trace["warnings"])

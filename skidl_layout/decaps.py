@@ -479,8 +479,15 @@ def measure_decap_pad_distances(
     placed_parts: list[PlacedPart],
     circuit,
     fp_geometries: dict[str, FootprintGeometry],
+    roles=None,
 ) -> dict[str, DecapPadDistance]:
-    """Measure decap pad distance to the parent IC/regulator supply pads."""
+    """Measure decap pad distance to the parent IC/regulator supply pads.
+
+    ``roles`` is threaded straight to ``infer_decap_placement_intents`` so a
+    caller that already classified the circuit avoids a redundant
+    ``classify_parts`` (roles are circuit-invariant). ``roles=None`` preserves
+    the original self-classifying behavior.
+    """
     if circuit is None or not fp_geometries:
         return {}
 
@@ -488,7 +495,9 @@ def measure_decap_pad_distances(
     part_by_ref = {getattr(part, "ref", None): part for part in circuit.parts}
     distances: dict[str, DecapPadDistance] = {}
 
-    for intent in infer_decap_placement_intents(circuit, placed_parts, fp_geometries):
+    for intent in infer_decap_placement_intents(
+        circuit, placed_parts, fp_geometries, roles
+    ):
         cap_part = part_by_ref.get(intent.ref)
         cap_placed = placed_by_ref.get(intent.ref)
         cap_geometry = fp_geometries.get(cap_placed.footprint) if cap_placed else None

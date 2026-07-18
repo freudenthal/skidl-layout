@@ -586,6 +586,34 @@ def test_ctx_cached_quick_score_is_numerically_identical():
     assert no_ctx.to_dict() == with_ctx.to_dict()
 
 
+def test_ctx_cached_role_warnings_identical():
+    """WS12: _role_warnings(ctx=ctx) must produce the exact same warning list
+    (same strings, same order) as the ctx=None live-walk path."""
+    from skidl_layout.context import LayoutContext
+    from skidl_layout.scoring import _role_warnings
+
+    circuit, placed = _fixture_circuit_and_placement()
+    outline = BoardOutline(80.0, 80.0)
+    ctx = LayoutContext.from_circuit(circuit)
+
+    live = _role_warnings(placed, circuit, ctx.roles, BBOXES, outline,
+                          fp_geometries=None, ctx=None)
+    cached = _role_warnings(placed, circuit, ctx.roles, BBOXES, outline,
+                            fp_geometries=None, ctx=ctx)
+    assert cached == live
+
+
+def test_ctx_part_tokens_matches_live_part_tokens():
+    """WS12: the LayoutContext token cache is byte-equal to a live compute."""
+    from skidl_layout.context import LayoutContext
+    from skidl_layout.roles import _part_tokens
+
+    circuit, _ = _fixture_circuit_and_placement()
+    ctx = LayoutContext.from_circuit(circuit)
+    for part in circuit.parts:
+        assert ctx.part_tokens[part.ref] == _part_tokens(part)
+
+
 def test_vectorized_crossings_matches_reference():
     import random
 

@@ -6,6 +6,7 @@ from .roles import (
     GND_NET_RE,
     POWER_NET_RE,
     PartRole,
+    _part_tokens,
     classify_parts,
     pin_net_names,
 )
@@ -34,6 +35,9 @@ class LayoutContext:
     # pin_net_names) so it is byte-equivalent to the live traversal.
     net_ref_lists: list[tuple[str, list[str]]] = field(default_factory=list)
     pin_counts: dict[str, int] = field(default_factory=dict)  # ref -> pin count
+    # ref -> _part_tokens(part), the owner-affinity token set used by scoring's
+    # _role_warnings. Circuit-invariant (derived from ref/name/value/footprint).
+    part_tokens: dict[str, set[str]] = field(default_factory=dict)
 
     @staticmethod
     def from_circuit(circuit) -> LayoutContext:
@@ -67,6 +71,12 @@ class LayoutContext:
             if (ref := getattr(part, "ref", None)) is not None
         }
 
+        part_tokens = {
+            ref: _part_tokens(part)
+            for part in circuit.parts
+            if (ref := getattr(part, "ref", None)) is not None
+        }
+
         return LayoutContext(
             roles=roles,
             pin_nets=pin_nets_map,
@@ -75,6 +85,7 @@ class LayoutContext:
             ground_nets=ground_nets,
             net_ref_lists=_build_net_ref_lists(circuit),
             pin_counts=pin_counts,
+            part_tokens=part_tokens,
         )
 
 

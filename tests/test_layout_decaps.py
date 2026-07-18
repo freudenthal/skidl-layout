@@ -202,6 +202,32 @@ def test_refine_decaps_treats_fixed_cap_as_soft_seed():
     assert "actual U1 VDD/GND pads" in result.ref_reasons["C1"][0]
 
 
+def test_measure_decap_pad_distances_roles_passthrough_identical():
+    """WS12: passing precomputed roles must give the same distances as the
+    self-classifying (roles=None) path."""
+    from skidl_layout.roles import classify_parts
+
+    vdd = _Net("VDD")
+    gnd = _Net("GND")
+    parent = _Part("U1", footprint="Pkg:MCU",
+                   pins=[("1", vdd), ("2", gnd)], name="MCU")
+    cap = _Part("C1", value="100nF", footprint="Pkg:Cap",
+                pins=[("1", vdd), ("2", gnd)])
+    circuit = _Circuit([parent, cap], [vdd, gnd])
+    placed = [
+        PlacedPart("U1", 20.0, 20.0, 0.0, "Pkg:MCU"),
+        PlacedPart("C1", 22.0, 20.0, 0.0, "Pkg:Cap"),
+    ]
+    no_roles = measure_decap_pad_distances(placed, circuit, _basic_geometries())
+    with_roles = measure_decap_pad_distances(
+        placed, circuit, _basic_geometries(), classify_parts(circuit)
+    )
+    assert set(no_roles) == set(with_roles)
+    for ref in no_roles:
+        assert (no_roles[ref].average_pad_distance_mm
+                == with_roles[ref].average_pad_distance_mm)
+
+
 def test_refine_decaps_final_position_clears_parent_pads():
     vdd = _Net("VDD")
     gnd = _Net("GND")

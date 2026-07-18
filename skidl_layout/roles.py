@@ -243,3 +243,46 @@ def classify_part(part) -> PartRole:
 
 def classify_parts(circuit) -> dict[str, PartRole]:
     return {part.ref: classify_part(part) for part in circuit.parts}
+
+
+# --- part-name tokenization (used by scoring's owner-affinity heuristic) -----
+# Lives here (not scoring.py) so LayoutContext can precompute per-ref tokens
+# without importing scoring (which would create an import cycle). scoring.py
+# re-exports these names for backward compatibility.
+
+_TOKEN_GENERIC = {
+    "CAP",
+    "CAPACITOR",
+    "DEVICE",
+    "FOOTPRINT",
+    "IC",
+    "LGA",
+    "MCU",
+    "METRIC",
+    "MODULE",
+    "PACKAGE",
+    "PKG",
+    "RESISTOR",
+    "SENSOR",
+    "SMD",
+}
+
+
+def _alpha_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for match in re.finditer(r"[A-Za-z]{3,}", str(text or "")):
+        token = match.group(0).upper()
+        if token not in _TOKEN_GENERIC:
+            tokens.add(token)
+        if token[0] in {"C", "R", "L", "D", "U", "J", "Q"} and len(token) >= 4:
+            stripped = token[1:]
+            if stripped not in _TOKEN_GENERIC:
+                tokens.add(stripped)
+    return tokens
+
+
+def _part_tokens(part) -> set[str]:
+    tokens: set[str] = set()
+    for field_name in ("ref", "name", "value", "footprint"):
+        tokens.update(_alpha_tokens(str(getattr(part, field_name, "") or "")))
+    return tokens
