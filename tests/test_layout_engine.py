@@ -384,6 +384,8 @@ def test_plan_layout_selects_best_finalized_candidate(monkeypatch):
                 placed_parts=placed_parts,
                 start_score=24.0,
                 final_score=24.0,
+                start_penalty=76.0,
+                final_penalty=76.0,
                 ref_reasons={},
             )
         return SimpleNamespace(
@@ -393,6 +395,8 @@ def test_plan_layout_selects_best_finalized_candidate(monkeypatch):
             ],
             start_score=90.0,
             final_score=0.0,
+            start_penalty=10.0,
+            final_penalty=140.0,
             ref_reasons={"U1": ["forced degradation for regression coverage"]},
         )
 
@@ -2550,6 +2554,35 @@ def test_plan_layout_candidate_names_env_default(monkeypatch):
         _circuit(), fp_bboxes=BBOXES, candidate_names=["baseline"]
     )
     assert {c.name for c in result2.candidates} == {"baseline"}
+
+
+def test_plan_layout_max_candidates_caps_refined_strategies():
+    """WS10: max_candidates prunes to the top-N seed-scored strategies."""
+    full = plan_layout(_circuit(), fp_bboxes=BBOXES)
+    assert len(full.candidates) > 2  # something to prune
+    capped = plan_layout(_circuit(), fp_bboxes=BBOXES, max_candidates=2)
+    assert len(capped.candidates) <= 2
+    assert capped.validation.ok
+
+
+def test_plan_layout_max_candidates_none_is_unpruned():
+    """WS10: default (None) refines every candidate, byte-identical to no knob."""
+    baseline = plan_layout(_circuit(), fp_bboxes=BBOXES)
+    explicit_none = plan_layout(_circuit(), fp_bboxes=BBOXES, max_candidates=None)
+    assert _placement_signature(baseline.placed_parts) == _placement_signature(
+        explicit_none.placed_parts
+    )
+    assert len(baseline.candidates) == len(explicit_none.candidates)
+
+
+def test_plan_layout_max_candidates_env_default(monkeypatch):
+    """WS10: SKIDL_LAYOUT_MAX_CANDIDATES env default; explicit kwarg wins."""
+    monkeypatch.setenv("SKIDL_LAYOUT_MAX_CANDIDATES", "1")
+    result = plan_layout(_circuit(), fp_bboxes=BBOXES)
+    assert len(result.candidates) == 1
+    # explicit kwarg overrides the env var (larger than candidate count -> all)
+    result2 = plan_layout(_circuit(), fp_bboxes=BBOXES, max_candidates=99)
+    assert len(result2.candidates) > 1
 
 
 def test_plan_layout_progress_callback_emits_stages():

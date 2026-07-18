@@ -241,8 +241,10 @@ def _select_parent(
     circuit,
     placed_by_ref: dict[str, PlacedPart],
     fp_geometries: dict[str, FootprintGeometry],
+    roles=None,
 ) -> tuple[object, list[PadGeometry], list[PadGeometry]] | None:
-    roles = classify_parts(circuit)
+    if roles is None:
+        roles = classify_parts(circuit)
     part_by_ref = {getattr(part, "ref", None): part for part in circuit.parts}
     cap_part = part_by_ref.get(cap_ref)
     cap_placed = placed_by_ref.get(cap_ref)
@@ -305,11 +307,14 @@ def infer_decap_placement_intents(
     circuit,
     placed_parts: list[PlacedPart],
     fp_geometries: dict[str, FootprintGeometry],
+    roles=None,
 ) -> list[DecapPlacementIntent]:
     """Infer decap-to-parent pad targets from SKiDL pins and footprint geometry."""
     if circuit is None or not fp_geometries:
         return []
 
+    if roles is None:
+        roles = classify_parts(circuit)
     placed_by_ref = {placed.ref: placed for placed in placed_parts}
     usage_counts: dict[tuple[str, str], int] = {}
     intents: list[DecapPlacementIntent] = []
@@ -329,6 +334,7 @@ def infer_decap_placement_intents(
             circuit,
             placed_by_ref,
             fp_geometries,
+            roles,
         )
         if parent is None:
             continue
@@ -741,6 +747,7 @@ def refine_decaps(
     fp_geometries: dict[str, FootprintGeometry],
     fp_bboxes: dict[str, tuple[float, float]],
     constraints: LayoutConstraints | None = None,
+    roles=None,
 ) -> DecapRefinementResult:
     """Move decaps near actual parent power/GND pads when geometry is available."""
     if circuit is None or not fp_geometries:
@@ -748,7 +755,9 @@ def refine_decaps(
 
     placed_by_ref = {placed.ref: placed for placed in placed_parts}
     part_by_ref = {getattr(part, "ref", None): part for part in circuit.parts}
-    intents = infer_decap_placement_intents(circuit, placed_parts, fp_geometries)
+    intents = infer_decap_placement_intents(
+        circuit, placed_parts, fp_geometries, roles
+    )
     locked = _locked_refs(constraints)
     reasons: dict[str, list[str]] = {}
 
@@ -898,6 +907,7 @@ def refine_candidate_decaps(
     circuit,
     fp_geometries: dict[str, FootprintGeometry],
     fp_bboxes: dict[str, tuple[float, float]],
+    ctx=None,
 ) -> None:
     result = refine_decaps(
         candidate.placed_parts,
@@ -905,6 +915,7 @@ def refine_candidate_decaps(
         fp_geometries,
         fp_bboxes,
         constraints=candidate.constraints,
+        roles=ctx.roles if ctx is not None else None,
     )
     if not result.ref_reasons:
         return

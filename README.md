@@ -66,6 +66,14 @@ result = plan_layout(circuit, candidate_names=["baseline", "connector_edge_first
 or set `SKIDL_LAYOUT_CANDIDATES="baseline,connector_edge_first"` in the
 environment (an explicit `candidate_names=` always wins). Two strategies is
 roughly 4× faster than the full set; leave it unset for the final board.
+
+When you don't know which strategies fit the board, cap the count instead with
+`plan_layout(circuit, max_candidates=2)` (or `SKIDL_LAYOUT_MAX_CANDIDATES=2`):
+each candidate's *seed* placement is quick-scored and only the top N are
+refined. The seed score is a heuristic predictor, not the refined quality — use
+it for iteration, not the final board. `max_candidates` composes with
+`candidate_names` (filter first, then cap).
+
 When redirecting output, run with `python -u` and pass a `progress=` callback
 (below) so a long placement stays observable.
 
@@ -92,6 +100,24 @@ print(m.layout_ok, m.overlaps, m.outline_violations,
   a generated `<dir>/circuit.py`, score its layout, and write `layout_score.json`
   (+ `board.kicad_pcb`). KiCad symbol/footprint libraries are auto-discovered.
 - `summary_table(rows)` — markdown scoreboard for a batch of boards.
+
+### Two scores, one board
+
+There are two distinct 0-100 numbers and they measure different things — do not
+compare them:
+
+- **`LayoutScore.score`** (from `score_placement`) is `max(0, 100 - penalty)`,
+  the *internal search objective*. Its soft penalties (HPWL, crossings,
+  congestion, warnings) saturate past 100 on dense boards, so a perfectly legal
+  layout routinely clamps to `0.0`. Read **`LayoutScore.penalty`** (raw,
+  unclamped) for the actual gradient the local search optimizes — a lower
+  penalty is strictly better even when both scores read `0.0`.
+- **`LayoutMetrics.layout_score`** (from `evaluate_circuit`) is a separate
+  *structural rubric* (overlaps/violations/HPWL rolled into a grade). A clean
+  board reads `100.0` here.
+
+So the same board can legitimately report `score=0.0` (saturated search
+objective) and `layout_score=100.0` (clean rubric) at once.
 
 ## Optional external tools
 

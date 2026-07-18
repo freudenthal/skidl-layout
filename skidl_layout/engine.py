@@ -199,6 +199,60 @@ def _filter_candidates(
     return [candidate for candidate in candidates if candidate.name in wanted]
 
 
+def _resolve_max_candidates(max_candidates: int | None) -> int | None:
+    """Explicit kwarg wins, else SKIDL_LAYOUT_MAX_CANDIDATES env default."""
+    if max_candidates is not None:
+        return max_candidates
+    env = os.environ.get("SKIDL_LAYOUT_MAX_CANDIDATES")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            raise ValueError(
+                f"SKIDL_LAYOUT_MAX_CANDIDATES must be an integer, got {env!r}"
+            )
+    return None
+
+
+def _prune_candidates(
+    candidates: list[PlacementCandidate],
+    max_candidates: int | None,
+    circuit,
+    fp_bboxes: dict[str, tuple[float, float]],
+    outline,
+    keepouts,
+    cutouts,
+    fp_geometries,
+    clearance_mm: float,
+    ctx,
+) -> list[PlacementCandidate]:
+    """Keep only the top ``max_candidates`` by a cheap seed quick-score.
+
+    The seed score (validate + HPWL + warnings, no refinement) is a heuristic
+    predictor of the refined result — good enough for fast iteration, NOT a
+    substitute for scoring the final board. Ranking is
+    ``(ok desc, penalty asc, name asc)`` and fully deterministic.
+    """
+    if max_candidates is None or max_candidates >= len(candidates) or max_candidates <= 0:
+        return candidates
+    scored = []
+    for candidate in candidates:
+        seed_score = score_placement_quick(
+            candidate.placed_parts,
+            circuit,
+            fp_bboxes,
+            outline=outline,
+            keepouts=keepouts,
+            cutouts=cutouts,
+            fp_geometries=fp_geometries,
+            clearance_mm=clearance_mm,
+            ctx=ctx,
+        )
+        scored.append((candidate, seed_score))
+    scored.sort(key=lambda item: (not item[1].ok, item[1].penalty, item[0].name))
+    return [candidate for candidate, _ in scored[:max_candidates]]
+
+
 def _candidate_seed_key(candidate: PlacementCandidate) -> tuple:
     """Dedup key for a candidate before refinement.
 
@@ -2892,6 +2946,7 @@ def plan_layout(
     assembly_policy: str | None = None,
     corner_radius_mm: float | None = None,
     candidate_names: list[str] | None = None,
+    max_candidates: int | None = None,
     progress=None,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
@@ -2902,6 +2957,12 @@ def plan_layout(
     raise ``ValueError``. When omitted, the ``SKIDL_LAYOUT_CANDIDATES`` env var
     (comma-separated) is honored as a default; an explicit kwarg always wins.
     Leave both unset (the default) to evaluate every strategy.
+
+    ``max_candidates`` caps how many strategies are refined by pre-scoring each
+    candidate's *seed* placement (a cheap heuristic predictor — not the refined
+    quality) and keeping the top N. The ``SKIDL_LAYOUT_MAX_CANDIDATES`` env var
+    is the default; an explicit kwarg wins. Default ``None`` refines all (after
+    ``candidate_names`` filtering). Use for fast iteration, not final boards.
 
     ``progress`` is an optional ``Callable[[str], None]`` invoked with a short
     human-readable message at each stage boundary (candidate refinement,
@@ -2961,9 +3022,29 @@ def plan_layout(
         fp_geometries=fp_geometries,
     )
     candidates = _filter_candidates(candidates, candidate_names)
-    _emit(f"generated {len(candidates)} candidate strategy(ies); refining")
 
     ctx = LayoutContext.from_circuit(circuit)
+
+    resolved_max_candidates = _resolve_max_candidates(max_candidates)
+    if resolved_max_candidates is not None and resolved_max_candidates < len(candidates):
+        pruned = _prune_candidates(
+            candidates,
+            resolved_max_candidates,
+            circuit,
+            resolved_bboxes,
+            resolved_outline,
+            resolved_constraints.keepouts,
+            resolved_constraints.cutouts,
+            fp_geometries,
+            clearance_mm,
+            ctx,
+        )
+        _emit(
+            f"pruned {len(candidates)} -> {len(pruned)} candidate(s) by seed "
+            "quick-score (max_candidates)"
+        )
+        candidates = pruned
+    _emit(f"generated {len(candidates)} candidate strategy(ies); refining")
 
     candidate_scores: dict[str, LayoutScore] = {}
     candidate_validations: dict[str, ValidationResult] = {}
@@ -3002,6 +3083,7 @@ def plan_layout(
             circuit,
             fp_geometries,
             resolved_bboxes,
+            ctx=ctx,
         )
         refine_candidate_placement(
             candidate,
@@ -3435,8 +3517,10 @@ def plan_layout(
                 (
                     "post-anchor local refinement accepted "
                     f"{post_refinement.accepted_count} score-gated adjustment(s): "
-                    f"{post_refinement.start_score:.1f} -> "
-                    f"{post_refinement.final_score:.1f}"
+                    f"score {post_refinement.start_score:.1f} -> "
+                    f"{post_refinement.final_score:.1f} "
+                    f"(penalty {post_refinement.start_penalty:.1f} -> "
+                    f"{post_refinement.final_penalty:.1f})"
                 )
             )
             for ref, reasons in post_refinement.ref_reasons.items():
