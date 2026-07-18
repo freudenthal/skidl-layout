@@ -2931,6 +2931,149 @@ def _spread_grid_subjects_on_generous_outline(
     return [replacements.get(placed.ref, placed) for placed in placed_parts], moved_refs
 
 
+def _resolve_parallel_workers(parallel_workers: int | None) -> int | None:
+    """Explicit kwarg wins, else SKIDL_LAYOUT_PARALLEL env default."""
+    if parallel_workers is not None:
+        return parallel_workers
+    env = os.environ.get("SKIDL_LAYOUT_PARALLEL")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            raise ValueError(
+                f"SKIDL_LAYOUT_PARALLEL must be an integer, got {env!r}"
+            )
+    return None
+
+
+def _refine_candidate_trio(
+    candidate,
+    circuit,
+    resolved_bboxes,
+    fp_geometries,
+    clearance_mm,
+    board_layers,
+    ctx,
+    progress,
+):
+    """Run the pass-1 refinement trio on one candidate, mutating it in place.
+
+    Module-level (not a closure) so a spawn worker can import it by name — see
+    ``parallel.refine_candidate_worker``. Behaviour is exactly the three calls
+    the sequential candidate loop used to make inline.
+    """
+    refine_candidate_orientations(candidate, circuit, fp_geometries)
+    refine_candidate_decaps(
+        candidate,
+        circuit,
+        fp_geometries,
+        resolved_bboxes,
+        ctx=ctx,
+    )
+    refine_candidate_placement(
+        candidate,
+        circuit,
+        resolved_bboxes,
+        fp_geometries=fp_geometries,
+        clearance_mm=clearance_mm,
+        board_layers=board_layers,
+        ctx=ctx,
+        progress=progress,
+    )
+    return candidate
+
+
+def _prerefine_candidates_parallel(
+    candidates,
+    seed_keys,
+    workers,
+    circuit,
+    resolved_bboxes,
+    fp_geometries,
+    clearance_mm,
+    board_layers,
+    emit,
+):
+    """Refine each unique (seed-key) candidate's pass-1 trio in a ``spawn``
+    worker pool, replacing the canonical entries of ``candidates`` in place with
+    the worker-refined objects.
+
+    Returns the set of refined canonical names, or ``None`` to tell the caller
+    to run the plain sequential loop instead (child process, too few unique
+    jobs, or ANY error — pickling, spawn, worker crash). On the ``None`` path
+    ``candidates`` is left untouched, so the fallback is byte-identical.
+
+    The canonical selection is first-seen-wins over ``seed_keys`` in candidate
+    order — identical to the sequential loop's dedup — so the loop's own dedup
+    reproduces the same canonical/dup assignment against the same keys.
+    """
+    import multiprocessing
+
+    # Belt-and-braces: never parallelize inside a spawn child (an unguarded
+    # driver script re-imports its module top level in every worker).
+    if multiprocessing.parent_process() is not None:
+        return None
+
+    seen: dict = {}
+    canonical_indices: list[int] = []
+    for i, key in enumerate(seed_keys):
+        if key not in seen:
+            seen[key] = i
+            canonical_indices.append(i)
+    if len(canonical_indices) < 2:
+        return None  # nothing to parallelize
+
+    try:
+        import pickle
+        from concurrent.futures import ProcessPoolExecutor
+
+        from .parallel import refine_candidate_worker
+        from .snapshot import snapshot_circuit
+
+        snapshot = snapshot_circuit(circuit)
+        payloads = {
+            i: pickle.dumps(
+                (
+                    candidates[i],
+                    snapshot,
+                    resolved_bboxes,
+                    fp_geometries,
+                    clearance_mm,
+                    board_layers,
+                )
+            )
+            for i in canonical_indices
+        }
+        k = min(workers, len(canonical_indices))
+        emit(
+            f"refining {len(canonical_indices)} unique candidate(s) in parallel "
+            f"({k} workers); per-ref progress is suppressed in parallel mode"
+        )
+        mp_ctx = multiprocessing.get_context("spawn")
+        refined_by_index: dict[int, object] = {}
+        with ProcessPoolExecutor(max_workers=k, mp_context=mp_ctx) as executor:
+            futures = {
+                executor.submit(refine_candidate_worker, payloads[i]): i
+                for i in canonical_indices
+            }
+            # Collect keyed by candidate index (NOT completion order).
+            for future, i in futures.items():
+                refined_by_index[i] = pickle.loads(future.result())
+    except Exception as exc:  # noqa: BLE001 - any failure -> sequential fallback
+        emit(
+            f"parallel refinement unavailable ({exc}); falling back to sequential"
+        )
+        return None
+
+    prerefined_names: set[str] = set()
+    for i in canonical_indices:
+        refined = refined_by_index[i]
+        candidates[i] = refined
+        prerefined_names.add(refined.name)
+        emit(f"[parallel] {refined.name}: refined")
+    return prerefined_names
+
+
 def plan_layout(
     circuit,
     fp_bboxes: dict[str, tuple[float, float]] | None = None,
@@ -2947,6 +3090,7 @@ def plan_layout(
     corner_radius_mm: float | None = None,
     candidate_names: list[str] | None = None,
     max_candidates: int | None = None,
+    parallel_workers: int | None = None,
     progress=None,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
@@ -2969,6 +3113,19 @@ def plan_layout(
     finalization, selection). Default ``None`` is silent and has zero behavioral
     effect. Placement can take minutes on a large board; a callback that prints
     (with ``flush=True``) makes it observable when stdout is redirected.
+
+    ``parallel_workers`` opts into refining the unique candidates' pass-1 trio
+    (orientation/decap/placement) concurrently in a spawn worker pool. The
+    ``SKIDL_LAYOUT_PARALLEL`` env var is the default; an explicit kwarg wins;
+    only a resolved value ``>= 2`` (with ``>= 2`` unique candidates) engages it.
+    Output is **identical** to the sequential default (each worker refines a
+    picklable :class:`~skidl_layout.snapshot.SnapshotCircuit`, proven
+    byte-identical), and ANY worker/pickling/spawn error falls back silently to
+    the sequential loop. Two caveats: (1) the **calling script must be
+    import-safe** — wrap its top level in ``if __name__ == "__main__":`` —
+    because ``multiprocessing`` on Windows re-imports it in every worker;
+    (2) per-ref ``progress`` lines are suppressed in parallel mode. Default
+    ``None`` stays fully sequential.
     """
     def _emit(message: str) -> None:
         if progress is not None:
@@ -3046,6 +3203,32 @@ def plan_layout(
         candidates = pruned
     _emit(f"generated {len(candidates)} candidate strategy(ies); refining")
 
+    # Seed keys precomputed ONCE, before any refinement mutates placed_parts, so
+    # the loop's dedup is stable even when parallel pre-refinement has already
+    # replaced the canonical candidates with their refined (mutated) selves.
+    seed_keys = [_candidate_seed_key(candidate) for candidate in candidates]
+
+    # WS18: opt-in parallel pass-1 refinement of the unique candidates. Byte-
+    # identical to sequential; returns the set of already-refined canonical
+    # names (empty when not engaged / on fallback), and mutates `candidates` in
+    # place with the worker-refined objects.
+    prerefined_names: set[str] = set()
+    resolved_workers = _resolve_parallel_workers(parallel_workers)
+    if resolved_workers is not None and resolved_workers >= 2:
+        result_names = _prerefine_candidates_parallel(
+            candidates,
+            seed_keys,
+            resolved_workers,
+            circuit,
+            resolved_bboxes,
+            fp_geometries,
+            clearance_mm,
+            board_layers,
+            _emit,
+        )
+        if result_names is not None:
+            prerefined_names = result_names
+
     candidate_scores: dict[str, LayoutScore] = {}
     candidate_validations: dict[str, ValidationResult] = {}
     # WS1: candidates whose (seed placement, constraints) match an already-refined
@@ -3054,7 +3237,7 @@ def plan_layout(
     canonical_by_key: dict[tuple, PlacementCandidate] = {}
     dup_canonical_name: dict[str, str] = {}
     for cand_index, candidate in enumerate(candidates, start=1):
-        seed_key = _candidate_seed_key(candidate)
+        seed_key = seed_keys[cand_index - 1]
         canonical = canonical_by_key.get(seed_key)
         if canonical is not None:
             dup_canonical_name[candidate.name] = canonical.name
@@ -3076,29 +3259,27 @@ def plan_layout(
                 f"identical to candidate '{canonical.name}'; refinement reused"
             )
             continue
-        _emit(f"[{cand_index}/{len(candidates)}] refining {candidate.name}")
-        refine_candidate_orientations(candidate, circuit, fp_geometries)
-        refine_candidate_decaps(
-            candidate,
-            circuit,
-            fp_geometries,
-            resolved_bboxes,
-            ctx=ctx,
-        )
-        refine_candidate_placement(
-            candidate,
-            circuit,
-            resolved_bboxes,
-            fp_geometries=fp_geometries,
-            clearance_mm=clearance_mm,
-            board_layers=board_layers,
-            ctx=ctx,
-            progress=(
-                (lambda m, _n=candidate.name: _emit(f"[{_n}] {m}"))
-                if progress is not None
-                else None
-            ),
-        )
+        if candidate.name in prerefined_names:
+            _emit(
+                f"[{cand_index}/{len(candidates)}] {candidate.name}: "
+                "refined (parallel)"
+            )
+        else:
+            _emit(f"[{cand_index}/{len(candidates)}] refining {candidate.name}")
+            _refine_candidate_trio(
+                candidate,
+                circuit,
+                resolved_bboxes,
+                fp_geometries,
+                clearance_mm,
+                board_layers,
+                ctx,
+                progress=(
+                    (lambda m, _n=candidate.name: _emit(f"[{_n}] {m}"))
+                    if progress is not None
+                    else None
+                ),
+            )
         canonical_by_key[seed_key] = candidate
         candidate.placed_parts = _apply_assembly_sides(
             candidate.placed_parts,

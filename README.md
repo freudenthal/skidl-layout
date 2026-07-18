@@ -74,6 +74,24 @@ refined. The seed score is a heuristic predictor, not the refined quality — us
 it for iteration, not the final board. `max_candidates` composes with
 `candidate_names` (filter first, then cap).
 
+To keep the full breadth but spend less wall-clock, refine the unique
+candidates concurrently with `plan_layout(circuit, parallel_workers=4)` (or set
+`SKIDL_LAYOUT_PARALLEL=4`; an explicit kwarg wins, and only a value `>= 2`
+engages it). Each worker refines a picklable snapshot of the circuit in a
+`spawn` process, so the **output is identical to the sequential default** — this
+is a speed knob, not a quality one — and any worker/pickling error falls back
+silently to the sequential path. Two caveats on Windows/`spawn`:
+
+- **The calling script must be import-safe** — wrap its top level in
+  `if __name__ == "__main__":`. `multiprocessing` re-imports the script in every
+  worker; an unguarded script would re-enter `plan_layout` recursively.
+- Per-ref `progress` lines are suppressed in parallel mode (candidate-level
+  messages still emit).
+
+`parallel_workers` composes with `candidate_names` / `max_candidates` (the cap
+happens first, then the survivors refine in parallel). The default is fully
+sequential.
+
 When redirecting output, run with `python -u` and pass a `progress=` callback
 (below) so a long placement stays observable.
 
