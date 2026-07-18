@@ -135,27 +135,50 @@ def _distance(a: PlacedPart, b: PlacedPart) -> float:
     return math.hypot(a.x_mm - b.x_mm, a.y_mm - b.y_mm)
 
 
-def _total_hpwl(placed_parts: list[PlacedPart], circuit) -> float:
-    if circuit is None:
-        return 0.0
+def _net_ref_lists(circuit, ctx=None) -> list[tuple[str, list[str]]]:
+    """(net_name, deduped ref list) for nets touching >=2 distinct refs.
 
+    Returns the ctx-cached topology when available, else the identical live
+    traversal (shared shape with congestion._net_refs). Positions are NOT
+    filtered here — callers filter refs against their own placed set per call.
+    """
+    if ctx is not None and ctx.net_ref_lists:
+        return ctx.net_ref_lists
+    if circuit is None:
+        return []
     try:
         from skidl.net import NCNet
     except Exception:
         NCNet = None
 
-    pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
-    total = 0.0
+    result: list[tuple[str, list[str]]] = []
     for net in circuit.get_nets():
         if NCNet is not None and isinstance(net, NCNet):
             continue
-        xs, ys = [], []
+        name = str(getattr(net, "name", "") or "")
+        refs: list[str] = []
         for pin in net.get_pins():
             ref = getattr(getattr(pin, "part", None), "ref", None)
-            if ref in pos_by_ref:
-                x, y = pos_by_ref[ref]
-                xs.append(x)
-                ys.append(y)
+            if ref is not None and ref not in refs:
+                refs.append(ref)
+        if len(refs) >= 2:
+            result.append((name, refs))
+    return result
+
+
+def _total_hpwl(placed_parts: list[PlacedPart], circuit, ctx=None) -> float:
+    if circuit is None:
+        return 0.0
+
+    pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
+    total = 0.0
+    for _name, refs in _net_ref_lists(circuit, ctx):
+        xs, ys = [], []
+        for ref in refs:
+            pos = pos_by_ref.get(ref)
+            if pos is not None:
+                xs.append(pos[0])
+                ys.append(pos[1])
         if len(xs) >= 2:
             total += (max(xs) - min(xs)) + (max(ys) - min(ys))
     return total
@@ -305,29 +328,22 @@ def _select_primary_owner_ref(
     return min(candidates)[-1]
 
 
-def _weighted_hpwl(placed_parts: list[PlacedPart], circuit) -> float:
+def _weighted_hpwl(placed_parts: list[PlacedPart], circuit, ctx=None) -> float:
     if circuit is None:
         return 0.0
-    try:
-        from skidl.net import NCNet
-    except Exception:
-        NCNet = None
 
     pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
     total = 0.0
-    for net in circuit.get_nets():
-        if NCNet is not None and isinstance(net, NCNet):
-            continue
+    for name, refs in _net_ref_lists(circuit, ctx):
         xs, ys = [], []
-        for pin in net.get_pins():
-            ref = getattr(getattr(pin, "part", None), "ref", None)
-            if ref in pos_by_ref:
-                x, y = pos_by_ref[ref]
-                xs.append(x)
-                ys.append(y)
+        for ref in refs:
+            pos = pos_by_ref.get(ref)
+            if pos is not None:
+                xs.append(pos[0])
+                ys.append(pos[1])
         if len(xs) >= 2:
             hpwl = (max(xs) - min(xs)) + (max(ys) - min(ys))
-            total += hpwl * _net_weight(str(getattr(net, "name", "") or ""))
+            total += hpwl * _net_weight(name)
     return total
 
 
@@ -342,24 +358,14 @@ def _segment_intersects(a1, a2, b1, b2) -> bool:
     return o1 * o2 < 0 and o3 * o4 < 0
 
 
-def _estimate_crossings(placed_parts: list[PlacedPart], circuit) -> int:
+def _estimate_crossings(placed_parts: list[PlacedPart], circuit, ctx=None) -> int:
     if circuit is None:
         return 0
-    try:
-        from skidl.net import NCNet
-    except Exception:
-        NCNet = None
 
     pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
     segments = []
-    for net in circuit.get_nets():
-        if NCNet is not None and isinstance(net, NCNet):
-            continue
-        refs = []
-        for pin in net.get_pins():
-            ref = getattr(getattr(pin, "part", None), "ref", None)
-            if ref in pos_by_ref and ref not in refs:
-                refs.append(ref)
+    for _name, all_refs in _net_ref_lists(circuit, ctx):
+        refs = [ref for ref in all_refs if ref in pos_by_ref]
         if len(refs) < 2:
             continue
         anchor = min(refs, key=lambda ref: (pos_by_ref[ref][0], pos_by_ref[ref][1], ref))
@@ -367,6 +373,10 @@ def _estimate_crossings(placed_parts: list[PlacedPart], circuit) -> int:
             if ref != anchor:
                 segments.append((anchor, ref, pos_by_ref[anchor], pos_by_ref[ref]))
 
+    return _count_segment_crossings(segments)
+
+
+def _count_segment_crossings_loop(segments) -> int:
     crossings = 0
     for idx, (a_ref, b_ref, a1, a2) in enumerate(segments):
         for c_ref, d_ref, b1, b2 in segments[idx + 1:]:
@@ -375,6 +385,11 @@ def _estimate_crossings(placed_parts: list[PlacedPart], circuit) -> int:
             if _segment_intersects(a1, a2, b1, b2):
                 crossings += 1
     return crossings
+
+
+def _count_segment_crossings(segments) -> int:
+    """Exact star-topology crossing count. Pairs sharing a ref are skipped."""
+    return _count_segment_crossings_loop(segments)
 
 
 def _pin_escape_congestion(placed_parts: list[PlacedPart], circuit) -> float:
@@ -915,7 +930,7 @@ def score_placement_quick(
     front_panel_trace = _front_panel_trace_metrics(placed_parts, circuit, roles)
     warnings.extend(front_panel_trace["warnings"])
     outline_metrics = _outline_utilization_metrics(placed_parts, fp_bboxes, outline)
-    total_hpwl = _total_hpwl(placed_parts, circuit)
+    total_hpwl = _total_hpwl(placed_parts, circuit, ctx)
 
     penalty = 0.0
     penalty += len(validation.overlaps) * 25.0
@@ -989,9 +1004,9 @@ def score_placement(
         power_plan = plan_power_routes(circuit, placed_parts, board_layers=board_layers)
         warnings.extend(power_plan.warnings)
     outline_metrics = _outline_utilization_metrics(placed_parts, fp_bboxes, outline)
-    total_hpwl = _total_hpwl(placed_parts, circuit)
-    weighted_hpwl = _weighted_hpwl(placed_parts, circuit)
-    crossing_count = _estimate_crossings(placed_parts, circuit)
+    total_hpwl = _total_hpwl(placed_parts, circuit, ctx)
+    weighted_hpwl = _weighted_hpwl(placed_parts, circuit, ctx)
+    crossing_count = _estimate_crossings(placed_parts, circuit, ctx)
     pin_escape_score = _pin_escape_congestion(placed_parts, circuit)
     congestion_map = build_congestion_map(
         placed_parts,
@@ -1000,6 +1015,7 @@ def score_placement(
         keepouts=keepouts,
         power_plan=power_plan,
         board_layers=board_layers,
+        ctx=ctx,
     )
     congestion_score = (
         pin_escape_score

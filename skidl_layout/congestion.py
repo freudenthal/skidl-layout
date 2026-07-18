@@ -160,7 +160,20 @@ def _add_demand(
                 reasons.append(reason)
 
 
-def _net_refs(circuit, placed_by_ref: dict[str, PlacedPart]) -> list[tuple[str, list[str]]]:
+def _net_refs(
+    circuit,
+    placed_by_ref: dict[str, PlacedPart],
+    ctx=None,
+) -> list[tuple[str, list[str]]]:
+    if ctx is not None and ctx.net_ref_lists:
+        # Cached topology (all nets with >=2 distinct refs). Filter to placed
+        # refs per call — identical result to the live traversal below.
+        result: list[tuple[str, list[str]]] = []
+        for name, all_refs in ctx.net_ref_lists:
+            refs = [ref for ref in all_refs if ref in placed_by_ref]
+            if len(refs) >= 2:
+                result.append((name, refs))
+        return result
     if circuit is None:
         return []
     try:
@@ -168,12 +181,12 @@ def _net_refs(circuit, placed_by_ref: dict[str, PlacedPart]) -> list[tuple[str, 
     except Exception:
         NCNet = None
 
-    result: list[tuple[str, list[str]]] = []
+    result = []
     for net in circuit.get_nets():
         if NCNet is not None and isinstance(net, NCNet):
             continue
         name = str(getattr(net, "name", "") or "")
-        refs: list[str] = []
+        refs = []
         for pin in net.get_pins():
             ref = getattr(getattr(pin, "part", None), "ref", None)
             if ref in placed_by_ref and ref not in refs:
@@ -199,13 +212,14 @@ def build_congestion_map(
     power_plan: PowerRoutePlan | None = None,
     board_layers: int = 2,
     cell_size_mm: float = 10.0,
+    ctx=None,
 ) -> CongestionMap:
     """Estimate routing pressure on a deterministic board grid."""
     congestion = _make_map(placed_parts, outline, cell_size_mm)
     placed_by_ref = {part.ref: part for part in placed_parts}
     layer_relief = 0.55 if board_layers >= 4 else 1.0
 
-    for name, refs in _net_refs(circuit, placed_by_ref):
+    for name, refs in _net_refs(circuit, placed_by_ref, ctx):
         xs = [placed_by_ref[ref].x_mm for ref in refs]
         ys = [placed_by_ref[ref].y_mm for ref in refs]
         margin = max(1.0, min(8.0, len(refs) * 0.75))
@@ -220,13 +234,14 @@ def build_congestion_map(
         )
 
     if circuit is not None:
-        roles = classify_parts(circuit)
+        roles = ctx.roles if ctx is not None else classify_parts(circuit)
+        pin_counts = ctx.pin_counts if ctx is not None else None
         part_by_ref = {part.ref: part for part in circuit.parts}
         for ref, part in part_by_ref.items():
             placed = placed_by_ref.get(ref)
             if placed is None:
                 continue
-            pins = _pin_count(part)
+            pins = pin_counts[ref] if pin_counts is not None and ref in pin_counts else _pin_count(part)
             role = roles.get(ref)
             role_factor = 1.4 if role is not None and role.role == "connector" else 1.0
             amount = min(6.0, pins / 8.0) * role_factor

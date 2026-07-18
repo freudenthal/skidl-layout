@@ -504,3 +504,83 @@ def test_four_layer_board_scores_long_high_current_path_better_than_two_layer():
 
     assert score_4_layer.score > score_2_layer.score
     assert score_4_layer.power_corridor_count >= 1
+
+
+def _fixture_circuit_and_placement():
+    """A multi-net circuit exercising HPWL, crossings, congestion and the
+    dedup edge cases (a single-part 2-pin net, a >=3-ref net)."""
+    vcc = _Net("VCC")
+    gnd = _Net("GND")
+    sig_a = _Net("SIG_A")
+    sig_b = _Net("SIG_B")
+    self_net = _Net("SELF")  # one part, two pins -> single distinct ref
+    u1 = _Part("U1", name="MCU", footprint="Package_QFP:MCU",
+               nets=[vcc, gnd, sig_a, sig_b], pins=6)
+    c1 = _Part("C1", value="1uF", footprint="Capacitor:C_0805", nets=[vcc, gnd])
+    c2 = _Part("C2", value="100nF", footprint="Capacitor:C_0805", nets=[vcc, gnd])
+    r1 = _Part("R1", value="10k", footprint="Resistor_SMD:R_0603", nets=[sig_a])
+    r2 = _Part("R2", value="1k", footprint="Resistor_SMD:R_0603", nets=[sig_b])
+    j1 = _Part("J1", name="Header", footprint="Connector:Header", nets=[sig_a, sig_b])
+    # self_net: both pins on r1 -> exercises the single-distinct-ref dedup path
+    r1.pins.append(_Pin(r1, self_net))
+    r1.pins.append(_Pin(r1, self_net))
+    circuit = _Circuit([u1, c1, c2, r1, r2, j1],
+                       [vcc, gnd, sig_a, sig_b, self_net])
+    placed = [
+        PlacedPart("U1", 40.0, 40.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("C1", 45.0, 30.0, 0.0, "Capacitor:C_0805"),
+        PlacedPart("C2", 30.0, 45.0, 90.0, "Capacitor:C_0805"),
+        PlacedPart("R1", 60.0, 20.0, 0.0, "Resistor_SMD:R_0603"),
+        PlacedPart("R2", 20.0, 60.0, 0.0, "Resistor_SMD:R_0603"),
+        PlacedPart("J1", 5.0, 5.0, 0.0, "Connector:Header"),
+    ]
+    return circuit, placed
+
+
+def test_ctx_cached_scoring_is_numerically_identical():
+    from skidl_layout.context import LayoutContext
+
+    circuit, placed = _fixture_circuit_and_placement()
+    outline = BoardOutline(80.0, 80.0)
+    ctx = LayoutContext.from_circuit(circuit)
+
+    no_ctx = score_placement(placed, circuit, BBOXES, outline=outline)
+    with_ctx = score_placement(placed, circuit, BBOXES, outline=outline, ctx=ctx)
+
+    for attr in (
+        "penalty",
+        "score",
+        "total_hpwl_mm",
+        "weighted_hpwl_mm",
+        "crossing_count",
+        "congestion_score",
+        "warning_count",
+    ):
+        assert getattr(no_ctx, attr) == getattr(with_ctx, attr), attr
+    assert no_ctx.to_dict() == with_ctx.to_dict()
+
+
+def test_ctx_net_ref_lists_excludes_nc_and_single_ref_nets():
+    from skidl_layout.context import LayoutContext
+
+    circuit, _ = _fixture_circuit_and_placement()
+    ctx = LayoutContext.from_circuit(circuit)
+    names = {name for name, _ in ctx.net_ref_lists}
+    # SELF is a single-part two-pin net -> excluded; multi-ref nets kept.
+    assert "SELF" not in names
+    assert {"VCC", "GND", "SIG_A", "SIG_B"} <= names
+    for _name, refs in ctx.net_ref_lists:
+        assert len(refs) == len(set(refs)) >= 2
+
+
+def test_ctx_cached_quick_score_is_numerically_identical():
+    from skidl_layout.context import LayoutContext
+    from skidl_layout.scoring import score_placement_quick
+
+    circuit, placed = _fixture_circuit_and_placement()
+    outline = BoardOutline(80.0, 80.0)
+    ctx = LayoutContext.from_circuit(circuit)
+
+    no_ctx = score_placement_quick(placed, circuit, BBOXES, outline=outline)
+    with_ctx = score_placement_quick(placed, circuit, BBOXES, outline=outline, ctx=ctx)
+    assert no_ctx.to_dict() == with_ctx.to_dict()
