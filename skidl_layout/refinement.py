@@ -9,7 +9,7 @@ from .constraints import LayoutConstraints
 from .geometry import FootprintGeometry, PadGeometry, transform_point
 from .placer import _find_clear_position, _overlaps_any
 from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_ui_grid_part
-from .scoring import LayoutScore, score_placement
+from .scoring import LayoutScore, _net_ref_lists, score_placement
 from .validator import _same_physical_side, _through_board_pads_collide, validate
 from .writer import PlacedPart
 
@@ -23,6 +23,10 @@ class RefinementResult:
     accepted_rotations: int = 0
     accepted_swaps: int = 0
     ref_reasons: dict[str, list[str]] = field(default_factory=dict)
+    # Raw (unclamped) penalties: on saturated boards start/final_score both
+    # clamp to 0.0, so the penalty is what actually shows local progress.
+    start_penalty: float = 0.0
+    final_penalty: float = 0.0
 
     @property
     def accepted_count(self) -> int:
@@ -1086,6 +1090,94 @@ def _rotation_trials(placed: PlacedPart) -> list[PlacedPart]:
     return trials
 
 
+# Two-tier trials: when a single ref generates more than this many candidate
+# positions, cheaply rank them (this-ref overlap count, then touching-net HPWL)
+# and full-score only the best RANK_LIMIT. Acceptance is still decided by
+# _is_better on the full score — only *which* trials get full-scored changes.
+RANK_LIMIT = 3
+
+
+def _rank_trial(
+    trial: PlacedPart,
+    ref: str,
+    other_boxes: list[tuple[float, float, float, float]],
+    touching_nets: list[tuple[str, list[str]]],
+    pos_base: dict[str, tuple[float, float]],
+    fp_bboxes: dict[str, tuple[float, float]],
+    fp_geometries: dict[str, FootprintGeometry] | None,
+) -> tuple[int, float]:
+    """Cheap O(neighbors) proxy for a trial's quality: (this-ref overlap count,
+    HPWL over the nets that touch this ref). Lower is better."""
+    w, h = _part_dimensions(trial, fp_bboxes, fp_geometries)
+    tx0 = trial.x_mm - w / 2
+    ty0 = trial.y_mm - h / 2
+    tx1 = trial.x_mm + w / 2
+    ty1 = trial.y_mm + h / 2
+    overlaps = 0
+    for ox0, oy0, ox1, oy1 in other_boxes:
+        if tx0 < ox1 and ox0 < tx1 and ty0 < oy1 and oy0 < ty1:
+            overlaps += 1
+
+    hpwl = 0.0
+    tx, ty = trial.x_mm, trial.y_mm
+    for _name, refs in touching_nets:
+        xs, ys = [], []
+        for r in refs:
+            if r == ref:
+                xs.append(tx)
+                ys.append(ty)
+            else:
+                pos = pos_base.get(r)
+                if pos is not None:
+                    xs.append(pos[0])
+                    ys.append(pos[1])
+        if len(xs) >= 2:
+            hpwl += (max(xs) - min(xs)) + (max(ys) - min(ys))
+    return overlaps, hpwl
+
+
+def _rank_and_limit_trials(
+    placed_parts: list[PlacedPart],
+    ref: str,
+    trials: list[PlacedPart],
+    circuit,
+    fp_bboxes: dict[str, tuple[float, float]],
+    fp_geometries: dict[str, FootprintGeometry] | None,
+    ctx,
+) -> list[PlacedPart]:
+    """Keep the RANK_LIMIT cheapest-ranked trials, stable by original index."""
+    pos_base = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
+    other_boxes: list[tuple[float, float, float, float]] = []
+    for pp in placed_parts:
+        if pp.ref == ref:
+            continue
+        w, h = _part_dimensions(pp, fp_bboxes, fp_geometries)
+        other_boxes.append(
+            (pp.x_mm - w / 2, pp.y_mm - h / 2, pp.x_mm + w / 2, pp.y_mm + h / 2)
+        )
+    touching_nets = [
+        (name, refs)
+        for name, refs in _net_ref_lists(circuit, ctx)
+        if ref in refs
+    ]
+    ranked = sorted(
+        enumerate(trials),
+        key=lambda item: (
+            _rank_trial(
+                item[1],
+                ref,
+                other_boxes,
+                touching_nets,
+                pos_base,
+                fp_bboxes,
+                fp_geometries,
+            ),
+            item[0],
+        ),
+    )
+    return [trial for _idx, trial in ranked[:RANK_LIMIT]]
+
+
 def _best_single_ref_trial(
     placed_parts: list[PlacedPart],
     current_score: LayoutScore,
@@ -1099,6 +1191,16 @@ def _best_single_ref_trial(
     board_layers: int,
     ctx=None,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
+    if len(trials) > RANK_LIMIT:
+        trials = _rank_and_limit_trials(
+            placed_parts,
+            ref,
+            trials,
+            circuit,
+            fp_bboxes,
+            fp_geometries,
+            ctx,
+        )
     best_parts = None
     best_score = current_score
     best_trial = None
@@ -1456,6 +1558,7 @@ def refine_placement(
         ctx,
     )
     start_score = current_score.score
+    start_penalty = current_score.penalty
     position_locked = _locked_position_refs(constraints, circuit)
     rotation_locked = _locked_rotation_refs(constraints)
     preanchored_refs = set(preanchored_refs or ())
@@ -1701,6 +1804,8 @@ def refine_placement(
         accepted_rotations=accepted_rotations,
         accepted_swaps=accepted_swaps,
         ref_reasons=ref_reasons,
+        start_penalty=start_penalty,
+        final_penalty=current_score.penalty,
     )
 
 

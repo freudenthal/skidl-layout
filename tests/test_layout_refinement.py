@@ -1098,3 +1098,40 @@ def test_refinement_score_sees_cutout_violations():
     clean = LayoutConstraints(outline=BoardOutline(100.0, 50.0))
     clean_score = _score(placed, circuit, BBOXES, clean, None, 0.5, 2)
     assert clean_score.cutout_violation_count == 0
+
+
+def test_two_tier_trials_deterministic():
+    from skidl_layout.refinement import RANK_LIMIT
+
+    circuit = _connected_circuit()
+    constraints = LayoutConstraints(outline=BoardOutline(100.0, 50.0))
+    placed = [
+        PlacedPart("U1", 20.0, 25.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 80.0, 25.0, 0.0, "Package_QFP:MCU"),
+    ]
+    assert RANK_LIMIT == 3
+    r1 = refine_placement(_clone(placed), circuit, BBOXES, constraints=constraints)
+    r2 = refine_placement(_clone(placed), circuit, BBOXES, constraints=constraints)
+    assert _signature(r1.placed_parts) == _signature(r2.placed_parts)
+
+
+def test_rank_and_limit_trials_stable_for_tied_ranks():
+    from skidl_layout.refinement import _rank_and_limit_trials, RANK_LIMIT
+    from dataclasses import replace as _replace
+
+    circuit = _connected_circuit()
+    placed = [
+        PlacedPart("U1", 20.0, 25.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 80.0, 25.0, 0.0, "Package_QFP:MCU"),
+    ]
+    base = placed[0]
+    # Many trials at the same coordinate -> identical rank; index breaks ties.
+    trials = [_replace(base, x_mm=20.0, y_mm=25.0) for _ in range(8)]
+    kept = _rank_and_limit_trials(placed, "U1", trials, circuit, BBOXES, None, None)
+    assert len(kept) == RANK_LIMIT
+    assert kept == trials[:RANK_LIMIT]
+
+
+def _clone(parts):
+    from dataclasses import replace as _replace
+    return [_replace(p) for p in parts]
