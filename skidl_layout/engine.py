@@ -3558,6 +3558,7 @@ def _prerefine_candidates_parallel(
     clearance_mm,
     board_layers,
     emit,
+    snapshot,
 ):
     """Refine each unique (seed-key) candidate's pass-1 trio in a ``spawn``
     worker pool, replacing the canonical entries of ``candidates`` in place with
@@ -3568,6 +3569,11 @@ def _prerefine_candidates_parallel(
     jobs, or ANY error — pickling, spawn, worker crash). On the ``None`` path
     ``candidates`` is left untouched, so the fallback is byte-identical.
 
+    ``snapshot`` is the picklable :class:`~skidl_layout.snapshot.SnapshotCircuit`
+    built once by the caller (round-6 WS22) and reused across both parallel
+    phases; the caller passes ``None`` only when it could not be built, in which
+    case this falls back to sequential.
+
     The canonical selection is first-seen-wins over ``seed_keys`` in candidate
     order — identical to the sequential loop's dedup — so the loop's own dedup
     reproduces the same canonical/dup assignment against the same keys.
@@ -3577,6 +3583,8 @@ def _prerefine_candidates_parallel(
     # Belt-and-braces: never parallelize inside a spawn child (an unguarded
     # driver script re-imports its module top level in every worker).
     if multiprocessing.parent_process() is not None:
+        return None
+    if snapshot is None:
         return None
 
     seen: dict = {}
@@ -3593,9 +3601,7 @@ def _prerefine_candidates_parallel(
         from concurrent.futures import ProcessPoolExecutor
 
         from .parallel import refine_candidate_worker
-        from .snapshot import snapshot_circuit
 
-        snapshot = snapshot_circuit(circuit)
         payloads = {
             i: pickle.dumps(
                 (
@@ -3637,6 +3643,87 @@ def _prerefine_candidates_parallel(
         prerefined_names.add(refined.name)
         emit(f"[parallel] {refined.name}: refined")
     return prerefined_names
+
+
+def _finalize_candidates_parallel(
+    candidates,
+    dup_canonical_name,
+    workers,
+    circuit,
+    params,
+    snapshot,
+    emit,
+):
+    """Finalize each *canonical* (non-dup) candidate's post-anchor pass in a
+    ``spawn`` worker pool (round-6 WS22), replacing the canonical entries of
+    ``candidates`` in place with the worker-mutated candidate objects and
+    returning ``{candidate_name: _FinalizedCandidate}`` for those canonicals.
+
+    Returns ``None`` to tell the caller to run the plain sequential finalize
+    loop instead (child process, no snapshot, < 2 canonicals, or ANY error —
+    pickling, spawn, worker crash). On the ``None`` path ``candidates`` is left
+    untouched, so the fallback is byte-identical.
+
+    Each canonical's finalize is independent of the others: the only nonlocal it
+    threaded (``density_outline``) is either read-only from the pre-loop value
+    (auto-outline path) or recomputed from a pure function inside the closure
+    (derive path), so shipping the same ``params`` to every worker and
+    discarding the workers' returned outline is exact (plan hazard #2).
+    """
+    import multiprocessing
+
+    if multiprocessing.parent_process() is not None:
+        return None
+    if snapshot is None:
+        return None
+
+    canonical_indices = [
+        i
+        for i, candidate in enumerate(candidates)
+        if candidate.name not in dup_canonical_name
+    ]
+    if len(canonical_indices) < 2:
+        return None
+
+    try:
+        import pickle
+        from concurrent.futures import ProcessPoolExecutor
+
+        from .parallel import finalize_candidate_worker
+
+        payloads = {
+            i: pickle.dumps((candidates[i], snapshot, params))
+            for i in canonical_indices
+        }
+        k = min(workers, len(canonical_indices))
+        emit(
+            f"finalizing {len(canonical_indices)} unique candidate(s) in "
+            f"parallel ({k} workers)"
+        )
+        mp_ctx = multiprocessing.get_context("spawn")
+        finalized_by_index: dict[int, _FinalizedCandidate] = {}
+        with ProcessPoolExecutor(max_workers=k, mp_context=mp_ctx) as executor:
+            futures = {
+                executor.submit(finalize_candidate_worker, payloads[i]): i
+                for i in canonical_indices
+            }
+            for future, i in futures.items():
+                finalized_by_index[i] = pickle.loads(future.result())
+    except Exception as exc:  # noqa: BLE001 - any failure -> sequential fallback
+        emit(
+            f"parallel finalize unavailable ({exc}); falling back to sequential"
+        )
+        return None
+
+    finalized_by_name: dict[str, _FinalizedCandidate] = {}
+    for i in canonical_indices:
+        finalized = finalized_by_index[i]
+        # The worker mutated & returned the whole candidate (finalize appends
+        # reasons and sets placed_parts/constraints/score); adopt it in place so
+        # the dup-reuse branch reads the finalized canonical (plan hazard #4).
+        candidates[i] = finalized.candidate
+        finalized_by_name[finalized.candidate.name] = finalized
+    return finalized_by_name
 
 
 def plan_layout(
@@ -3773,13 +3860,38 @@ def plan_layout(
     # replaced the canonical candidates with their refined (mutated) selves.
     seed_keys = [_candidate_seed_key(candidate) for candidate in candidates]
 
+    # WS18/WS22: opt-in parallel machinery. The picklable snapshot is built at
+    # most ONCE per plan_layout call (round-6 WS22) and reused by both the pass-1
+    # and finalize parallel phases; a build failure emits the fallback message
+    # and leaves both phases sequential (byte-identical). `resolved_workers` and
+    # `layout_snapshot` are hoisted here so the finalize dispatch below reuses
+    # them.
+    resolved_workers = _resolve_parallel_workers(parallel_workers)
+    parallel_enabled = resolved_workers is not None and resolved_workers >= 2
+    layout_snapshot = None
+    if parallel_enabled:
+        import multiprocessing
+
+        # Never parallelize inside a spawn child (an unguarded driver re-imports
+        # its module top level in every worker).
+        if multiprocessing.parent_process() is None:
+            try:
+                from .snapshot import snapshot_circuit
+
+                layout_snapshot = snapshot_circuit(circuit)
+            except Exception as exc:  # noqa: BLE001 - any failure -> sequential
+                _emit(
+                    f"parallel layout unavailable ({exc}); falling back to "
+                    "sequential"
+                )
+                layout_snapshot = None
+
     # WS18: opt-in parallel pass-1 refinement of the unique candidates. Byte-
     # identical to sequential; returns the set of already-refined canonical
     # names (empty when not engaged / on fallback), and mutates `candidates` in
     # place with the worker-refined objects.
     prerefined_names: set[str] = set()
-    resolved_workers = _resolve_parallel_workers(parallel_workers)
-    if resolved_workers is not None and resolved_workers >= 2:
+    if parallel_enabled and layout_snapshot is not None:
         result_names = _prerefine_candidates_parallel(
             candidates,
             seed_keys,
@@ -3790,6 +3902,7 @@ def plan_layout(
             clearance_mm,
             board_layers,
             _emit,
+            layout_snapshot,
         )
         if result_names is not None:
             prerefined_names = result_names
@@ -4019,6 +4132,41 @@ def plan_layout(
     _emit("finalizing candidates (snap / legalize / re-score)")
     finalized_candidates: dict[str, _FinalizedCandidate] = {}
     finalized_by_canonical: dict[str, _FinalizedCandidate] = {}
+
+    # WS22: opt-in parallel finalize of the canonical candidates. Each finalize
+    # is independent (plan hazard #2), so the canonicals run in the reused spawn
+    # pool while the dup-reuse branch stays sequential and untouched. ANY failure
+    # (or too few canonicals / no snapshot) -> `None` and the plain loop runs.
+    # Byte-identical to the sequential default; `candidates` canonicals are
+    # replaced in place with the worker-mutated objects (plan hazard #4).
+    parallel_finalized = None
+    if parallel_enabled:
+        finalize_params = _FinalizeParams(
+            resolved_bboxes=resolved_bboxes,
+            fp_geometries=fp_geometries,
+            clearance_mm=clearance_mm,
+            board_layers=board_layers,
+            margin_mm=margin_mm,
+            corner_radius_mm=corner_radius_mm,
+            form_factor=form_factor,
+            auto_outline=auto_outline,
+            resolved_outline=resolved_outline,
+            resolved_constraints=resolved_constraints,
+            density_outline=density_outline,
+            intent_plan=intent_plan,
+            derive_outline_if_missing=derive_outline_if_missing,
+            constraints=constraints,
+        )
+        parallel_finalized = _finalize_candidates_parallel(
+            candidates,
+            dup_canonical_name,
+            resolved_workers,
+            circuit,
+            finalize_params,
+            layout_snapshot,
+            _emit,
+        )
+
     for candidate in candidates:
         canonical_name = dup_canonical_name.get(candidate.name)
         if canonical_name is not None:
@@ -4051,7 +4199,13 @@ def plan_layout(
                 keepouts=base.keepouts,
             )
         else:
-            finalized = _finalize_candidate(candidate)
+            if parallel_finalized is not None:
+                # `candidates[i]` was replaced in place with the worker's
+                # mutated candidate, so `candidate` here IS that object and its
+                # name keys the worker result.
+                finalized = parallel_finalized[candidate.name]
+            else:
+                finalized = _finalize_candidate(candidate)
             finalized_by_canonical[candidate.name] = finalized
         finalized_candidates[candidate.name] = finalized
     candidate_validations = {

@@ -42,3 +42,25 @@ def refine_candidate_worker(payload: bytes) -> bytes:
         progress=None,
     )
     return pickle.dumps(candidate)
+
+
+def finalize_candidate_worker(payload: bytes) -> bytes:
+    """Round-6 WS22 worker: finalize one canonical candidate's post-anchor pass.
+
+    Mirrors :func:`refine_candidate_worker` — a single ``bytes`` argument so any
+    pickling error surfaces in the parent at ``pickle.dumps`` time. Rebuilds the
+    :class:`LayoutContext` from the snapshot (a pure function of it) rather than
+    pickling the context, runs the extracted finalize impl with ``emit=None`` /
+    ``progress=None`` (byte-identical to the sequential default), and returns the
+    mutated ``_FinalizedCandidate`` as pickled bytes.
+    """
+    (candidate, snapshot, params) = pickle.loads(payload)
+
+    from .context import LayoutContext
+    from .engine import _finalize_candidate_impl
+
+    ctx = LayoutContext.from_circuit(snapshot)
+    finalized, _ = _finalize_candidate_impl(
+        candidate, snapshot, params, ctx, emit=None, progress=None
+    )
+    return pickle.dumps(finalized)

@@ -1,7 +1,8 @@
-"""Round-6 WS21 finalize tests: picklability of the extracted finalize params /
-result, and a small-circuit form of the live-vs-snapshot finalize identity check.
+"""Round-6 finalize tests: WS21 picklability of the extracted finalize params /
+result, and WS22 opt-in parallel finalize == sequential + fallback.
 
-Reuses the fakes from tests/test_layout_parallel.py (tiny 3-part circuit).
+Reuses the fakes from tests/test_layout_parallel.py (spawn-safe module-level
+worker + tiny 3-part circuit).
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from skidl_layout.engine import (
 from skidl_layout.intent import infer_placement_intents
 from skidl_layout.snapshot import snapshot_circuit
 
-from tests.test_layout_parallel import BBOXES, _circuit
+from tests.test_layout_parallel import BBOXES, _circuit, _sig
 
 
 # --- WS21: picklability ------------------------------------------------------
@@ -57,7 +58,9 @@ def test_finalize_params_pickles():
 
 
 def test_finalized_candidate_pickles():
-    """A full _FinalizedCandidate (the finalize result) round-trips."""
+    """A full _FinalizedCandidate (the worker's return value) round-trips."""
+    result = plan_layout(_circuit(), fp_bboxes=BBOXES)
+    # Rebuild one via the impl so we pickle the real dataclass, not LayoutResult.
     from skidl_layout.writer import PlacedPart
 
     circuit = _circuit()
@@ -113,3 +116,90 @@ def test_finalize_impl_live_equals_snapshot():
         )
 
     assert sig(live) == sig(snap)
+
+
+# --- WS22: opt-in parallel finalize == sequential ----------------------------
+
+
+def test_parallel_finalize_matches_sequential():
+    seq = plan_layout(_circuit(), fp_bboxes=BBOXES)
+    msgs: list[str] = []
+    par = plan_layout(
+        _circuit(), fp_bboxes=BBOXES, parallel_workers=2,
+        progress=lambda m: msgs.append(m),
+    )
+    assert _sig(par) == _sig(seq)
+    assert par.score.to_dict() == seq.score.to_dict()
+    assert par.report == seq.report
+    assert [c.name for c in par.candidates] == [c.name for c in seq.candidates]
+
+
+def test_finalize_worker_roundtrip():
+    """finalize_candidate_worker (in-process) == _finalize_candidate_impl on the
+    same snapshot payload."""
+    from skidl_layout.parallel import finalize_candidate_worker
+    from skidl_layout.writer import PlacedPart
+
+    circuit = _circuit()
+    snap = snapshot_circuit(circuit)
+    ctx = LayoutContext.from_circuit(snap)
+    placed = [
+        PlacedPart("U1", 10.0, 10.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("C1", 14.0, 10.0, 0.0, "Capacitor:C_0805"),
+        PlacedPart("J1", 30.0, 10.0, 0.0, "Connector:USB"),
+    ]
+    plan = infer_placement_intents(snap)
+    params = _FinalizeParams(
+        resolved_bboxes=dict(BBOXES),
+        fp_geometries={},
+        clearance_mm=0.5,
+        board_layers=2,
+        margin_mm=3.0,
+        corner_radius_mm=None,
+        form_factor=None,
+        auto_outline=False,
+        resolved_outline=None,
+        resolved_constraints=None,
+        density_outline=None,
+        intent_plan=plan,
+        derive_outline_if_missing=False,
+        constraints=None,
+    )
+    cand_a = PlacementCandidate(name="baseline", placed_parts=list(placed))
+    _refine_candidate_trio(cand_a, snap, BBOXES, {}, 0.5, 2, ctx, None)
+    cand_b = PlacementCandidate(name="baseline", placed_parts=list(placed))
+    _refine_candidate_trio(cand_b, snap, BBOXES, {}, 0.5, 2, ctx, None)
+
+    expected, _ = _finalize_candidate_impl(cand_a, snap, params, ctx, None, None)
+    payload = pickle.dumps((cand_b, snap, params))
+    got = pickle.loads(finalize_candidate_worker(payload))
+
+    esig = [(p.ref, p.x_mm, p.y_mm, p.rot_deg, p.side) for p in expected.placed_parts]
+    gsig = [(p.ref, p.x_mm, p.y_mm, p.rot_deg, p.side) for p in got.placed_parts]
+    assert gsig == esig
+    assert got.score.to_dict() == expected.score.to_dict()
+
+
+def test_parallel_finalize_fallback_on_error(monkeypatch):
+    """An error raised while dispatching the finalize pool is caught inside
+    _finalize_candidates_parallel -> sequential fallback, byte-identical result,
+    fallback message. Patching ProcessPoolExecutor (resolved at call time via a
+    local import) trips the internal try/except without a real spawn."""
+    import concurrent.futures as cf
+
+    seq = plan_layout(_circuit(), fp_bboxes=BBOXES)
+
+    def boom(*a, **k):
+        raise RuntimeError("pool exploded")
+
+    monkeypatch.setattr(cf, "ProcessPoolExecutor", boom)
+    msgs: list[str] = []
+    par = plan_layout(
+        _circuit(), fp_bboxes=BBOXES, parallel_workers=2,
+        progress=lambda m: msgs.append(m),
+    )
+    assert _sig(par) == _sig(seq)
+    assert par.score.to_dict() == seq.score.to_dict()
+    assert any(
+        "parallel finalize unavailable" in m and "sequential" in m for m in msgs
+    )
