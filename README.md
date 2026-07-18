@@ -77,10 +77,12 @@ it for iteration, not the final board. `max_candidates` composes with
 To keep the full breadth but spend less wall-clock, refine the unique
 candidates concurrently with `plan_layout(circuit, parallel_workers=4)` (or set
 `SKIDL_LAYOUT_PARALLEL=4`; an explicit kwarg wins, and only a value `>= 2`
-engages it). Each worker refines a picklable snapshot of the circuit in a
-`spawn` process, so the **output is identical to the sequential default** — this
-is a speed knob, not a quality one — and any worker/pickling error falls back
-silently to the sequential path. Two caveats on Windows/`spawn`:
+engages it). The same knob parallelizes **both** heavy phases — the pass-1
+refinement trio and the finalize / post-anchor pass — each running the unique
+candidates in a `spawn` worker pool over a picklable snapshot of the circuit, so
+the **output is identical to the sequential default** — this is a speed knob,
+not a quality one — and any worker/pickling error falls back silently to the
+sequential path. Two caveats on Windows/`spawn`:
 
 - **The calling script must be import-safe** — wrap its top level in
   `if __name__ == "__main__":`. `multiprocessing` re-imports the script in every
