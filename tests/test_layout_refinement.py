@@ -205,6 +205,33 @@ def test_refinement_preserves_back_side_when_moving_part():
     assert by_ref["U2"].side == "back"
 
 
+def test_refine_placement_progress_emits_per_ref():
+    """WS13: progress callback fires at least one per-ref message, and passing
+    progress=None vs a collecting callback yields byte-identical placements."""
+    circuit = _connected_circuit()
+    constraints = LayoutConstraints(
+        outline=BoardOutline(100.0, 50.0),
+        fixed=[FixedPosition("U1", 10.0, 10.0)],
+    )
+    placed = [
+        PlacedPart("U1", 10.0, 10.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("U2", 80.0, 10.0, 0.0, "Package_QFP:MCU"),
+    ]
+
+    messages = []
+    with_cb = refine_placement(
+        [PlacedPart(p.ref, p.x_mm, p.y_mm, p.rot_deg, p.footprint) for p in placed],
+        circuit, BBOXES, constraints=constraints, progress=messages.append,
+    )
+    silent = refine_placement(
+        [PlacedPart(p.ref, p.x_mm, p.y_mm, p.rot_deg, p.footprint) for p in placed],
+        circuit, BBOXES, constraints=constraints, progress=None,
+    )
+
+    assert any("ref 1/" in m for m in messages)
+    assert _signature(with_cb.placed_parts) == _signature(silent.placed_parts)
+
+
 def test_refinement_preserves_edge_anchor_positions():
     vbus = _Net("VBUS")
     j1 = _Part("J1", "Connector:USB", name="USB connector", nets=[vbus], pins=4)

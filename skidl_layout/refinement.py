@@ -1544,8 +1544,15 @@ def refine_placement(
     max_legalization_moves: int = 64,
     preanchored_refs: set[str] | None = None,
     ctx=None,
+    progress=None,
 ) -> RefinementResult:
-    """Apply deterministic score-gated local placement adjustments."""
+    """Apply deterministic score-gated local placement adjustments.
+
+    ``progress`` (optional ``callable(str)``) is invoked at per-ref, swap-loop
+    and legalization-loop boundaries for observability only. It must never
+    influence a decision: with ``progress=None`` (the default) the refinement
+    is byte-identical.
+    """
     current_parts = _clone_placed(placed_parts)
     current_score = _score(
         current_parts,
@@ -1574,7 +1581,7 @@ def refine_placement(
     ref_reasons: dict[str, list[str]] = {}
     pin_gravity_anchored_refs: set[str] = set(preanchored_refs)
 
-    for _ in range(max_passes):
+    for _pass_idx in range(max_passes):
         changed = False
         placed_by_ref = {part.ref: part for part in current_parts}
         neighbors, degrees = _ref_neighbors(circuit, placed_by_ref)
@@ -1593,7 +1600,11 @@ def refine_placement(
         movable_refs.sort(key=lambda ref: (-degrees.get(ref, 0), ref))
         movable_refs = movable_refs[:max_movable_refs]
 
-        for ref in movable_refs:
+        for _ref_idx, ref in enumerate(movable_refs):
+            if progress is not None:
+                progress(
+                    f"pass {_pass_idx}: ref {_ref_idx + 1}/{len(movable_refs)} {ref}"
+                )
             placed_by_ref = {part.ref: part for part in current_parts}
             placed = placed_by_ref[ref]
             width_mm, height_mm = _part_dimensions(
@@ -1720,6 +1731,8 @@ def refine_placement(
                     f"locally rotated to {trial.rot_deg:.0f} deg after scoring"
                 )
 
+        if progress is not None:
+            progress(f"pass {_pass_idx}: swap loop ({len(movable_refs)} refs)")
         placed_by_ref = {part.ref: part for part in current_parts}
         swap_attempts = 0
         for idx, ref_a in enumerate(movable_refs):
@@ -1768,6 +1781,8 @@ def refine_placement(
                 )
                 break
 
+        if progress is not None:
+            progress(f"pass {_pass_idx}: legalization loop")
         legalizations = 0
         while legalizations < max_legalization_moves:
             placed_by_ref = {part.ref: part for part in current_parts}
@@ -1817,6 +1832,7 @@ def refine_candidate_placement(
     clearance_mm: float = 0.5,
     board_layers: int = 2,
     ctx=None,
+    progress=None,
 ) -> RefinementResult:
     result = refine_placement(
         candidate.placed_parts,
@@ -1828,6 +1844,7 @@ def refine_candidate_placement(
         board_layers=board_layers,
         preanchored_refs=set(candidate.pin_gravity_anchored_refs),
         ctx=ctx,
+        progress=progress,
     )
     if result.accepted_count == 0:
         return result

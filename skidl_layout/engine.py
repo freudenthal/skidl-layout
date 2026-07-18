@@ -3093,6 +3093,11 @@ def plan_layout(
             clearance_mm=clearance_mm,
             board_layers=board_layers,
             ctx=ctx,
+            progress=(
+                (lambda m, _n=candidate.name: _emit(f"[{_n}] {m}"))
+                if progress is not None
+                else None
+            ),
         )
         canonical_by_key[seed_key] = candidate
         candidate.placed_parts = _apply_assembly_sides(
@@ -3509,6 +3514,11 @@ def plan_layout(
             max_movable_refs=32,
             max_pair_swaps=8,
             ctx=ctx,
+            progress=(
+                (lambda m, _n=candidate.name: _emit(f"[{_n}] post-anchor {m}"))
+                if progress is not None
+                else None
+            ),
         )
         if post_refinement.accepted_count:
             placed_parts = post_refinement.placed_parts
