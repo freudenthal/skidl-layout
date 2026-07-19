@@ -623,6 +623,7 @@ def _finalize_candidate_impl(
         keepouts=candidate_keepouts,
         cutouts=getattr(candidate_constraints, "cutouts", None),
         fp_geometries=fp_geometries,
+        ctx=ctx,
     )
     raw_score = score_placement(
         placed_parts,
@@ -3655,6 +3656,7 @@ def _posttrio_candidate_impl(
         keepouts=candidate_keepouts,
         cutouts=getattr(candidate_constraints, "cutouts", None),
         fp_geometries=fp_geometries,
+        ctx=ctx,
     )
     if not validation.ok:
         raw_score = score_placement_quick(

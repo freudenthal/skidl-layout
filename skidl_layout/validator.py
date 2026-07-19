@@ -355,18 +355,30 @@ def _check_cutout_violations(
 def _compute_hpwl(
     placed: list[PlacedPart],
     circuit,
+    net_pins: list[tuple[str, list[str]]] | None = None,
 ) -> list[tuple[str, float, list[str]]]:
     pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed}
-    net_hpwl: list[tuple[str, float]] = []
+    # Round-9 WS33: net_pins is the ctx-cached connectivity walk
+    # (LayoutContext.hpwl_net_pins). None -> build the identical pairs
+    # live (single source of truth for the loop below; plan hazard #3).
+    if net_pins is None:
+        net_pins = []
+        for net in circuit.get_nets():
+            if is_nc_net(net):
+                continue
+            pin_refs = [
+                ref
+                for pin in net.get_pins()
+                if (ref := getattr(getattr(pin, "part", None), "ref", None))
+            ]
+            net_pins.append((net.name, pin_refs))
 
-    for net in circuit.get_nets():
-        if is_nc_net(net):
-            continue
+    net_hpwl: list[tuple[str, float]] = []
+    for name, pin_refs in net_pins:
         xs, ys = [], []
         refs = []
-        for pin in net.get_pins():
-            ref = getattr(getattr(pin, "part", None), "ref", None)
-            if ref and ref in pos_by_ref:
+        for ref in pin_refs:
+            if ref in pos_by_ref:
                 x, y = pos_by_ref[ref]
                 xs.append(x)
                 ys.append(y)
@@ -375,7 +387,7 @@ def _compute_hpwl(
         if len(xs) < 2:
             continue
         hpwl = (max(xs) - min(xs)) + (max(ys) - min(ys))
-        net_hpwl.append((net.name, hpwl, refs))
+        net_hpwl.append((name, hpwl, refs))
 
     net_hpwl.sort(key=lambda t: t[1], reverse=True)
     return net_hpwl[:10]
@@ -390,6 +402,7 @@ def validate(
     keepouts=None,
     cutouts=None,
     fp_geometries: dict[str, FootprintGeometry] | None = None,
+    ctx=None,
 ) -> ValidationResult:
     result = ValidationResult(placed_parts=len(placed_parts))
 
@@ -412,7 +425,8 @@ def validate(
         placed_refs = {pp.ref for pp in placed_parts}
         result.missing_refs = sorted(circuit_refs - placed_refs - {None})
         result.extra_refs = sorted(placed_refs - circuit_refs)
-        worst_hpwl = _compute_hpwl(placed_parts, circuit)
+        memo = getattr(ctx, "hpwl_net_pins", None) if ctx is not None else None
+        worst_hpwl = _compute_hpwl(placed_parts, circuit, net_pins=memo)
         result.worst_hpwl_nets = [(name, hpwl) for name, hpwl, _ in worst_hpwl]
         result.worst_hpwl_refs = {name: refs for name, _, refs in worst_hpwl}
 

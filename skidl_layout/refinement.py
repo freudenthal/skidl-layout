@@ -1280,6 +1280,7 @@ def _best_pin_gravity_trial(
             constraints,
             fp_geometries,
             clearance_mm,
+            ctx=ctx,
         ):
             continue
         if not _ref_is_clear_of_drc_courtyards(
@@ -1322,6 +1323,7 @@ def _ref_is_clear_of_hard_violations(
     constraints: LayoutConstraints | None,
     fp_geometries: dict[str, FootprintGeometry] | None,
     clearance_mm: float,
+    ctx=None,
 ) -> bool:
     validation = validate(
         placed_parts,
@@ -1331,6 +1333,7 @@ def _ref_is_clear_of_hard_violations(
         outline=constraints.outline if constraints is not None else None,
         keepouts=constraints.keepouts if constraints is not None else None,
         fp_geometries=fp_geometries,
+        ctx=ctx,
     )
     if any(ref in pair for pair in validation.overlaps):
         return False
@@ -1443,6 +1446,7 @@ def _legalize_one_overlap(
         keepouts=constraints.keepouts if constraints is not None else None,
         cutouts=constraints.cutouts if constraints is not None else None,
         fp_geometries=fp_geometries,
+        ctx=ctx,
     )
     if not validation.overlaps:
         return None

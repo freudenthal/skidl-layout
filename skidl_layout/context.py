@@ -39,6 +39,13 @@ class LayoutContext:
     # ref -> _part_tokens(part), the owner-affinity token set used by scoring's
     # _role_warnings. Circuit-invariant (derived from ref/name/value/footprint).
     part_tokens: dict[str, set[str]] = field(default_factory=dict)
+    # Round-9 WS33: per-net pin->ref walk for validator._compute_hpwl,
+    # cached because connectivity never changes during a plan. For each
+    # non-NC net in circuit.get_nets() ORDER: (net.name, [ref for each pin
+    # in net.get_pins() order — duplicates KEPT, pins without a part ref
+    # dropped]). None (the default) means "not built" — validate falls back
+    # to the live walk (hand-built LayoutContext() test fakes hit this).
+    hpwl_net_pins: list[tuple[str, list[str]]] | None = None
     # Lazy memos for plan_power_routes' circuit-invariant inputs. Built on
     # first use (not in from_circuit) so non-power users pay nothing. The
     # cached objects are shared across PowerRoutePlan results — read-only by
@@ -109,7 +116,27 @@ class LayoutContext:
             net_ref_lists=_build_net_ref_lists(circuit),
             pin_counts=pin_counts,
             part_tokens=part_tokens,
+            hpwl_net_pins=_build_hpwl_net_pins(circuit),
         )
+
+
+def _build_hpwl_net_pins(circuit) -> list[tuple[str, list[str]]]:
+    """Walk circuit.get_nets() exactly as validator._compute_hpwl does,
+    minus the placement filter (positions vary; connectivity does not).
+    Pin-level, order-preserved, duplicates kept (plan hazard #4)."""
+    if circuit is None:
+        return []
+    result: list[tuple[str, list[str]]] = []
+    for net in circuit.get_nets():
+        if is_nc_net(net):
+            continue
+        pin_refs = [
+            ref
+            for pin in net.get_pins()
+            if (ref := getattr(getattr(pin, "part", None), "ref", None))
+        ]
+        result.append((net.name, pin_refs))
+    return result
 
 
 def _build_net_ref_lists(circuit) -> list[tuple[str, list[str]]]:

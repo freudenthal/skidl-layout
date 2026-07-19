@@ -973,6 +973,7 @@ def score_placement_quick(
         keepouts=keepouts,
         cutouts=cutouts,
         fp_geometries=fp_geometries,
+        ctx=ctx,
     )
     roles = ctx.roles if ctx is not None else (classify_parts(circuit) if circuit is not None else {})
     warnings = _role_warnings(
@@ -1044,6 +1045,7 @@ def score_placement(
         keepouts=keepouts,
         cutouts=cutouts,
         fp_geometries=fp_geometries,
+        ctx=ctx,
     )
     roles = ctx.roles if ctx is not None else (classify_parts(circuit) if circuit is not None else {})
     warnings = _role_warnings(
