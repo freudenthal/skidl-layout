@@ -18,9 +18,9 @@ It is **complementary** to a schematic-generation path: given a SKiDL `Circuit`,
 - Classifies parts (roles), infers placement intent, and places footprints on a
   board outline scored by congestion / routability / power topology.
 - Emits a `.kicad_pcb` (footprint placement, no copper) via `write_kicad_pcb`.
-- Optionally invokes `kicad-cli` DRC and a Freerouting pass for routability
-  feedback (both **external tools**, feature-gated, invoked via `subprocess` —
-  not Python dependencies).
+- Optionally invokes `kicad-cli` DRC and a KiCadRoutingTools autoroute pass for
+  routability feedback (both **external tools**, feature-gated, invoked via
+  `subprocess` — not Python dependencies).
 
 ## Install
 
@@ -147,7 +147,18 @@ objective) and `layout_score=100.0` (clean rubric) at once.
 
 - **KiCad `kicad-cli`** — DRC feedback (`validator.run_kicad_drc`,
   `find_kicad_cli`). Skipped if not found.
-- **Freerouting** (external Java) — routability feedback. Feature-gated.
+- **KiCadRoutingTools (KRT)** — routability feedback (`krt.evaluate_routability`,
+  `krt.route_and_check`, `krt.find_krt`). Request-only, never called from
+  `plan_layout`. The checkout is discovered by path at runtime — explicit arg,
+  env `SKIDL_LAYOUT_KRT_DIR`, or the workspace sibling `../KiCadRoutingTools` —
+  and its `route.py` / `check_connected.py` / `check_drc.py` CLIs are invoked via
+  `subprocess` (not imported, installed, or vendored). Skipped if not found
+  (`find_krt()` returns `None`; `route_and_check` raises `KrtNotFoundError`).
+  Populates the existing `RoutabilityFeedback` / `LayoutResult.routability` slot.
+
+  > **Freerouting was never wired in and has been dropped.** The earlier
+  > Freerouting-Java idea was never implemented; KRT replaces it. No Java, no
+  > Freerouting install, and no new Python dependencies are required.
 
 ## Tests
 

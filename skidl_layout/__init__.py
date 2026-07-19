@@ -70,6 +70,12 @@ from .refinement import (
 from .report import CandidateReport, NetExplanation, PartExplanation, PlacementReport
 from .roles import PartRole, classify_part, classify_parts
 from .routability import RoutabilityFeedback
+from .krt import (
+    KrtNotFoundError,
+    evaluate_routability,
+    find_krt,
+    route_and_check,
+)
 from .scoring import LayoutScore, score_placement, score_placement_quick
 from .spatial import SpatialGrid
 from .validator import ValidationResult, find_kicad_cli, run_kicad_drc, validate

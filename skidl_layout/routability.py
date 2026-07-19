@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 
 @dataclass
 class RoutabilityFeedback:
-    """Structured feedback from external routing (Freerouting, KiCad DRC)."""
+    """Structured feedback from external routing.
+
+    Populated by KiCadRoutingTools (route.py + check_connected.py +
+    check_drc.py) via ``skidl_layout.krt.evaluate_routability`` /
+    ``route_and_check``.
+    """
 
     unrouted_count: int = 0
     total_nets: int = 0
