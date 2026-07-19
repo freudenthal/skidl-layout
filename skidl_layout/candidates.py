@@ -533,8 +533,27 @@ def _append_candidate(
     intent_plan: PlacementIntentPlan | None = None,
     power_topology: PowerTopology | None = None,
     fp_geometries: dict[str, object] | None = None,
+    seed_memo: list[tuple[LayoutConstraints, list[PlacedPart]]] | None = None,
 ):
-    placed = place_parts(groups, constraints, fp_bboxes, fp_geometries=fp_geometries)
+    # Round-10 WS37: place_parts is deterministic in its inputs, and on
+    # boards where a strategy's intents are absent several strategies
+    # produce IDENTICAL LayoutConstraints (verified on DPSG: 8 builds ->
+    # 5 unique). Memoize the seed placement by constraints equality
+    # (eq=True dataclass; unhashable -> linear scan, <=9 entries). Copy on
+    # BOTH store and reuse (plan hazard #2) so no two candidates — and no
+    # candidate + memo entry — ever share a mutable PlacedPart instance.
+    placed = None
+    if seed_memo is not None:
+        for known_constraints, known_placed in seed_memo:
+            if known_constraints == constraints:
+                placed = [replace(p) for p in known_placed]
+                break
+    if placed is None:
+        placed = place_parts(
+            groups, constraints, fp_bboxes, fp_geometries=fp_geometries
+        )
+        if seed_memo is not None:
+            seed_memo.append((constraints, [replace(p) for p in placed]))
     candidate = PlacementCandidate(
         name=name,
         placed_parts=placed,
@@ -555,6 +574,7 @@ def generate_placement_candidates(
 ) -> list[PlacementCandidate]:
     """Generate deterministic placement candidates from available intent."""
     candidates: list[PlacementCandidate] = []
+    seed_memo: list[tuple[LayoutConstraints, list[PlacedPart]]] = []
 
     _append_candidate(
         candidates,
@@ -566,6 +586,7 @@ def generate_placement_candidates(
         intent_plan,
         power_topology,
         fp_geometries,
+        seed_memo=seed_memo,
     )
     _append_candidate(
         candidates,
@@ -577,6 +598,7 @@ def generate_placement_candidates(
         intent_plan,
         power_topology,
         fp_geometries,
+        seed_memo=seed_memo,
     )
     if intent_plan is not None and intent_plan.refs_with_kind("panel_template"):
         _append_candidate(
@@ -589,6 +611,7 @@ def generate_placement_candidates(
             intent_plan,
             power_topology,
             fp_geometries,
+            seed_memo=seed_memo,
         )
     _append_candidate(
         candidates,
@@ -600,6 +623,7 @@ def generate_placement_candidates(
         intent_plan,
         power_topology,
         fp_geometries,
+        seed_memo=seed_memo,
     )
     _append_candidate(
         candidates,
@@ -611,6 +635,7 @@ def generate_placement_candidates(
         intent_plan,
         power_topology,
         fp_geometries,
+        seed_memo=seed_memo,
     )
     _append_candidate(
         candidates,
@@ -622,6 +647,7 @@ def generate_placement_candidates(
         intent_plan,
         power_topology,
         fp_geometries,
+        seed_memo=seed_memo,
     )
     _append_candidate(
         candidates,
@@ -633,6 +659,7 @@ def generate_placement_candidates(
         intent_plan,
         power_topology,
         fp_geometries,
+        seed_memo=seed_memo,
     )
     _append_candidate(
         candidates,
@@ -644,6 +671,7 @@ def generate_placement_candidates(
         intent_plan,
         power_topology,
         fp_geometries,
+        seed_memo=seed_memo,
     )
 
     if intent_plan is not None and intent_plan.backend_status.enabled:
@@ -660,6 +688,7 @@ def generate_placement_candidates(
             intent_plan,
             power_topology,
             fp_geometries,
+            seed_memo=seed_memo,
         )
 
     return candidates
