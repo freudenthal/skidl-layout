@@ -14,6 +14,16 @@ from .placer import place_parts
 from .power import PowerTopology
 from .writer import PlacedPart
 
+# NOTE: ``scoring._net_ref_lists`` is imported LAZILY inside the alpha_relax
+# closure below, NOT at module top: ``scoring`` -> ``decaps`` -> ``candidates``
+# is a real import cycle (decaps imports PlacementCandidate from here), so a
+# top-level ``from .scoring import ...`` would fail on first import.
+
+# Strategies that are appended to ``specs`` but NEVER emitted unless explicitly
+# requested via ``requested``/``candidate_names`` -- so a bare
+# generate_placement_candidates() returns the historical default set unchanged.
+_REQUEST_ONLY_STRATEGIES = frozenset({"alpha_relax"})
+
 
 @dataclass
 class PlacementCandidate:
@@ -534,6 +544,7 @@ def _append_candidate(
     power_topology: PowerTopology | None = None,
     fp_geometries: dict[str, object] | None = None,
     seed_memo: list[tuple[LayoutConstraints, list[PlacedPart]]] | None = None,
+    post_transform=None,
 ):
     # Round-10 WS37: place_parts is deterministic in its inputs, and on
     # boards where a strategy's intents are absent several strategies
@@ -554,6 +565,13 @@ def _append_candidate(
         )
         if seed_memo is not None:
             seed_memo.append((constraints, [replace(p) for p in placed]))
+    # Optional post-transform (round-2 WS2 alpha_relax) is applied AFTER the
+    # memo store/reuse so it NEVER pollutes the seed memo: the memo holds RAW
+    # place_parts output, and a candidate sharing this constraints key (e.g.
+    # cluster_first) still gets the untouched seed. It receives the BUILT
+    # constraints so its outline/fixed clamps match this candidate.
+    if post_transform is not None:
+        placed = post_transform(placed, constraints)
     candidate = PlacementCandidate(
         name=name,
         placed_parts=placed,
@@ -572,6 +590,7 @@ def generate_placement_candidates(
     power_topology: PowerTopology | None = None,
     fp_geometries: dict[str, object] | None = None,
     requested: list[str] | None = None,
+    circuit=None,
 ) -> list[PlacementCandidate]:
     """Generate deterministic placement candidates from available intent.
 
@@ -653,6 +672,42 @@ def generate_placement_candidates(
             )
         )
 
+    # Round-2 WS2: request-only ``alpha_relax`` candidate (reverse transfer). It
+    # shares cluster_first's constraints, so the seed memo hands it the RAW
+    # cluster seed for free; the alpha-annealed relaxation runs as a
+    # post_transform AFTER the memo (non-pollution, hazard #4). Appended (after
+    # optional_backend_ready so historical emission order is untouched) only when
+    # a circuit is threaded in -- the relaxation needs net topology. Requesting
+    # it with circuit=None then raises the normal unknown-name ValueError.
+    post_transforms: dict[str, object] = {}
+    if circuit is not None:
+        from .alpha_relax import alpha_relax_placement
+        from .scoring import _net_ref_lists
+
+        _net_lists_cache: list = []
+
+        def _alpha_post(placed, built_constraints):
+            if not _net_lists_cache:
+                _net_lists_cache.append(_net_ref_lists(circuit, None))
+            return alpha_relax_placement(
+                placed,
+                _net_lists_cache[0],
+                fp_bboxes,
+                constraints=built_constraints,
+            )
+
+        specs.append(
+            (
+                "alpha_relax",
+                lambda: _with_cluster_zone(constraints, intent_plan),
+                [
+                    "cluster seed relaxed by alpha-annealed force continuation "
+                    "(ported from the skidl schematic placer)"
+                ],
+            )
+        )
+        post_transforms["alpha_relax"] = _alpha_post
+
     # Validate + filter BEFORE building seeds. Semantics byte-match
     # engine._filter_candidates (plan hazard #6): available = names whose
     # conditions hold for this circuit.
@@ -670,6 +725,10 @@ def generate_placement_candidates(
 
     candidates: list[PlacementCandidate] = []
     for name, build_constraints, reasons in specs:
+        # Request-only strategies never emit in the default (bare) call, so the
+        # default candidate set is byte-identical to before (hazard #1).
+        if name in _REQUEST_ONLY_STRATEGIES and wanted is None:
+            continue
         if wanted is not None and name not in wanted:
             continue
         _append_candidate(
@@ -683,5 +742,6 @@ def generate_placement_candidates(
             power_topology,
             fp_geometries,
             seed_memo=seed_memo,
+            post_transform=post_transforms.get(name),
         )
     return candidates

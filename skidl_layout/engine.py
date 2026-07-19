@@ -4073,6 +4073,7 @@ def plan_layout(
         power_topology=power_topology,
         fp_geometries=fp_geometries,
         requested=resolved_candidate_names,
+        circuit=circuit,
     )
 
     ctx = LayoutContext.from_circuit(circuit)
