@@ -125,21 +125,49 @@ def _pad_collision_pairs(
     if not fp_geometries:
         return []
 
+    # Round-9 WS34: per-part precompute (index-parallel, NOT ref-keyed —
+    # plan hazard #7). A pair can only collide when at least one part has
+    # a through-board pad (_through_board_pads_collide requires
+    # is_through_board on one side), so all-SMD pairs skip before any
+    # per-pair work. tb by footprint name: geometry is per-footprint.
+    tb_by_footprint: dict[str, bool] = {}
+    geoms: list[FootprintGeometry | None] = []
+    sides: list[str] = []
+    tbs: list[bool] = []
+    for pp in placed:
+        g = fp_geometries.get(pp.footprint)
+        if g is not None and not g.pads:
+            g = None
+        geoms.append(g)
+        sides.append(_assembly_side(pp))
+        if g is None:
+            tbs.append(False)
+            continue
+        if pp.footprint not in tb_by_footprint:
+            tb_by_footprint[pp.footprint] = any(
+                pad.is_through_board for pad in g.pads
+            )
+        tbs.append(tb_by_footprint[pp.footprint])
+
     collisions: list[tuple[str, str]] = []
     for i, a in enumerate(placed):
-        a_geometry = fp_geometries.get(a.footprint)
-        if a_geometry is None or not a_geometry.pads:
+        a_geometry = geoms[i]
+        if a_geometry is None:
             continue
-        for b in placed[i + 1:]:
-            if _same_physical_side(a, b):
+        a_side = sides[i]
+        a_tb = tbs[i]
+        for j in range(i + 1, len(placed)):
+            b_geometry = geoms[j]
+            if b_geometry is None:
                 continue
-            b_geometry = fp_geometries.get(b.footprint)
-            if b_geometry is None or not b_geometry.pads:
+            if not (a_tb or tbs[j]):
                 continue
+            if {a_side, sides[j]} != {"front", "back"}:
+                continue  # same physical side -> pad check not applicable
             if _through_board_pads_collide(
-                a, a_geometry, b, b_geometry, clearance_mm
+                a, a_geometry, placed[j], b_geometry, clearance_mm
             ):
-                collisions.append((a.ref, b.ref))
+                collisions.append((a.ref, placed[j].ref))
     return collisions
 
 
