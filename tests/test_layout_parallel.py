@@ -175,3 +175,70 @@ def test_parallel_matches_sequential():
     assert par.score.to_dict() == seq.score.to_dict()
     assert par.report == seq.report
     assert [c.name for c in par.candidates] == [c.name for c in seq.candidates]
+
+
+# --- round-8 WS30: combined refine+finalize (mode "full") --------------------
+
+
+def test_combined_matches_sequential():
+    """The default (round-8) combined path is byte-identical to sequential, and
+    the combined rung actually engaged (not a silent two-phase fallback)."""
+    seq = plan_layout(_circuit(), fp_bboxes=BBOXES, parallel_workers=1)
+    msgs: list[str] = []
+    par = plan_layout(
+        _circuit(), fp_bboxes=BBOXES, parallel_workers=2,
+        progress=lambda m: msgs.append(m),
+    )
+    assert any("refine+finalize combined" in m for m in msgs), (
+        "combined path did not engage"
+    )
+    assert _sig(par) == _sig(seq)
+    assert par.score.to_dict() == seq.score.to_dict()
+    assert par.report == seq.report
+    assert [c.name for c in par.candidates] == [c.name for c in seq.candidates]
+
+
+def test_combined_matches_sequential_with_outline():
+    """Combined == sequential with a fixed BoardOutline, exercising the
+    edge-anchor snap branch of the post-trio impl inside the worker."""
+    from skidl_layout.constraints import BoardOutline, LayoutConstraints
+
+    outline = BoardOutline(60.0, 40.0)
+    seq = plan_layout(
+        _circuit(), fp_bboxes=BBOXES,
+        constraints=LayoutConstraints(outline=outline), parallel_workers=1,
+    )
+    msgs: list[str] = []
+    par = plan_layout(
+        _circuit(), fp_bboxes=BBOXES,
+        constraints=LayoutConstraints(outline=outline), parallel_workers=2,
+        progress=lambda m: msgs.append(m),
+    )
+    assert any("refine+finalize combined" in m for m in msgs)
+    assert _sig(par) == _sig(seq)
+    assert par.score.to_dict() == seq.score.to_dict()
+    assert par.report == seq.report
+
+
+def test_combined_fallback_on_error(monkeypatch):
+    """A raise inside run_payloads trips the full hazard-#5 fallback ladder:
+    combined -> two-phase (refine + finalize) -> sequential. Result stays
+    byte-identical and every rung's fallback message is emitted."""
+    import skidl_layout.parallel as par_mod
+
+    seq = plan_layout(_circuit(), fp_bboxes=BBOXES, parallel_workers=1)
+
+    def boom(*a, **k):
+        raise RuntimeError("subprocess exploded")
+
+    monkeypatch.setattr(par_mod, "run_payloads", boom)
+    msgs: list[str] = []
+    par = plan_layout(
+        _circuit(), fp_bboxes=BBOXES, parallel_workers=2,
+        progress=lambda m: msgs.append(m),
+    )
+    assert _sig(par) == _sig(seq)
+    assert par.score.to_dict() == seq.score.to_dict()
+    assert any("combined parallel planning unavailable" in m for m in msgs)
+    assert any("parallel refinement unavailable" in m for m in msgs)
+    assert any("parallel finalize unavailable" in m for m in msgs)

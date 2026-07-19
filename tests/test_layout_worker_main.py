@@ -68,6 +68,61 @@ def test_run_payloads_failure_raises():
     assert leftover == [], f"temp dirs leaked: {leftover}"
 
 
+def test_plan_candidate_worker_roundtrip():
+    """Round-8 WS30: in-process plan_candidate_worker == manual trio + posttrio +
+    finalize on an identically-built candidate. The returned pass1 blob matches
+    the post-trio stage; the finalized state matches the finalize stage."""
+    from skidl_layout.context import LayoutContext
+    from skidl_layout.engine import (
+        _FinalizeParams,
+        _finalize_candidate_impl,
+        _posttrio_candidate_impl,
+        _refine_candidate_trio,
+    )
+    from skidl_layout.intent import infer_placement_intents
+    from skidl_layout.parallel import plan_candidate_worker
+
+    circuit = _circuit()
+    snap = snapshot_circuit(circuit)
+    ctx = LayoutContext.from_circuit(snap)
+    placed = [
+        PlacedPart("U1", 10.0, 10.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("C1", 14.0, 10.0, 0.0, "Capacitor:C_0805"),
+        PlacedPart("J1", 30.0, 10.0, 0.0, "Connector:USB"),
+    ]
+    params = _FinalizeParams(
+        resolved_bboxes=dict(BBOXES), fp_geometries={}, clearance_mm=0.5,
+        board_layers=2, margin_mm=3.0, corner_radius_mm=None, form_factor=None,
+        auto_outline=False, resolved_outline=None, resolved_constraints=None,
+        density_outline=None, intent_plan=infer_placement_intents(snap),
+        derive_outline_if_missing=False, constraints=None,
+    )
+
+    # manual reference: trio -> post-trio (capture pass-1 sig) -> finalize
+    cand_m = PlacementCandidate(name="baseline", placed_parts=list(placed))
+    _refine_candidate_trio(cand_m, snap, BBOXES, {}, 0.5, 2, ctx, None)
+    m_score, m_val = _posttrio_candidate_impl(cand_m, snap, params, ctx)
+    manual_pass1_sig = _sig(cand_m)
+    m_finalized, _ = _finalize_candidate_impl(cand_m, snap, params, ctx, None, None)
+
+    # worker: one call runs the whole chain and returns both states
+    cand_w = PlacementCandidate(name="baseline", placed_parts=list(placed))
+    payload = pickle.dumps((cand_w, snap, params))
+    pass1_blob, w_score, w_val, w_finalized = pickle.loads(
+        plan_candidate_worker(payload)
+    )
+    pass1_cand = pickle.loads(pass1_blob)
+
+    assert _sig(pass1_cand) == manual_pass1_sig
+    assert w_score.to_dict() == m_score.to_dict()
+    assert w_val.ok == m_val.ok
+    fin_sig = lambda f: [
+        (p.ref, p.x_mm, p.y_mm, p.rot_deg, p.side) for p in f.placed_parts
+    ]
+    assert fin_sig(w_finalized) == fin_sig(m_finalized)
+    assert w_finalized.score.to_dict() == m_finalized.score.to_dict()
+
+
 def test_worker_main_import_light():
     """Hazard #10: the entry point must be spawn-inert — its only module-top-level
     import is `import sys`; `from . import parallel` lives indented inside main."""

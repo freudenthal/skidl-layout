@@ -23,6 +23,7 @@ def main(argv):
     worker = {
         "refine": parallel.refine_candidate_worker,
         "finalize": parallel.finalize_candidate_worker,
+        "full": parallel.plan_candidate_worker,
     }[mode]
     pairs = list(zip(argv[1::2], argv[2::2]))
     for in_path, out_path in pairs:

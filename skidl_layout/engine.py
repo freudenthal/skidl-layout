@@ -3795,6 +3795,90 @@ def _prerefine_candidates_parallel(
     return prerefined_names
 
 
+def _plan_candidates_parallel(
+    candidates,
+    seed_keys,
+    workers,
+    params,
+    snapshot,
+    emit,
+):
+    """Round-8 WS30: run each unique (seed-key) candidate's FULL chain — pass-1
+    trio, the post-trio block, and finalize — in ONE ``"full"`` subprocess per
+    canonical, killing the round-7 phase barrier and the second subprocess-launch
+    round.
+
+    Returns ``{candidate_name: (score, validation, finalized)}`` for the
+    canonicals, with the canonical entries of ``candidates`` replaced in place by
+    their **post-trio (pass-1)** state (so the sequential pass-1 loop and its
+    dup-clone branch see exactly the sequential intermediate state — plan hazard
+    #3). Returns ``None`` to tell the caller to fall back to the round-7 two-phase
+    parallel path (child process, no snapshot, < 2 unique jobs, or ANY error —
+    pickling, subprocess, worker crash — plan hazard #5). On the ``None`` path
+    ``candidates`` is left untouched, so the fallback is byte-identical.
+
+    Canonical selection is first-seen-wins over ``seed_keys`` in candidate order —
+    identical to the sequential loop's dedup — so the loop reproduces the same
+    canonical/dup assignment. ``params`` is the single ``_FinalizeParams`` bundle
+    (round-8 WS29); the worker reuses it for the post-trio block AND finalize.
+    """
+    import multiprocessing
+
+    # Belt-and-braces: never parallelize inside a spawn child.
+    if multiprocessing.parent_process() is not None:
+        return None
+    if snapshot is None:
+        return None
+
+    seen: dict = {}
+    canonical_indices: list[int] = []
+    for i, key in enumerate(seed_keys):
+        if key not in seen:
+            seen[key] = i
+            canonical_indices.append(i)
+    if len(canonical_indices) < 2:
+        return None
+
+    try:
+        import pickle
+
+        from .parallel import run_payloads
+
+        payloads = {
+            i: pickle.dumps((candidates[i], snapshot, params))
+            for i in canonical_indices
+        }
+        k = min(workers, len(canonical_indices))
+        emit(
+            f"planning {len(canonical_indices)} unique candidate(s) in parallel "
+            f"({k} workers): refine+finalize combined; per-ref progress is "
+            "suppressed in parallel mode"
+        )
+        # Round-8 mode "full": pass-1 + post-trio + finalize in one process.
+        raw = run_payloads("full", payloads, workers)
+        results_by_index: dict[int, tuple] = {
+            i: pickle.loads(b) for i, b in raw.items()
+        }
+    except Exception as exc:  # noqa: BLE001 - any failure -> two-phase fallback
+        emit(
+            f"combined parallel planning unavailable ({exc}); falling back to "
+            "two-phase"
+        )
+        return None
+
+    planned: dict[str, tuple] = {}
+    for i in canonical_indices:
+        pass1_blob, score, validation, finalized = results_by_index[i]
+        # Adopt the post-trio (pass-1) state so the pass-1 loop and the dup
+        # branch clone from the sequential intermediate state (hazard #3). The
+        # finalized candidate is adopted later, at finalize consumption.
+        candidates[i] = pickle.loads(pass1_blob)
+        name = candidates[i].name
+        planned[name] = (score, validation, finalized)
+        emit(f"[parallel] {name}: planned (refine+finalize combined)")
+    return planned
+
+
 def _finalize_candidates_parallel(
     candidates,
     dup_canonical_name,
@@ -4063,12 +4147,32 @@ def plan_layout(
                 )
                 layout_snapshot = None
 
+    # Round-8 WS30: try the combined refine+finalize path FIRST (mode "full").
+    # One subprocess per unique candidate runs the whole chain — pass-1 trio,
+    # post-trio block, finalize — killing the round-7 phase barrier and the
+    # second subprocess-launch round. On success `combined_planned` is
+    # {name: (score, validation, finalized)} and each canonical entry of
+    # `candidates` carries its post-trio (pass-1) state; on None (child / no
+    # snapshot / < 2 unique / ANY error) `candidates` is untouched and we fall
+    # through to the round-7 two-phase parallel path (fallback rung 2, hazard #5).
+    combined_planned = None
+    if parallel_enabled and layout_snapshot is not None:
+        combined_planned = _plan_candidates_parallel(
+            candidates,
+            seed_keys,
+            resolved_workers,
+            params_early,
+            layout_snapshot,
+            _emit,
+        )
+
     # WS18: opt-in parallel pass-1 refinement of the unique candidates. Byte-
     # identical to sequential; returns the set of already-refined canonical
     # names (empty when not engaged / on fallback), and mutates `candidates` in
-    # place with the worker-refined objects.
+    # place with the worker-refined objects. Only runs when the combined path
+    # above did not engage (fallback rung 2).
     prerefined_names: set[str] = set()
-    if parallel_enabled and layout_snapshot is not None:
+    if combined_planned is None and parallel_enabled and layout_snapshot is not None:
         result_names = _prerefine_candidates_parallel(
             candidates,
             seed_keys,
@@ -4113,6 +4217,20 @@ def plan_layout(
             candidate.reasons.append(
                 f"identical to candidate '{canonical.name}'; refinement reused"
             )
+            continue
+        if combined_planned is not None and candidate.name in combined_planned:
+            # Round-8 WS30: the combined "full" worker already ran this
+            # candidate's trio + post-trio block (and finalize, consumed later).
+            # `candidates[i]` holds its post-trio (pass-1) state, so just record
+            # the pass-1 score/validation and register the canonical for dedup.
+            _emit(
+                f"[{cand_index}/{len(candidates)}] {candidate.name}: "
+                "planned (parallel)"
+            )
+            canonical_by_key[seed_key] = candidate
+            score, validation, _finalized = combined_planned[candidate.name]
+            candidate_scores[candidate.name] = score
+            candidate_validations[candidate.name] = validation
             continue
         if candidate.name in prerefined_names:
             _emit(
@@ -4214,8 +4332,24 @@ def plan_layout(
     # Byte-identical to the sequential default; `candidates` canonicals are
     # replaced in place with the worker-mutated objects (plan hazard #4).
     parallel_finalized = None
-    if parallel_enabled:
-        # Round-8 WS29: reuse the single params_early build (one build, all uses).
+    if combined_planned is not None and any_valid:
+        # Round-8 WS30: the combined "full" workers already finalized every
+        # canonical, so adopt each finalized candidate in place (the round-6
+        # rule) and reuse those results directly — no second dispatch, no phase
+        # barrier. `candidates[i]` currently holds the post-trio (pass-1) state;
+        # swap in the finalized candidate so the consumption loop keys off it.
+        parallel_finalized = {}
+        for i, candidate in enumerate(candidates):
+            name = candidate.name
+            if name in combined_planned:
+                finalized = combined_planned[name][2]
+                candidates[i] = finalized.candidate
+                parallel_finalized[name] = finalized
+    elif parallel_enabled:
+        # Combined path unavailable (fell back to two-phase) OR the rare
+        # any_valid rescue fired (plan hazard #4: discard the combined finalize
+        # results and re-finalize the rescued candidates via the round-6/7
+        # dispatch, exactly as before). Round-8 WS29: reuse params_early.
         parallel_finalized = _finalize_candidates_parallel(
             candidates,
             dup_canonical_name,

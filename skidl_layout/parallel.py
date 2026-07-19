@@ -150,3 +150,46 @@ def finalize_candidate_worker(payload: bytes) -> bytes:
         candidate, snapshot, params, ctx, emit=None, progress=None
     )
     return pickle.dumps(finalized)
+
+
+def plan_candidate_worker(payload: bytes) -> bytes:
+    """Round-8 WS30 worker: one candidate's FULL chain — pass-1 refinement trio,
+    the post-trio block, and finalize — in a single subprocess (mode ``"full"``).
+
+    Removes the round-7 phase barrier (pass-1 and finalize ran as two separate
+    parallel rounds, each paying its own subprocess-launch + snapshot-unpickle
+    cost). Returns BOTH states the parent needs (plan hazard #3): the post-trio
+    (pass-1) candidate — pickled BEFORE finalize mutates the same object, so the
+    parent's pass-1 loop and its dup-clone branch see exactly the sequential
+    intermediate state — plus the pass-1 ``score`` / ``validation`` and the
+    finalized ``_FinalizedCandidate``. Rebuilds the :class:`LayoutContext` from
+    the snapshot (a pure function of it) rather than pickling the context; runs
+    with ``emit=None`` / ``progress=None`` (byte-identical to the sequential
+    default). A single ``bytes`` argument keeps any pickling error in the parent.
+    """
+    (candidate, snapshot, params) = pickle.loads(payload)
+
+    from .context import LayoutContext
+    from .engine import (
+        _finalize_candidate_impl,
+        _posttrio_candidate_impl,
+        _refine_candidate_trio,
+    )
+
+    ctx = LayoutContext.from_circuit(snapshot)
+    _refine_candidate_trio(
+        candidate,
+        snapshot,
+        params.resolved_bboxes,
+        params.fp_geometries,
+        params.clearance_mm,
+        params.board_layers,
+        ctx,
+        progress=None,
+    )
+    score, validation = _posttrio_candidate_impl(candidate, snapshot, params, ctx)
+    pass1_blob = pickle.dumps(candidate)  # BEFORE finalize mutates it (hazard #3)
+    finalized, _ = _finalize_candidate_impl(
+        candidate, snapshot, params, ctx, emit=None, progress=None
+    )
+    return pickle.dumps((pass1_blob, score, validation, finalized))
