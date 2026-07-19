@@ -3574,6 +3574,134 @@ def _refine_candidate_trio(
     return candidate
 
 
+def _posttrio_candidate_impl(
+    candidate,
+    circuit,
+    params: _FinalizeParams,
+    ctx,
+) -> tuple[LayoutScore, ValidationResult]:
+    """Module-level extraction of plan_layout's pass-1 post-trio block (round-8
+    WS29). Runs, in order, on a candidate whose refinement trio already ran:
+    ``_apply_assembly_sides`` -> (edge-anchor snap / neighbor legalize, only when
+    a real outline is fixed) -> ``_effective_keepouts`` -> ``validate`` ->
+    ``score_placement`` (or ``score_placement_quick`` when validation failed) ->
+    ``_apply_edge_intent_score`` -> ``_apply_panel_mechanical_outline_score``.
+    Mutates ``candidate.placed_parts`` / ``.reasons`` / ``.ref_reasons`` /
+    ``.score`` in place and returns ``(score, validation)``. Byte-identical to the
+    former inline block; shared verbatim by the sequential pass-1 loop and the
+    round-8 combined worker (``parallel.plan_candidate_worker``). Reads every
+    positional-dependent input from ``params`` (a :class:`_FinalizeParams`); the
+    combined payload reuses that bundle as-is."""
+    resolved_bboxes = params.resolved_bboxes
+    fp_geometries = params.fp_geometries
+    clearance_mm = params.clearance_mm
+    board_layers = params.board_layers
+    intent_plan = params.intent_plan
+    resolved_outline = params.resolved_outline
+    auto_outline = params.auto_outline
+    resolved_constraints = params.resolved_constraints
+
+    candidate.placed_parts = _apply_assembly_sides(
+        candidate.placed_parts,
+        intent_plan,
+    )
+    candidate_constraints = candidate.constraints or resolved_constraints
+    if resolved_outline is not None and not auto_outline:
+        candidate.placed_parts, moved_edge_refs = _snap_edge_anchors_to_outline(
+            candidate.placed_parts,
+            resolved_outline,
+            intent_plan,
+            candidate_constraints,
+            resolved_bboxes,
+            fp_geometries,
+        )
+        if moved_edge_refs:
+            candidate.reasons.append("edge connectors snapped to outline edges")
+            for ref in moved_edge_refs:
+                candidate.ref_reasons.setdefault(ref, []).append(
+                    "snapped to outline edge"
+                )
+        candidate.placed_parts, moved_neighbor_refs = _legalize_edge_anchor_neighbors(
+            candidate.placed_parts,
+            resolved_outline,
+            intent_plan,
+            candidate_constraints,
+            resolved_bboxes,
+            fp_geometries,
+            clearance_mm,
+        )
+        if moved_neighbor_refs:
+            candidate.reasons.append(
+                "near-edge parts nudged clear of edge connectors"
+            )
+            for ref in moved_neighbor_refs:
+                candidate.ref_reasons.setdefault(ref, []).append(
+                    "nudged clear of edge connector"
+                )
+    candidate_keepouts = _effective_keepouts(
+        candidate_constraints,
+        candidate.placed_parts,
+        intent_plan,
+        resolved_bboxes,
+        fp_geometries,
+        resolved_outline,
+    )
+    validation = validate(
+        candidate.placed_parts,
+        circuit,
+        resolved_bboxes,
+        clearance_mm=clearance_mm,
+        outline=resolved_outline,
+        keepouts=candidate_keepouts,
+        cutouts=getattr(candidate_constraints, "cutouts", None),
+        fp_geometries=fp_geometries,
+    )
+    if not validation.ok:
+        raw_score = score_placement_quick(
+            candidate.placed_parts,
+            circuit,
+            resolved_bboxes,
+            outline=resolved_outline,
+            keepouts=candidate_keepouts,
+            cutouts=getattr(candidate_constraints, "cutouts", None),
+            fp_geometries=fp_geometries,
+            clearance_mm=clearance_mm,
+            ctx=ctx,
+        )
+    else:
+        raw_score = score_placement(
+            candidate.placed_parts,
+            circuit,
+            resolved_bboxes,
+            outline=resolved_outline,
+            keepouts=candidate_keepouts,
+            cutouts=getattr(candidate_constraints, "cutouts", None),
+            fp_geometries=fp_geometries,
+            clearance_mm=clearance_mm,
+            board_layers=board_layers,
+            ctx=ctx,
+        )
+    edge_score = _apply_edge_intent_score(
+        raw_score,
+        candidate.placed_parts,
+        resolved_bboxes,
+        resolved_outline,
+        intent_plan,
+        constraints=candidate.constraints,
+        fp_geometries=fp_geometries,
+    )
+    score = _apply_panel_mechanical_outline_score(
+        edge_score,
+        candidate.placed_parts,
+        resolved_bboxes,
+        resolved_outline,
+        intent_plan,
+        fp_geometries=fp_geometries,
+    )
+    candidate.score = score.score
+    return score, validation
+
+
 def _prerefine_candidates_parallel(
     candidates,
     seed_keys,
@@ -3880,6 +4008,29 @@ def plan_layout(
     # replaced the canonical candidates with their refined (mutated) selves.
     seed_keys = [_candidate_seed_key(candidate) for candidate in candidates]
 
+    # Round-8 WS29: build the picklable _FinalizeParams bundle ONCE, before the
+    # pass-1 loop, and reuse it at all three consumers — the pass-1 post-trio
+    # block (_posttrio_candidate_impl), the sequential finalize closure, and the
+    # parallel finalize/combined dispatch. `density_outline` holds its pre-loop
+    # value here on every path (set once above; nothing writes it before the
+    # finalize builds — plan hazard #7), so a single build cannot drift.
+    params_early = _FinalizeParams(
+        resolved_bboxes=resolved_bboxes,
+        fp_geometries=fp_geometries,
+        clearance_mm=clearance_mm,
+        board_layers=board_layers,
+        margin_mm=margin_mm,
+        corner_radius_mm=corner_radius_mm,
+        form_factor=form_factor,
+        auto_outline=auto_outline,
+        resolved_outline=resolved_outline,
+        resolved_constraints=resolved_constraints,
+        density_outline=density_outline,
+        intent_plan=intent_plan,
+        derive_outline_if_missing=derive_outline_if_missing,
+        constraints=constraints,
+    )
+
     # WS18/WS22: opt-in parallel machinery. The picklable snapshot is built at
     # most ONCE per plan_layout call (round-6 WS22) and reused by both the pass-1
     # and finalize parallel phases; a build failure emits the fallback message
@@ -3985,104 +4136,14 @@ def plan_layout(
                 ),
             )
         canonical_by_key[seed_key] = candidate
-        candidate.placed_parts = _apply_assembly_sides(
-            candidate.placed_parts,
-            intent_plan,
+        # Round-8 WS29: the pass-1 post-trio block is now a shared module-level
+        # impl (byte-identical), so the sequential loop and the combined worker
+        # run the SAME code (plan hazard #2).
+        score, validation = _posttrio_candidate_impl(
+            candidate, circuit, params_early, ctx
         )
-        candidate_constraints = candidate.constraints or resolved_constraints
-        if resolved_outline is not None and not auto_outline:
-            candidate.placed_parts, moved_edge_refs = _snap_edge_anchors_to_outline(
-                candidate.placed_parts,
-                resolved_outline,
-                intent_plan,
-                candidate_constraints,
-                resolved_bboxes,
-                fp_geometries,
-            )
-            if moved_edge_refs:
-                candidate.reasons.append("edge connectors snapped to outline edges")
-                for ref in moved_edge_refs:
-                    candidate.ref_reasons.setdefault(ref, []).append(
-                        "snapped to outline edge"
-                    )
-            candidate.placed_parts, moved_neighbor_refs = _legalize_edge_anchor_neighbors(
-                candidate.placed_parts,
-                resolved_outline,
-                intent_plan,
-                candidate_constraints,
-                resolved_bboxes,
-                fp_geometries,
-                clearance_mm,
-            )
-            if moved_neighbor_refs:
-                candidate.reasons.append(
-                    "near-edge parts nudged clear of edge connectors"
-                )
-                for ref in moved_neighbor_refs:
-                    candidate.ref_reasons.setdefault(ref, []).append(
-                        "nudged clear of edge connector"
-                    )
-        candidate_keepouts = _effective_keepouts(
-            candidate_constraints,
-            candidate.placed_parts,
-            intent_plan,
-            resolved_bboxes,
-            fp_geometries,
-            resolved_outline,
-        )
-        candidate_validations[candidate.name] = validate(
-            candidate.placed_parts,
-            circuit,
-            resolved_bboxes,
-            clearance_mm=clearance_mm,
-            outline=resolved_outline,
-            keepouts=candidate_keepouts,
-            cutouts=getattr(candidate_constraints, "cutouts", None),
-            fp_geometries=fp_geometries,
-        )
-        if not candidate_validations[candidate.name].ok:
-            raw_score = score_placement_quick(
-                candidate.placed_parts,
-                circuit,
-                resolved_bboxes,
-                outline=resolved_outline,
-                keepouts=candidate_keepouts,
-                cutouts=getattr(candidate_constraints, "cutouts", None),
-                fp_geometries=fp_geometries,
-                clearance_mm=clearance_mm,
-                ctx=ctx,
-            )
-        else:
-            raw_score = score_placement(
-                candidate.placed_parts,
-                circuit,
-                resolved_bboxes,
-                outline=resolved_outline,
-                keepouts=candidate_keepouts,
-                cutouts=getattr(candidate_constraints, "cutouts", None),
-                fp_geometries=fp_geometries,
-                clearance_mm=clearance_mm,
-                board_layers=board_layers,
-                ctx=ctx,
-            )
-        edge_score = _apply_edge_intent_score(
-            raw_score,
-            candidate.placed_parts,
-            resolved_bboxes,
-            resolved_outline,
-            intent_plan,
-            constraints=candidate.constraints,
-            fp_geometries=fp_geometries,
-        )
-        candidate_scores[candidate.name] = _apply_panel_mechanical_outline_score(
-            edge_score,
-            candidate.placed_parts,
-            resolved_bboxes,
-            resolved_outline,
-            intent_plan,
-            fp_geometries=fp_geometries,
-        )
-        candidate.score = candidate_scores[candidate.name].score
+        candidate_scores[candidate.name] = score
+        candidate_validations[candidate.name] = validation
 
     any_valid = any(
         candidate_validations[c.name].ok for c in candidates
@@ -4131,24 +4192,11 @@ def plan_layout(
 
     def _finalize_candidate(candidate: PlacementCandidate) -> _FinalizedCandidate:
         nonlocal density_outline
-        params = _FinalizeParams(
-            resolved_bboxes=resolved_bboxes,
-            fp_geometries=fp_geometries,
-            clearance_mm=clearance_mm,
-            board_layers=board_layers,
-            margin_mm=margin_mm,
-            corner_radius_mm=corner_radius_mm,
-            form_factor=form_factor,
-            auto_outline=auto_outline,
-            resolved_outline=resolved_outline,
-            resolved_constraints=resolved_constraints,
-            density_outline=density_outline,
-            intent_plan=intent_plan,
-            derive_outline_if_missing=derive_outline_if_missing,
-            constraints=constraints,
-        )
+        # Round-8 WS29: reuse the single params_early build (field-for-field
+        # identical to the former per-call build; density_outline is the stable
+        # pre-loop value on every path — plan hazard #7).
         finalized, density_outline = _finalize_candidate_impl(
-            candidate, circuit, params, ctx, emit=_emit, progress=progress
+            candidate, circuit, params_early, ctx, emit=_emit, progress=progress
         )
         return finalized
 
@@ -4167,28 +4215,13 @@ def plan_layout(
     # replaced in place with the worker-mutated objects (plan hazard #4).
     parallel_finalized = None
     if parallel_enabled:
-        finalize_params = _FinalizeParams(
-            resolved_bboxes=resolved_bboxes,
-            fp_geometries=fp_geometries,
-            clearance_mm=clearance_mm,
-            board_layers=board_layers,
-            margin_mm=margin_mm,
-            corner_radius_mm=corner_radius_mm,
-            form_factor=form_factor,
-            auto_outline=auto_outline,
-            resolved_outline=resolved_outline,
-            resolved_constraints=resolved_constraints,
-            density_outline=density_outline,
-            intent_plan=intent_plan,
-            derive_outline_if_missing=derive_outline_if_missing,
-            constraints=constraints,
-        )
+        # Round-8 WS29: reuse the single params_early build (one build, all uses).
         parallel_finalized = _finalize_candidates_parallel(
             candidates,
             dup_canonical_name,
             resolved_workers,
             circuit,
-            finalize_params,
+            params_early,
             layout_snapshot,
             _emit,
         )

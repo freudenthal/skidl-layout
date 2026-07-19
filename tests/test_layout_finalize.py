@@ -14,6 +14,7 @@ from skidl_layout.context import LayoutContext
 from skidl_layout.engine import (
     _FinalizeParams,
     _finalize_candidate_impl,
+    _posttrio_candidate_impl,
     _refine_candidate_trio,
 )
 from skidl_layout.intent import infer_placement_intents
@@ -94,6 +95,68 @@ def test_finalized_candidate_pickles():
     got = pickle.loads(pickle.dumps(finalized))
     assert got.candidate.name == "baseline"
     assert [p.ref for p in got.placed_parts] == [p.ref for p in finalized.placed_parts]
+
+
+# --- WS29: post-trio impl extraction (byte-identical refactor) ---------------
+
+
+def _prepared_candidate(snap, ctx):
+    """A 3-part candidate with its refinement trio already run (post-trio impl
+    input)."""
+    from skidl_layout.writer import PlacedPart
+
+    placed = [
+        PlacedPart("U1", 10.0, 10.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("C1", 14.0, 10.0, 0.0, "Capacitor:C_0805"),
+        PlacedPart("J1", 30.0, 10.0, 0.0, "Connector:USB"),
+    ]
+    cand = PlacementCandidate(name="baseline", placed_parts=list(placed))
+    _refine_candidate_trio(cand, snap, BBOXES, {}, 0.5, 2, ctx, None)
+    return cand
+
+
+def _posttrio_params(snap):
+    plan = infer_placement_intents(snap)
+    return _FinalizeParams(
+        resolved_bboxes=dict(BBOXES),
+        fp_geometries={},
+        clearance_mm=0.5,
+        board_layers=2,
+        margin_mm=3.0,
+        corner_radius_mm=None,
+        form_factor=None,
+        auto_outline=False,
+        resolved_outline=None,
+        resolved_constraints=None,
+        density_outline=None,
+        intent_plan=plan,
+        derive_outline_if_missing=False,
+        constraints=None,
+    )
+
+
+def test_posttrio_impl_matches_inline_expectations():
+    """WS29: _posttrio_candidate_impl returns (LayoutScore, ValidationResult),
+    sets candidate.score to score.score, and is deterministic across two
+    identically-prepared candidates."""
+    from skidl_layout.scoring import LayoutScore
+    from skidl_layout.validator import ValidationResult
+
+    circuit = _circuit()
+    snap = snapshot_circuit(circuit)
+    ctx = LayoutContext.from_circuit(snap)
+    params = _posttrio_params(snap)
+
+    cand_a = _prepared_candidate(snap, ctx)
+    score_a, val_a = _posttrio_candidate_impl(cand_a, snap, params, ctx)
+    assert isinstance(score_a, LayoutScore)
+    assert isinstance(val_a, ValidationResult)
+    assert cand_a.score == score_a.score
+
+    cand_b = _prepared_candidate(snap, ctx)
+    score_b, val_b = _posttrio_candidate_impl(cand_b, snap, params, ctx)
+    assert score_b.to_dict() == score_a.to_dict()
+    assert val_b.ok == val_a.ok
 
 
 # --- WS21.5: finalize impl live vs snapshot ----------------------------------
