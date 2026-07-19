@@ -735,6 +735,17 @@ def _finalize_identity_probe(circuit, fp_lib_dirs):
     return live_fin, snap_fin
 
 
+def _resolve_candidate_names(candidate_names: list[str] | None) -> list[str] | None:
+    """Explicit kwarg wins, else SKIDL_LAYOUT_CANDIDATES env default."""
+    if candidate_names is None:
+        env = os.environ.get("SKIDL_LAYOUT_CANDIDATES")
+        if env:
+            candidate_names = [
+                name.strip() for name in env.split(",") if name.strip()
+            ]
+    return candidate_names or None
+
+
 def _filter_candidates(
     candidates: list[PlacementCandidate],
     candidate_names: list[str] | None,
@@ -746,10 +757,7 @@ def _filter_candidates(
     Unknown names raise ``ValueError`` listing the available strategies so a
     typo fails loudly instead of silently planning everything.
     """
-    if candidate_names is None:
-        env = os.environ.get("SKIDL_LAYOUT_CANDIDATES")
-        if env:
-            candidate_names = [name.strip() for name in env.split(",") if name.strip()]
+    candidate_names = _resolve_candidate_names(candidate_names)
     if not candidate_names:
         return candidates
 
@@ -4056,6 +4064,7 @@ def plan_layout(
         assembly_policy=assembly_policy,
     )
     power_topology = infer_power_topology(circuit)
+    resolved_candidate_names = _resolve_candidate_names(candidate_names)
     candidates = generate_placement_candidates(
         groups,
         resolved_constraints,
@@ -4063,8 +4072,8 @@ def plan_layout(
         intent_plan=intent_plan,
         power_topology=power_topology,
         fp_geometries=fp_geometries,
+        requested=resolved_candidate_names,
     )
-    candidates = _filter_candidates(candidates, candidate_names)
 
     ctx = LayoutContext.from_circuit(circuit)
 

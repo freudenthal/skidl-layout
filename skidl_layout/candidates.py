@@ -571,124 +571,117 @@ def generate_placement_candidates(
     intent_plan: PlacementIntentPlan | None = None,
     power_topology: PowerTopology | None = None,
     fp_geometries: dict[str, object] | None = None,
+    requested: list[str] | None = None,
 ) -> list[PlacementCandidate]:
-    """Generate deterministic placement candidates from available intent."""
-    candidates: list[PlacementCandidate] = []
+    """Generate deterministic placement candidates from available intent.
+
+    ``requested`` (round-10 WS38) filters strategies BEFORE their seeds are
+    built, so ``candidate_names`` mode stops paying for discarded strategies.
+    Its semantics byte-match ``engine._filter_candidates``: de-dup keeping
+    order, unknown names raise ``ValueError`` listing the strategies whose
+    conditions hold for this circuit.
+    """
     seed_memo: list[tuple[LayoutConstraints, list[PlacedPart]]] = []
 
-    _append_candidate(
-        candidates,
-        "baseline",
-        groups,
-        _merge_inferred_fixed_positions(constraints, intent_plan),
-        fp_bboxes,
-        ["explicit constraints, fixed mechanics, and default placement order"],
-        intent_plan,
-        power_topology,
-        fp_geometries,
-        seed_memo=seed_memo,
-    )
-    _append_candidate(
-        candidates,
-        "connector_edge_first",
-        groups,
-        _merge_inferred_edge_anchors(constraints, intent_plan),
-        fp_bboxes,
-        ["inferred connector edge anchors applied before primary parts"],
-        intent_plan,
-        power_topology,
-        fp_geometries,
-        seed_memo=seed_memo,
-    )
+    # (name, () -> LayoutConstraints, reasons). Lambdas defer seed-input
+    # construction so filtered-out strategies build nothing. Order and
+    # conditions MUST match the historical emission order (plan hazard #5).
+    specs: list[tuple[str, object, list[str]]] = [
+        (
+            "baseline",
+            lambda: _merge_inferred_fixed_positions(constraints, intent_plan),
+            ["explicit constraints, fixed mechanics, and default placement order"],
+        ),
+        (
+            "connector_edge_first",
+            lambda: _merge_inferred_edge_anchors(constraints, intent_plan),
+            ["inferred connector edge anchors applied before primary parts"],
+        ),
+    ]
     if intent_plan is not None and intent_plan.refs_with_kind("panel_template"):
-        _append_candidate(
-            candidates,
-            "panel_template_grid",
-            groups,
-            _with_panel_template(constraints, intent_plan),
-            fp_bboxes,
-            ["corpus-derived panel/UI grid constraints applied"],
-            intent_plan,
-            power_topology,
-            fp_geometries,
-            seed_memo=seed_memo,
+        specs.append(
+            (
+                "panel_template_grid",
+                lambda: _with_panel_template(constraints, intent_plan),
+                ["corpus-derived panel/UI grid constraints applied"],
+            )
         )
-    _append_candidate(
-        candidates,
-        "power_first",
-        groups,
-        _with_power_zone(constraints, intent_plan),
-        fp_bboxes,
-        ["power input and regulator-like parts biased into a power zone"],
-        intent_plan,
-        power_topology,
-        fp_geometries,
-        seed_memo=seed_memo,
+    specs.extend(
+        [
+            (
+                "power_first",
+                lambda: _with_power_zone(constraints, intent_plan),
+                ["power input and regulator-like parts biased into a power zone"],
+            ),
+            (
+                "power_topology_first",
+                lambda: _with_power_topology(constraints, intent_plan, power_topology),
+                [
+                    "source/protection/conversion/storage/load power chains "
+                    "biased together"
+                ],
+            ),
+            (
+                "cluster_first",
+                lambda: _with_cluster_zone(constraints, intent_plan),
+                ["edge/UI/power/debug refs biased into a shared service zone"],
+            ),
+            (
+                "module_socket_central",
+                lambda: _with_module_socket_zone(constraints, intent_plan),
+                ["plug-in module sockets biased into the internal board area"],
+            ),
+            (
+                "repeated_channel_array",
+                lambda: _with_repeated_channel_array(constraints, intent_plan),
+                [
+                    "repeated channel refs aligned and distributed as an "
+                    "ordered array"
+                ],
+            ),
+        ]
     )
-    _append_candidate(
-        candidates,
-        "power_topology_first",
-        groups,
-        _with_power_topology(constraints, intent_plan, power_topology),
-        fp_bboxes,
-        ["source/protection/conversion/storage/load power chains biased together"],
-        intent_plan,
-        power_topology,
-        fp_geometries,
-        seed_memo=seed_memo,
-    )
-    _append_candidate(
-        candidates,
-        "cluster_first",
-        groups,
-        _with_cluster_zone(constraints, intent_plan),
-        fp_bboxes,
-        ["edge/UI/power/debug refs biased into a shared service zone"],
-        intent_plan,
-        power_topology,
-        fp_geometries,
-        seed_memo=seed_memo,
-    )
-    _append_candidate(
-        candidates,
-        "module_socket_central",
-        groups,
-        _with_module_socket_zone(constraints, intent_plan),
-        fp_bboxes,
-        ["plug-in module sockets biased into the internal board area"],
-        intent_plan,
-        power_topology,
-        fp_geometries,
-        seed_memo=seed_memo,
-    )
-    _append_candidate(
-        candidates,
-        "repeated_channel_array",
-        groups,
-        _with_repeated_channel_array(constraints, intent_plan),
-        fp_bboxes,
-        ["repeated channel refs aligned and distributed as an ordered array"],
-        intent_plan,
-        power_topology,
-        fp_geometries,
-        seed_memo=seed_memo,
-    )
-
     if intent_plan is not None and intent_plan.backend_status.enabled:
+        specs.append(
+            (
+                "optional_backend_ready",
+                lambda: _with_cluster_zone(constraints, intent_plan),
+                [
+                    "optional optimization backends detected; using deterministic "
+                    "core strategy until backend-specific solvers are enabled"
+                ],
+            )
+        )
+
+    # Validate + filter BEFORE building seeds. Semantics byte-match
+    # engine._filter_candidates (plan hazard #6): available = names whose
+    # conditions hold for this circuit.
+    available = {name for name, _, _ in specs}
+    wanted: set[str] | None = None
+    if requested:
+        ordered = list(dict.fromkeys(requested))
+        unknown = [name for name in ordered if name not in available]
+        if unknown:
+            raise ValueError(
+                f"unknown candidate name(s) {unknown}; available for this "
+                f"circuit: {sorted(available)}"
+            )
+        wanted = set(ordered)
+
+    candidates: list[PlacementCandidate] = []
+    for name, build_constraints, reasons in specs:
+        if wanted is not None and name not in wanted:
+            continue
         _append_candidate(
             candidates,
-            "optional_backend_ready",
+            name,
             groups,
-            _with_cluster_zone(constraints, intent_plan),
+            build_constraints(),
             fp_bboxes,
-            [
-                "optional optimization backends detected; using deterministic "
-                "core strategy until backend-specific solvers are enabled"
-            ],
+            reasons,
             intent_plan,
             power_topology,
             fp_geometries,
             seed_memo=seed_memo,
         )
-
     return candidates

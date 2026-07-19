@@ -113,3 +113,52 @@ def test_seed_memo_matches_unmemoized_reference():
         groups, constraints, bboxes, intent_plan=intent
     )
     assert _sig(run1) == _sig(run2)
+
+
+# --- WS38 filter-before-build ---
+
+
+def test_requested_filters_before_build(monkeypatch):
+    groups, constraints, bboxes, intent = _fixture()
+    box = _counting_wrapper(monkeypatch)
+    cands = generate_placement_candidates(
+        groups, constraints, bboxes, intent_plan=intent,
+        requested=["baseline", "connector_edge_first"],
+    )
+    assert [c.name for c in cands] == ["baseline", "connector_edge_first"]
+    assert box["n"] == 2
+
+
+def test_requested_unknown_name_raises():
+    groups, constraints, bboxes, intent = _fixture()
+    with pytest.raises(ValueError) as excinfo:
+        generate_placement_candidates(
+            groups, constraints, bboxes, intent_plan=intent,
+            requested=["baseline", "nope"],
+        )
+    msg = str(excinfo.value)
+    assert "unknown candidate name(s)" in msg
+    assert "['nope']" in msg
+
+
+def test_requested_dedups_keeping_order(monkeypatch):
+    groups, constraints, bboxes, intent = _fixture()
+    box = _counting_wrapper(monkeypatch)
+    cands = generate_placement_candidates(
+        groups, constraints, bboxes, intent_plan=intent,
+        requested=["connector_edge_first", "baseline", "connector_edge_first"],
+    )
+    # de-dup keeps first occurrence; emission stays in generation order
+    assert [c.name for c in cands] == ["baseline", "connector_edge_first"]
+    assert box["n"] == 2
+
+
+def test_requested_none_matches_unfiltered():
+    groups, constraints, bboxes, intent = _fixture()
+    plain = generate_placement_candidates(
+        groups, constraints, bboxes, intent_plan=intent
+    )
+    explicit_none = generate_placement_candidates(
+        groups, constraints, bboxes, intent_plan=intent, requested=None
+    )
+    assert _sig(plain) == _sig(explicit_none)
