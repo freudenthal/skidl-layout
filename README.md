@@ -160,6 +160,42 @@ objective) and `layout_score=100.0` (clean rubric) at once.
   > Freerouting-Java idea was never implemented; KRT replaces it. No Java, no
   > Freerouting install, and no new Python dependencies are required.
 
+## Declaring decoupling caps (explicit `decouples=`)
+
+The decap pass *infers* which cap serves which IC from shared nets, footprint
+geometry, and token affinity. You can instead **declare** it in the skidl source
+(see the fork's `decouples=` API), which flows into layout:
+
+```python
+cbyp = Part("Device", "C", value="1u", decouples=vreg["VI"])  # Pin, ref, or "U1.3"
+```
+
+A declared cap is classified `decoupling_cap` **regardless of value** (unlocking
+1 µF / 4.7 µF / 10 µF local caps the `100n`/`0.1u` value-regex misses), its
+declared parent **wins outright** over the affinity/distance heuristic, and a
+declared supply pin seeds the target pad. `layout.txt` reasons say *"explicitly
+declared decoupling for U1"* vs the inferred *"shares VDD/GND with U1…"*.
+Untagged caps use the heuristic unchanged. The normalized `(ref, pin)` target is
+threaded through `SnapshotPart` so the parallel-worker path matches sequential.
+
+## Power copper (wide tracks + poured planes)
+
+`plan_power_routes` plans per-net widths/strategies; `emit_power_copper` spends
+that plan into **real copper** via KRT — request-only, like `evaluate_routability`:
+
+```python
+from skidl_layout import plan_layout, emit_power_copper
+res = plan_layout(circuit, fp_lib_dirs=[fp_root])
+out = emit_power_copper(res, circuit, fp_lib_dirs=[fp_root], workdir="krt_work",
+                        board_layers=2)          # overrides={"VIN": 0.8} to force a width
+print(out.summary())                             # planned -> emitted per net + warnings
+```
+
+It routes signals + wide power (`plane`/`pour` nets excluded, `wide_trunk`/
+`trunk`/`internal_rail` carried at width), then pours the plane nets as genuine
+`(zone … (fill yes))` copper, grades the final board (`out.feedback`), and sets
+`result.routability`. Never called from `plan_layout` — defaults byte-identical.
+
 ## Tests
 
 ```bash
