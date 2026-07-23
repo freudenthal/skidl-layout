@@ -13,7 +13,13 @@ from .placer import (
     _find_clear_position,
     _occupied_from_keepouts,
 )
-from .roles import DECAP_VALUE_RE, GND_NET_RE, POWER_NET_RE, classify_parts
+from .roles import (
+    DECAP_VALUE_RE,
+    GND_NET_RE,
+    POWER_NET_RE,
+    classify_parts,
+    decouples_declaration,
+)
 from .writer import PlacedPart
 
 
@@ -103,7 +109,12 @@ def _supply_ground_for_decap(part) -> tuple[str, str] | None:
         pin_count = len(getattr(part, "pins", []) or [])
     if pin_count != 2:
         return None
-    if not DECAP_VALUE_RE.match(str(getattr(part, "value", "") or "").strip()):
+    # An explicitly declared cap qualifies regardless of value (unlocks
+    # 1uF/4.7uF/10uF); the value-regex gate stays for the untagged heuristic.
+    if (
+        decouples_declaration(part) is None
+        and not DECAP_VALUE_RE.match(str(getattr(part, "value", "") or "").strip())
+    ):
         return None
 
     nets = list(_part_pin_nets_by_number(part).values())
@@ -248,6 +259,23 @@ def _select_parent(
     part_by_ref = {getattr(part, "ref", None): part for part in circuit.parts}
     cap_part = part_by_ref.get(cap_ref)
     cap_placed = placed_by_ref.get(cap_ref)
+
+    # Explicit declaration wins outright: if the cap names a parent ref that is
+    # placed and exposes the supply+ground pads, use it directly -- skip the
+    # role/affinity/distance scoring entirely (honors a declared connector, too).
+    # A declared parent that is unplaced or lacks the pads falls through to the
+    # heuristic below.
+    declared = decouples_declaration(cap_part) if cap_part is not None else None
+    declared_ref = declared[0] if declared else None
+    if declared_ref and declared_ref != cap_ref and declared_ref in placed_by_ref:
+        declared_part = part_by_ref.get(declared_ref)
+        geometry = fp_geometries.get(placed_by_ref[declared_ref].footprint)
+        if declared_part is not None and geometry is not None:
+            power_pads = _pads_for_net(declared_part, geometry, supply_net)
+            if power_pads:
+                ground_pads = _pads_for_net(declared_part, geometry, ground_net)
+                return declared_part, power_pads, ground_pads
+
     candidates = []
     for part in circuit.parts:
         ref = getattr(part, "ref", None)
@@ -296,10 +324,20 @@ def _select_target_pads(
     power_pads: list[PadGeometry],
     ground_pads: list[PadGeometry],
     usage_index: int,
+    declared_pin=None,
 ) -> tuple[PadGeometry | None, PadGeometry | None]:
     if not power_pads:
         return None, None
-    power_pad = power_pads[usage_index % len(power_pads)]
+    power_pad = None
+    if declared_pin is not None:
+        # A declared supply pin seeds the target pad (skip round-robin) when it
+        # matches an actual supply pad number.
+        for pad in power_pads:
+            if str(pad.number) == str(declared_pin):
+                power_pad = pad
+                break
+    if power_pad is None:
+        power_pad = power_pads[usage_index % len(power_pads)]
     return power_pad, _nearest_pad(ground_pads, power_pad)
 
 
@@ -345,14 +383,32 @@ def infer_decap_placement_intents(
         usage_index = usage_counts.get(usage_key, 0)
         usage_counts[usage_key] = usage_index + 1
 
+        # If this cap explicitly declared THIS parent, honor a declared supply pin
+        # and mark the reason "declared"; otherwise the inferred path is unchanged.
+        declared = decouples_declaration(part)
+        declared_here = declared is not None and declared[0] == parent_ref
+        declared_pin = declared[1] if declared_here else None
+
         power_pad, ground_pad = _select_target_pads(
             power_pads,
             ground_pads,
             usage_index,
+            declared_pin,
         )
         parent_placed = placed_by_ref[parent_ref]
         power_xy = _pad_world_xy(power_pad, parent_placed) if power_pad else None
         ground_xy = _pad_world_xy(ground_pad, parent_placed) if ground_pad else None
+
+        if declared_here:
+            pin_note = f" pin {declared_pin}" if declared_pin else ""
+            reason = (
+                f"{ref} explicitly declared decoupling for {parent_ref}{pin_note}"
+            )
+        else:
+            reason = (
+                f"{ref} shares {supply_net}/{ground_net} with "
+                f"{parent_ref} actual footprint pads"
+            )
 
         intents.append(
             DecapPlacementIntent(
@@ -364,12 +420,7 @@ def infer_decap_placement_intents(
                 target_ground_pin=ground_pad.number if ground_pad else None,
                 target_power_xy=power_xy,
                 target_ground_xy=ground_xy,
-                reasons=[
-                    (
-                        f"{ref} shares {supply_net}/{ground_net} with "
-                        f"{parent_ref} actual footprint pads"
-                    )
-                ],
+                reasons=[reason],
             )
         )
 

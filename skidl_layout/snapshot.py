@@ -79,6 +79,7 @@ class SnapshotPart:
         "hierarchy",
         "pins",
         "_pin_len",
+        "decouples",
     )
 
     def __init__(
@@ -91,6 +92,7 @@ class SnapshotPart:
         description,
         hierarchy,
         pin_len: int,
+        decouples=None,
     ):
         self.ref = ref
         self.name = name
@@ -101,6 +103,10 @@ class SnapshotPart:
         self.hierarchy = hierarchy
         self.pins: list[SnapshotPin] = []
         self._pin_len = pin_len
+        # normalized (ref, pin|None) explicit decoupling target, or None.
+        # Threaded so the parallel-worker path matches the sequential one
+        # (workers rebuild context from snapshots -- an untracked attr is lost).
+        self.decouples = decouples
 
     def __len__(self) -> int:
         # context._part_pin_count / roles._pin_count / congestion._pin_count try
@@ -124,6 +130,21 @@ def _pin_len(part) -> int:
         return len(part)
     except Exception:
         return len(getattr(part, "pins", []) or [])
+
+
+def _decouples_target(part):
+    """Normalized (ref, pin|None) explicit decoupling target, or None.
+
+    Refs are finalized by snapshot time, so this resolves eagerly. Any failure
+    (skidl absent, malformed value) -> None, leaving the heuristic path intact.
+    """
+    if getattr(part, "decouples", None) is None:
+        return None
+    try:
+        from skidl.decouple import decouples_target
+        return decouples_target(part)
+    except Exception:
+        return None
 
 
 def snapshot_circuit(circuit) -> SnapshotCircuit:
@@ -152,6 +173,7 @@ def snapshot_circuit(circuit) -> SnapshotCircuit:
             description=getattr(part, "description", ""),
             hierarchy=getattr(part, "hierarchy", ""),
             pin_len=_pin_len(part),
+            decouples=_decouples_target(part),
         )
         for pin in getattr(part, "pins", []) or []:
             live_func = getattr(pin, "func", None)

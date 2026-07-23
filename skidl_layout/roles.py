@@ -186,12 +186,47 @@ def has_power_and_ground(part) -> bool:
     )
 
 
+def decouples_declaration(part):
+    """Normalized ``(ref, pin|None)`` a part *explicitly* declares it decouples.
+
+    Reads a ``decouples`` attribute that is either an already-normalized
+    ``(ref, pin)`` tuple (a ``SnapshotPart``) or a raw skidl ``decouples=`` value
+    (Part / Pin / ``"REF"`` / ``"REF.PIN"`` / tuple), normalizing via
+    ``skidl.decouple``. ``None`` when absent or unresolvable -> the value-regex
+    heuristic path is used unchanged (byte-identical default).
+    """
+    value = getattr(part, "decouples", None)
+    if value is None:
+        return None
+    try:
+        from skidl.decouple import normalize_decouples
+        target = normalize_decouples(value)
+    except Exception:
+        return None
+    if not target or not target[0]:
+        return None
+    return target
+
+
 def classify_part(part) -> PartRole:
     ref = str(getattr(part, "ref", "") or "")
     prefix = _ref_prefix(part)
     text = _part_text(part)
     pin_count = _pin_count(part)
     reasons: list[str] = []
+
+    # Explicit declaration wins first: a 2-pin cap on power+ground that carries a
+    # decouples= tag is a decoupling cap regardless of value -- this is what
+    # unlocks 1uF/4.7uF/10uF local caps the value-regex heuristic misses.
+    if _is_capacitor_ref(prefix) and pin_count == 2 and has_power_and_ground(part):
+        declared = decouples_declaration(part)
+        if declared is not None:
+            return PartRole(
+                ref,
+                "decoupling_cap",
+                1.0,
+                [f"explicitly declared decoupling for {declared[0]}"],
+            )
 
     if (
         _is_capacitor_ref(prefix)
