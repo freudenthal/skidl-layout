@@ -257,6 +257,7 @@ def route_and_check(
     timeout_s: int = 900,
     power_net_widths: dict[str, float] | None = None,
     out_path: str | None = None,
+    route_extra_args: list[str] | None = None,
 ) -> RoutabilityFeedback:
     """Route ``pcb_path`` with KRT, verify connectivity + DRC, return feedback.
 
@@ -272,7 +273,9 @@ def route_and_check(
     routed-board destination (default: fresh basename in ``workdir``) so a caller
     can chain a plane-pour pass on the routed board. The routed-board path is
     exposed on the returned feedback's ``.source`` unchanged; callers that need
-    the file should pass ``out_path`` explicitly.
+    the file should pass ``out_path`` explicitly. ``route_extra_args`` are extra
+    route.py flags appended verbatim (e.g. ``["--max-ripup", "10",
+    "--max-iterations", "1000000"]`` for a congested 2-layer board).
     """
     resolved = find_krt(krt_dir)
     if resolved is None:
@@ -294,6 +297,10 @@ def route_and_check(
     if nets:
         route_args.append("--nets")
         route_args.extend(nets)
+    if route_extra_args:
+        # verbatim route.py flags (e.g. ["--max-ripup", "10", "--max-iterations",
+        # "1000000"] for a difficult 2-layer board, per plan-pcb-routing SKILL).
+        route_args.extend(route_extra_args)
     if power_net_widths:
         # names first, then the matching widths in the same order (fnmatch
         # patterns; exact net names are literal since '+'/'_' aren't wildcards).

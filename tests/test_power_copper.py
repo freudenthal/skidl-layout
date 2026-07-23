@@ -49,9 +49,10 @@ def patched(monkeypatch, tmp_path):
             fh.write('(net 0 "")\n')
 
     def fake_route(pcb_path, workdir, krt_dir=None, nets=None, timeout_s=900,
-                   power_net_widths=None, out_path=None):
+                   power_net_widths=None, out_path=None, route_extra_args=None):
         cap["route_nets"] = nets
         cap["route_widths"] = power_net_widths
+        cap["route_extra_args"] = route_extra_args
         # emit a routed board with a wide VIN track for the honesty check
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write('(net 1 "VIN_12V")\n'
@@ -100,6 +101,8 @@ def test_partition_2layer(patched):
     assert "SDA" not in cap["route_widths"]
     assert result.routability is out.feedback
     assert out.feedback.total_nets == 3
+    # a congested 2-layer board gets the SKILL rip-up budget by default
+    assert cap["route_extra_args"] == ["--max-ripup", "10", "--max-iterations", "1000000"]
 
 
 def test_partition_4layer_honors_suggested_layer(patched):

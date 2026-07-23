@@ -105,6 +105,7 @@ def emit_power_copper(
     overrides: dict[str, float] | None = None,
     add_gnd_vias: bool = False,
     gnd_via_distance: float = 2.0,
+    route_extra_args: list[str] | None = None,
     timeout_s: int = 900,
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
@@ -165,6 +166,10 @@ def emit_power_copper(
                 warnings.append(f"{net}: override width demoted plane -> wide trace")
 
     # Route: all nets except the plane nets (poured next), wide power at width.
+    # A congested 2-layer board needs the SKILL's rip-up budget to close every
+    # signal net; harmless on an easy board. Caller can override.
+    if route_extra_args is None:
+        route_extra_args = ["--max-ripup", "10", "--max-iterations", "1000000"]
     net_selection = ["*"] + [f"!{n}" for n in plane_nets]
     routed_pcb = os.path.join(workdir_abs, "routed_power.kicad_pcb")
     krt.route_and_check(
@@ -175,6 +180,7 @@ def emit_power_copper(
         timeout_s=timeout_s,
         power_net_widths=width_map or None,
         out_path=routed_pcb,
+        route_extra_args=route_extra_args,
     )
 
     # Honesty: planned -> emitted widths from the routed board.
