@@ -230,6 +230,110 @@ def test_feedback_mixed_extends_denominator():
 
 
 # --------------------------------------------------------------------------
+# power-copper parse helpers (pure)
+# --------------------------------------------------------------------------
+
+# Minimal board text: net declarations + segments at two widths + a poured zone.
+POURED_BOARD = (
+    '  (net 0 "")\n'
+    '  (net 1 "GND")\n'
+    '  (net 2 "VIN_12V")\n'
+    '  (net 3 "V5")\n'
+    '  (segment (start 1 1) (end 2 2) (width 0.8) (layer "F.Cu") (net 2))\n'
+    '  (segment (start 2 2) (end 3 3) (width 0.85) (layer "F.Cu") (net 2))\n'
+    '  (segment (start 4 4) (end 5 5) (width 0.25) (layer "F.Cu") (net 3))\n'
+    '  (via (at 2 2) (size 0.6) (drill 0.3) (net 1))\n'
+    '  (zone (net 1) (net_name "GND") (layer "B.Cu")\n'
+    '    (filled_polygon (layer "B.Cu") (pts (xy 0 0) (xy 10 0) (xy 10 10)))\n'
+    '  )\n'
+)
+
+
+def test_parse_net_id_map():
+    net_map = krt._parse_net_id_map(POURED_BOARD)
+    assert net_map == {0: "", 1: "GND", 2: "VIN_12V", 3: "V5"}
+
+
+def test_segment_widths_by_net_takes_max():
+    widths = krt._segment_widths_by_net(POURED_BOARD)
+    # VIN_12V has two segments (0.8, 0.85) -> max 0.85; V5 -> 0.25; GND poured
+    # (no segment) -> absent.
+    assert widths == {"VIN_12V": 0.85, "V5": 0.25}
+    assert "GND" not in widths
+
+
+def test_parse_zone_summary_counts():
+    summary = krt._parse_zone_summary(POURED_BOARD)
+    assert summary["zone_count"] == 1
+    assert summary["filled_polygon_count"] == 1
+    assert summary["via_count"] == 1
+    assert summary["segment_count"] == 3
+
+
+# --------------------------------------------------------------------------
+# pour_planes guard paths (no subprocess)
+# --------------------------------------------------------------------------
+
+def test_pour_planes_length_mismatch_raises(tmp_path):
+    with pytest.raises(ValueError):
+        krt.pour_planes(
+            str(tmp_path / "x.kicad_pcb"),
+            str(tmp_path / "out.kicad_pcb"),
+            nets=["GND", "V5"],
+            plane_layers=["B.Cu"],
+            workdir=str(tmp_path / "work"),
+        )
+
+
+def test_pour_planes_missing_krt_raises(monkeypatch, tmp_path):
+    monkeypatch.delenv("SKIDL_LAYOUT_KRT_DIR", raising=False)
+    monkeypatch.setattr(krt, "_is_usable_krt", lambda p: False)
+    with pytest.raises(KrtNotFoundError):
+        krt.pour_planes(
+            str(tmp_path / "x.kicad_pcb"),
+            str(tmp_path / "out.kicad_pcb"),
+            nets=["GND"],
+            plane_layers=["B.Cu"],
+            workdir=str(tmp_path / "work"),
+            krt_dir=str(tmp_path / "bogus"),
+        )
+
+
+def test_route_and_check_builds_power_net_args(monkeypatch, tmp_path):
+    """power_net_widths must map to --power-nets/--power-nets-widths in order."""
+    fake = _make_usable_krt(tmp_path / "krt")
+    captured = {}
+
+    def fake_run(args, krt_dir, timeout_s):
+        captured.setdefault("args", args)
+        # First call is route.py: fabricate a valid summary + output file so the
+        # function proceeds; later checker calls get benign output.
+        class P:
+            stdout = 'JSON_SUMMARY: {"successful": 1, "failed": 0}'
+            stderr = ""
+            returncode = 0
+        if args[0] == "route.py":
+            with open(args[2], "w", encoding="utf-8") as fh:
+                fh.write('(net 1 "V5")\n(segment (width 0.8) (net 1))\n')
+        return P()
+
+    monkeypatch.setattr(krt, "_run_krt", fake_run)
+    route_and_check(
+        str(tmp_path / "in.kicad_pcb"),
+        str(tmp_path / "work"),
+        krt_dir=str(fake),
+        nets=["*", "!GND"],
+        power_net_widths={"VIN_12V": 0.8, "V5": 0.5},
+    )
+    args = captured["args"]
+    assert "--power-nets" in args and "--power-nets-widths" in args
+    pn = args.index("--power-nets")
+    pw = args.index("--power-nets-widths")
+    assert args[pn + 1:pn + 3] == ["VIN_12V", "V5"]
+    assert args[pw + 1:pw + 3] == ["0.8", "0.5"]
+
+
+# --------------------------------------------------------------------------
 # route_and_check error path (no KRT)
 # --------------------------------------------------------------------------
 

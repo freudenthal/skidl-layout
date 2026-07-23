@@ -88,6 +88,11 @@ _ROUTED_COUNT_RE = re.compile(r"Checking (\d+) routed nets")
 _UNROUTED_NET_RE = re.compile(r"^    (.+?) \(\d+ pads\)$")
 _CONNECTIVITY_NET_RE = re.compile(r"^  (.+?) \(net \d+\):$")
 _DRC_COUNT_RE = re.compile(r"FOUND (\d+) DRC VIOLATIONS")
+_NET_DECL_RE = re.compile(r'\(net\s+(\d+)\s+"((?:[^"\\]|\\.)*)"\)')
+_SEGMENT_RE = re.compile(
+    r"\(segment\b.*?\(width\s+([0-9.]+)\).*?\(net\s+(\d+)\)",
+    re.DOTALL,
+)
 
 
 def _parse_route_summary(stdout: str) -> dict:
@@ -155,6 +160,43 @@ def _parse_drc_output(text: str) -> int:
     return 0
 
 
+def _parse_net_id_map(pcb_text: str) -> dict[int, str]:
+    """Map net id -> net name from a board's ``(net ID "name")`` declarations."""
+    net_map: dict[int, str] = {}
+    for match in _NET_DECL_RE.finditer(pcb_text):
+        net_map[int(match.group(1))] = match.group(2).replace('\\"', '"')
+    return net_map
+
+
+def _segment_widths_by_net(pcb_text: str) -> dict[str, float]:
+    """Return the max ``(segment)`` width (mm) emitted for each net name.
+
+    A net with no routed segments (e.g. a poured plane net) is absent from the
+    result. Vias are ignored; this measures trace copper only.
+    """
+    net_map = _parse_net_id_map(pcb_text)
+    widths: dict[str, float] = {}
+    for match in _SEGMENT_RE.finditer(pcb_text):
+        width = float(match.group(1))
+        net_name = net_map.get(int(match.group(2)))
+        if net_name is None:
+            continue
+        prev = widths.get(net_name)
+        if prev is None or width > prev:
+            widths[net_name] = width
+    return widths
+
+
+def _parse_zone_summary(pcb_text: str) -> dict:
+    """Count poured copper in a board: zones, filled polygons, vias, segments."""
+    return {
+        "zone_count": pcb_text.count("(zone"),
+        "filled_polygon_count": pcb_text.count("(filled_polygon"),
+        "via_count": pcb_text.count("(via"),
+        "segment_count": pcb_text.count("(segment"),
+    }
+
+
 def _feedback_from_outputs(
     routed_pcb_text: str,
     connected_output: str,
@@ -213,6 +255,8 @@ def route_and_check(
     krt_dir: str | None = None,
     nets: list[str] | None = None,
     timeout_s: int = 900,
+    power_net_widths: dict[str, float] | None = None,
+    out_path: str | None = None,
 ) -> RoutabilityFeedback:
     """Route ``pcb_path`` with KRT, verify connectivity + DRC, return feedback.
 
@@ -220,6 +264,15 @@ def route_and_check(
     cleanup) to avoid the ``.kicad_pro`` DRC-floor readback gotcha. Raises
     :class:`KrtNotFoundError` if no KRT checkout is found and RuntimeError on a
     route.py timeout/crash (checker 'issues found' exits are data, not errors).
+
+    ``power_net_widths`` maps net name -> track width (mm); those nets are routed
+    at the requested width via route.py ``--power-nets``/``--power-nets-widths``
+    (each name passed as an exact fnmatch pattern; KRT floors it to
+    ``--track-width`` and neck-downs at pads by default). ``out_path`` pins the
+    routed-board destination (default: fresh basename in ``workdir``) so a caller
+    can chain a plane-pour pass on the routed board. The routed-board path is
+    exposed on the returned feedback's ``.source`` unchanged; callers that need
+    the file should pass ``out_path`` explicitly.
     """
     resolved = find_krt(krt_dir)
     if resolved is None:
@@ -230,14 +283,25 @@ def route_and_check(
 
     os.makedirs(workdir, exist_ok=True)
     in_abs = os.path.abspath(pcb_path)
-    out_abs = os.path.join(
-        os.path.abspath(workdir), f"routed_{uuid.uuid4().hex[:8]}.kicad_pcb"
-    )
+    if out_path is not None:
+        out_abs = os.path.abspath(out_path)
+    else:
+        out_abs = os.path.join(
+            os.path.abspath(workdir), f"routed_{uuid.uuid4().hex[:8]}.kicad_pcb"
+        )
 
     route_args = ["route.py", in_abs, out_abs]
     if nets:
         route_args.append("--nets")
         route_args.extend(nets)
+    if power_net_widths:
+        # names first, then the matching widths in the same order (fnmatch
+        # patterns; exact net names are literal since '+'/'_' aren't wildcards).
+        names = list(power_net_widths)
+        route_args.append("--power-nets")
+        route_args.extend(names)
+        route_args.append("--power-nets-widths")
+        route_args.extend(f"{power_net_widths[name]:g}" for name in names)
     try:
         route_proc = _run_krt(route_args, resolved, timeout_s)
     except subprocess.TimeoutExpired as exc:
@@ -306,3 +370,98 @@ def evaluate_routability(
     feedback = route_and_check(placed_pcb, workdir, krt_dir=krt_dir)
     result.routability = feedback
     return feedback
+
+
+def pour_planes(
+    pcb_path: str,
+    out_path: str,
+    nets: list[str],
+    plane_layers: list[str],
+    workdir: str,
+    krt_dir: str | None = None,
+    timeout_s: int = 900,
+    add_gnd_vias: bool = False,
+    gnd_via_distance: float = 2.0,
+) -> dict:
+    """Pour copper planes on ``nets`` and re-verify the board.
+
+    Runs KRT ``route_planes.py --nets <names> --plane-layers <layers>`` (one
+    layer per net, paired positionally) to write real ``(zone ... (fill yes))``
+    objects to ``out_path``, then re-runs ``check_connected.py`` +
+    ``check_drc.py`` on the final board and folds the results into the returned
+    summary. A pour that strands an island is a failure signal
+    (``connected_ok`` False); KRT ships ``route_disconnected_planes.py`` for
+    that repair, deliberately NOT auto-invoked here (round-1 scope).
+
+    Ordering note (from ``KiCadRoutingTools/.claude/skills/plan-pcb-routing/``
+    ``SKILL.md`` Steps 2->3): signals are routed FIRST (plane nets excluded from
+    ``route.py --nets``, wide power carried inside it via ``--power-nets``), and
+    planes are poured LAST so their stitching vias adapt around the finished
+    tracks. Callers (``power_copper.emit_power_copper``) sequence route ->
+    pour accordingly; this function is the pour half only.
+
+    Returns a parsed summary dict: ``{"zone_count", "filled_polygon_count",
+    "via_count", "segment_count", "min_clearance_used", "connected_ok",
+    "unrouted_nets", "broken_nets", "drc_violation_count", "out_path"}``.
+    Raises :class:`KrtNotFoundError` if no KRT checkout is found and RuntimeError
+    on a route_planes.py timeout/crash.
+    """
+    if len(nets) != len(plane_layers):
+        raise ValueError(
+            f"nets ({len(nets)}) and plane_layers ({len(plane_layers)}) "
+            "must be the same length (one layer per net)"
+        )
+    resolved = find_krt(krt_dir)
+    if resolved is None:
+        raise KrtNotFoundError(
+            "KiCadRoutingTools not found (set SKIDL_LAYOUT_KRT_DIR or place a "
+            "built checkout at the workspace sibling KiCadRoutingTools/)"
+        )
+
+    os.makedirs(workdir, exist_ok=True)
+    in_abs = os.path.abspath(pcb_path)
+    out_abs = os.path.abspath(out_path)
+
+    args = ["route_planes.py", in_abs, out_abs, "--nets", *nets,
+            "--plane-layers", *plane_layers]
+    if add_gnd_vias:
+        args += ["--add-gnd-vias", "--gnd-via-distance", f"{gnd_via_distance:g}"]
+    try:
+        plane_proc = _run_krt(args, resolved, timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"route_planes.py timed out after {timeout_s}s") from exc
+
+    try:
+        plane_summary = _parse_route_summary(plane_proc.stdout)
+    except (RuntimeError, json.JSONDecodeError):
+        tail = "\n".join((plane_proc.stdout + plane_proc.stderr).splitlines()[-30:])
+        raise RuntimeError(
+            f"route_planes.py produced no JSON_SUMMARY "
+            f"(exit {plane_proc.returncode}):\n{tail}"
+        )
+
+    try:
+        with open(out_abs, "r", encoding="utf-8", errors="replace") as handle:
+            poured_text = handle.read()
+    except OSError as exc:
+        raise RuntimeError(f"route_planes.py did not write output {out_abs}") from exc
+
+    conn_proc = _run_krt(["check_connected.py", out_abs], resolved, timeout_s)
+    drc_proc = _run_krt(["check_drc.py", out_abs], resolved, timeout_s)
+    _routed_count, unrouted, broken = _parse_connected_output(conn_proc.stdout)
+
+    summary = _parse_zone_summary(poured_text)
+    summary.update(
+        min_clearance_used=plane_summary.get("min_clearance_used"),
+        connected_ok=(not unrouted and not broken),
+        unrouted_nets=unrouted,
+        broken_nets=broken,
+        drc_violation_count=_parse_drc_output(drc_proc.stdout),
+        out_path=out_abs,
+    )
+    logger.info(
+        "KRT planes: %d zone(s), %d filled polygon(s), connected=%s, DRC=%d",
+        summary["zone_count"], summary["filled_polygon_count"],
+        summary["connected_ok"], summary["drc_violation_count"],
+    )
+    return summary
