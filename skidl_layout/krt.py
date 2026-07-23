@@ -372,6 +372,31 @@ def evaluate_routability(
     return feedback
 
 
+def check_board(
+    pcb_path: str,
+    krt_dir: str | None = None,
+    timeout_s: int = 900,
+) -> RoutabilityFeedback:
+    """Grade an already-routed/poured board: connectivity + DRC, no routing.
+
+    Runs ``check_connected.py`` + ``check_drc.py`` on ``pcb_path`` and assembles
+    a :class:`RoutabilityFeedback` (zone-aware connectivity, so poured plane nets
+    count as connected). Used to grade the FINAL board after route + pour.
+    """
+    resolved = find_krt(krt_dir)
+    if resolved is None:
+        raise KrtNotFoundError(
+            "KiCadRoutingTools not found (set SKIDL_LAYOUT_KRT_DIR or place a "
+            "built checkout at the workspace sibling KiCadRoutingTools/)"
+        )
+    in_abs = os.path.abspath(pcb_path)
+    with open(in_abs, "r", encoding="utf-8", errors="replace") as handle:
+        text = handle.read()
+    conn_proc = _run_krt(["check_connected.py", in_abs], resolved, timeout_s)
+    drc_proc = _run_krt(["check_drc.py", in_abs], resolved, timeout_s)
+    return _feedback_from_outputs(text, conn_proc.stdout, drc_proc.stdout)
+
+
 def pour_planes(
     pcb_path: str,
     out_path: str,

@@ -72,11 +72,13 @@ from .roles import PartRole, classify_part, classify_parts
 from .routability import RoutabilityFeedback
 from .krt import (
     KrtNotFoundError,
+    check_board,
     evaluate_routability,
     find_krt,
     pour_planes,
     route_and_check,
 )
+from .power_copper import PowerCopperResult, emit_power_copper
 from .scoring import LayoutScore, score_placement, score_placement_quick
 from .spatial import SpatialGrid
 from .validator import ValidationResult, find_kicad_cli, run_kicad_drc, validate
