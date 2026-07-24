@@ -190,6 +190,52 @@ def resolve_fab_spec(spec) -> FabSpec | None:
     )
 
 
+def write_krt_fab_overrides(spec, path: str) -> list[str]:
+    """Write ``spec``'s published floors as a KRT ``--fab-overrides`` file.
+
+    Returns the CLI fragment ``["--fab-overrides", <path>]`` ready to hand to
+    ``emit_power_copper(route_extra_args=...)`` / ``plan_pcb(route_extra_args=...)``.
+
+    **Why this exists.** The design-rule flags :func:`emit_power_copper` passes
+    KRT (``--track-width`` / ``--clearance`` / ``--via-size`` / ``--via-drill``)
+    set the *nominal* values a board is drawn at.  They do **not** set the floor
+    KRT's fine-pitch pad-escape ladder necks down toward -- that comes from KRT's
+    own JLC-derived tier table, and on a fine-pitch part (TQFP/QFN) the escape
+    routinely lands below a fab's published minimum.  That is exactly the
+    limitation the FabSpec round recorded on the avalanche LT3757 board and
+    deferred as "would need KRT edits".  It does not: KRT ships
+    ``--fab-overrides <file>``, which pins the floor to the listed values and
+    disables the automatic standard->advanced escalation.
+
+    Measured on the ``qtpy_samd21`` canary (TQFP-32, 0.8 mm pitch, 2 layers)::
+
+        without            69 min_track violations, 23 routed-DRC, 5 unrouted
+        with this file      0 min_track violations,  0 routed-DRC, 1 unrouted
+
+    Report-only and entirely opt-in: nothing calls this automatically, so every
+    existing path stays byte-identical.
+    """
+    spec = resolve_fab_spec(spec)
+    if spec is None:
+        raise ValueError("write_krt_fab_overrides needs a FabSpec, not None")
+    lines = [
+        f"# KRT fab-floor overrides generated from FabSpec {spec.name!r}.",
+        "# Pins KRT's fine-pitch neck-down floor to the fab's published limits",
+        "# (without this, the pad-escape ladder necks below them).",
+        f"track_width  = {spec.min_track_mm:g}",
+        f"clearance    = {spec.min_clearance_mm:g}",
+        f"via_drill    = {spec.via_drill_mm:g}",
+        f"via_diameter = {spec.via_size_mm:g}",
+        "",
+    ]
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    return ["--fab-overrides", path]
+
+
 # --------------------------------------------------------------------------
 # The fab-limits gate (WS-F4)
 # --------------------------------------------------------------------------

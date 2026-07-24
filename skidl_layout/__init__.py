@@ -34,6 +34,7 @@ from .fabspec import (
     OSHPARK_2L,
     fab_check,
     resolve_fab_spec,
+    write_krt_fab_overrides,
 )
 from .context import LayoutContext
 from .engine import LayoutResult, plan_layout

@@ -333,3 +333,39 @@ def test_route_and_check_appends_design_rule_flags(monkeypatch, tmp_path):
     assert "--via-size" in args and args[args.index("--via-size") + 1] == "0.6"
     assert "--board-edge-clearance" in args
 
+
+
+# --------------------------------------------------------------------------
+# KRT fab-floor override file (pins the fine-pitch neck-down floor)
+# --------------------------------------------------------------------------
+
+def test_write_krt_fab_overrides_emits_the_published_floor(tmp_path):
+    from skidl_layout.fabspec import write_krt_fab_overrides
+
+    path = tmp_path / "nested" / "oshpark_2l.txt"
+    args = write_krt_fab_overrides("oshpark-2l", str(path))
+
+    assert args == ["--fab-overrides", str(path)]
+    body = path.read_text(encoding="utf-8")
+    values = {}
+    for line in body.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, _, val = line.partition("=")
+        values[key.strip()] = float(val)
+    # KRT's own key spelling; the floor is the spec's PUBLISHED minimum, which
+    # is what its fine-pitch pad-escape ladder must not neck below.
+    assert values == {
+        "track_width": OSHPARK_2L.min_track_mm,
+        "clearance": OSHPARK_2L.min_clearance_mm,
+        "via_drill": OSHPARK_2L.via_drill_mm,
+        "via_diameter": OSHPARK_2L.via_size_mm,
+    }
+
+
+def test_write_krt_fab_overrides_rejects_no_spec(tmp_path):
+    from skidl_layout.fabspec import write_krt_fab_overrides
+
+    with pytest.raises(ValueError):
+        write_krt_fab_overrides(None, str(tmp_path / "x.txt"))
