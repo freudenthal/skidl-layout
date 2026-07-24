@@ -151,3 +151,35 @@ def test_classify_parts_by_ref():
     roles = classify_parts(_Circuit(parts))
     assert roles["J1"].role == "connector"
     assert roles["R1"].role == "signal_passive"
+
+
+# --------------------------------------------------------------------------
+# Bulk-cap classifier (WS-8a)
+# --------------------------------------------------------------------------
+
+from skidl_layout.roles import cap_value_uf, is_bulk_cap  # noqa: E402
+
+
+def test_cap_value_uf_parses_common_spellings():
+    cases = {
+        "10uF": 10.0, "10u": 10.0, "4.7uF": 4.7, "100nF": 0.1,
+        "0.1uF": 0.1, "1mF": 1000.0, "1F": 1_000_000.0, "22uF": 22.0,
+    }
+    for text, expected in cases.items():
+        assert cap_value_uf(_Part("C1", value=text)) == expected
+
+
+def test_cap_value_uf_rejects_ambiguous_or_empty():
+    for text in ("", "abc", "100", "  "):
+        assert cap_value_uf(_Part("C1", value=text)) is None
+
+
+def test_is_bulk_cap_needs_size_and_power_ground():
+    # 10uF on a power+ground pair -> bulk.
+    assert is_bulk_cap(_Part("C1", value="10uF", nets=["V3", "GND"]))
+    # 100nF is decoupling-sized, never bulk.
+    assert not is_bulk_cap(_Part("C2", value="100nF", nets=["V3", "GND"]))
+    # 10uF but no ground -> not classifiable as a rail reservoir.
+    assert not is_bulk_cap(_Part("C3", value="10uF", nets=["V3", "SIG"]))
+    # A big resistor is not a cap.
+    assert not is_bulk_cap(_Part("R1", value="10uF", nets=["V3", "GND"]))

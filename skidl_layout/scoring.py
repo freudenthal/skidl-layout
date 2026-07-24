@@ -17,6 +17,7 @@ from .roles import (
     _part_tokens,  # re-exported for backward compat (defined in roles.py)
     classify_parts,
     is_nc_net,
+    is_bulk_cap,
     is_ui_grid_part,
     pin_net_names,
 )
@@ -827,6 +828,38 @@ def _role_warnings(
         if distance > 5.0:
             warnings.append(
                 f"{ref}: decoupling cap is {distance:.1f}mm from {nearest_ref}"
+            )
+
+    # Bulk (reservoir) caps want to sit near the regulator/IC they reservoir,
+    # but on a looser budget than a decoupling cap -- 15 mm vs 5 mm. Same
+    # mechanism as the decap warning above (nearest supply-sharing parent),
+    # keyed on the value-based bulk classifier rather than the decoupling role.
+    for ref, role in roles.items():
+        if ref not in placed_by_ref or role.role == "decoupling_cap":
+            continue
+        part = part_by_ref.get(ref)
+        if part is None or not is_bulk_cap(part):
+            continue
+        cap_nets = nets_by_ref.get(ref, set())
+        candidates = [
+            other_ref
+            for other_ref, other_role in roles.items()
+            if other_ref in placed_by_ref
+            and other_role.role in parent_roles
+            and cap_nets.intersection(nets_by_ref.get(other_ref, set()))
+        ]
+        if not candidates:
+            continue
+        nearest_ref = min(
+            candidates,
+            key=lambda other_ref: _distance(
+                placed_by_ref[ref], placed_by_ref[other_ref]
+            ),
+        )
+        distance = _distance(placed_by_ref[ref], placed_by_ref[nearest_ref])
+        if distance > 15.0:
+            warnings.append(
+                f"{ref}: bulk cap is {distance:.1f}mm from {nearest_ref}"
             )
 
     for ref, role in roles.items():

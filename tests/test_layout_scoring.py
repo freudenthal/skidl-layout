@@ -184,6 +184,48 @@ def test_score_decoupling_cap_warns_when_far_from_parent():
     assert score.power_net_count == 2
 
 
+def test_score_bulk_cap_warns_only_when_far_from_regulator():
+    """A 10uF reservoir cap: fine within 15mm, flagged past it."""
+    vin = _Net("VIN")
+    gnd = _Net("GND")
+    vout = _Net("V3")
+
+    def _build(cap_x):
+        reg = _Part("U1", name="LDO regulator", footprint="Package_QFP:MCU",
+                    nets=[vin, gnd, vout], pins=3)
+        cap = _Part("C1", value="10uF", footprint="Capacitor:C_0805",
+                    nets=[vout, gnd])
+        circuit = _Circuit([reg, cap], [vin, gnd, vout])
+        placed = [
+            PlacedPart("U1", 10.0, 10.0, 0.0, "Package_QFP:MCU"),
+            PlacedPart("C1", cap_x, 10.0, 0.0, "Capacitor:C_0805"),
+        ]
+        return score_placement(placed, circuit, BBOXES)
+
+    near = _build(20.0)   # 10 mm away
+    far = _build(40.0)    # 30 mm away
+    assert not any("bulk cap" in w for w in near.warnings)
+    assert any("C1: bulk cap" in w and "U1" in w for w in far.warnings)
+
+
+def test_score_does_not_call_a_small_decoupling_cap_bulk():
+    """A 100nF cap is decoupling, never bulk -- even placed far away."""
+    vcc = _Net("VCC")
+    gnd = _Net("GND")
+    ic = _Part("U1", name="MCU", footprint="Package_QFP:MCU",
+               nets=[vcc, gnd], pins=3)
+    cap = _Part("C1", value="100nF", footprint="Capacitor:C_0805",
+                nets=[vcc, gnd])
+    circuit = _Circuit([ic, cap], [vcc, gnd])
+    placed = [
+        PlacedPart("U1", 10.0, 10.0, 0.0, "Package_QFP:MCU"),
+        PlacedPart("C1", 50.0, 10.0, 0.0, "Capacitor:C_0805"),
+    ]
+    score = score_placement(placed, circuit, BBOXES)
+    assert not any("bulk cap" in w for w in score.warnings)
+    assert any("decoupling cap" in w for w in score.warnings)
+
+
 def test_score_named_decap_warns_from_token_matched_owner_without_geometry():
     vcc = _Net("VCC")
     gnd = _Net("GND")

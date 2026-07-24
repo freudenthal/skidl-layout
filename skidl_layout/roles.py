@@ -234,6 +234,52 @@ def has_power_and_ground(part) -> bool:
     )
 
 
+_CAP_VALUE_RE = re.compile(r"^\s*([\d.]+)\s*([pnuµm]?)f?\s*$", re.IGNORECASE)
+_CAP_UNIT_TO_UF = {"p": 1e-6, "n": 1e-3, "u": 1.0, "µ": 1.0, "m": 1e3, "": 1e6}
+
+#: A capacitor at or above this value (in µF) counts as *bulk* rather than
+#: local decoupling. 10 µF cleanly clears the 0.1/1/4.7 µF local-decoupling band
+#: (a declared local 10 µF is already the ``decoupling_cap`` role and so is
+#: excluded by the caller), and matches the electrolytic/tantalum reservoir caps
+#: that sit at a regulator's input and output.
+BULK_CAP_MIN_UF = 10.0
+
+
+def cap_value_uf(part) -> float | None:
+    """Capacitance of ``part`` in microfarads, or ``None`` if unparseable.
+
+    Understands ``10uF`` / ``10u`` / ``4.7µF`` / ``100nF`` / ``0.1uF`` / ``1mF``
+    and a bare ``F`` suffix. A bare number with no unit is ambiguous -> ``None``.
+    """
+    match = _CAP_VALUE_RE.match(str(getattr(part, "value", "") or ""))
+    if not match:
+        return None
+    number, unit = match.group(1), match.group(2).lower()
+    if number in {"", "."} or (not unit and "f" not in
+                               str(getattr(part, "value", "")).lower()):
+        return None
+    try:
+        return float(number) * _CAP_UNIT_TO_UF[unit]
+    except (ValueError, KeyError):
+        return None
+
+
+def is_bulk_cap(part) -> bool:
+    """A 2-pin capacitor on power+ground whose value is bulk-sized (>=10 µF).
+
+    Report-only classifier -- it does not change a part's :class:`PartRole`
+    (so placement stays byte-identical); the scorer uses it to flag a bulk cap
+    stranded far from the regulator it reservoirs.
+    """
+    prefix = _ref_prefix(part)
+    if not _is_capacitor_ref(prefix) or _pin_count(part) != 2:
+        return False
+    if not has_power_and_ground(part):
+        return False
+    value_uf = cap_value_uf(part)
+    return value_uf is not None and value_uf >= BULK_CAP_MIN_UF
+
+
 def decouples_declaration(part):
     """Normalized ``(ref, pin|None)`` a part *explicitly* declares it decouples.
 
