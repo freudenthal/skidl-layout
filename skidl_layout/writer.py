@@ -226,8 +226,61 @@ def validate_footprints(
     return valid, missing
 
 
-def _default_setup() -> Sexp:
-    return Sexp([
+def _copper_layer_names(copper_layers: int) -> list[str]:
+    """Ordered top->bottom copper layer names for an N-layer stackup."""
+    if copper_layers <= 2:
+        return ["F.Cu", "B.Cu"]
+    inner = [f"In{i}.Cu" for i in range(1, copper_layers - 1)]
+    return ["F.Cu"] + inner + ["B.Cu"]
+
+
+def _stackup_block(fab_spec) -> Sexp:
+    """Build a ``(stackup ...)`` node describing ``fab_spec``'s physical layers.
+
+    Top->bottom: silk / paste / mask, then copper foils separated by dielectric
+    (core) layers, then bottom mask / paste / silk, closed by the copper finish
+    and ``(dielectric_constraints no)``. Copper thickness comes from the foil
+    weight, the dielectric thickness/material/epsilon from the spec. Only emitted
+    when a spec is supplied -- the default path never calls this.
+    """
+    cu_names = _copper_layer_names(fab_spec.copper_layers)
+    n_cu = len(cu_names)
+    cu_th = fab_spec.copper_thickness_mm
+    # Split the core/prepreg thickness evenly across the N-1 dielectric gaps.
+    n_diel = max(n_cu - 1, 1)
+    diel_th = round(fab_spec.core_thickness_mm / n_diel, 4)
+    mask_th = 0.01
+
+    stack = Sexp(["stackup"])
+    stack.append(Sexp(["layer", _q("F.SilkS"), ["type", _q("Top Silk Screen")]]))
+    stack.append(Sexp(["layer", _q("F.Paste"), ["type", _q("Top Solder Paste")]]))
+    stack.append(Sexp([
+        "layer", _q("F.Mask"), ["type", _q("Top Solder Mask")], ["thickness", mask_th],
+    ]))
+    diel_idx = 1
+    for i, name in enumerate(cu_names):
+        stack.append(Sexp([
+            "layer", _q(name), ["type", _q("copper")], ["thickness", cu_th],
+        ]))
+        if i < n_cu - 1:
+            stack.append(Sexp([
+                "layer", _q(f"dielectric {diel_idx}"), ["type", _q("core")],
+                ["thickness", diel_th], ["material", _q(fab_spec.substrate)],
+                ["epsilon_r", fab_spec.dielectric_constant], ["loss_tangent", 0.02],
+            ]))
+            diel_idx += 1
+    stack.append(Sexp([
+        "layer", _q("B.Mask"), ["type", _q("Bottom Solder Mask")], ["thickness", mask_th],
+    ]))
+    stack.append(Sexp(["layer", _q("B.Paste"), ["type", _q("Bottom Solder Paste")]]))
+    stack.append(Sexp(["layer", _q("B.SilkS"), ["type", _q("Bottom Silk Screen")]]))
+    stack.append(Sexp(["copper_finish", _q(fab_spec.finish)]))
+    stack.append(Sexp(["dielectric_constraints", "no"]))
+    return stack
+
+
+def _default_setup(fab_spec=None) -> Sexp:
+    setup = Sexp([
         "setup",
         ["pad_to_mask_clearance", 0],
         ["allow_soldermask_bridges_in_footprints", "no"],
@@ -273,6 +326,10 @@ def _default_setup() -> Sexp:
             ["outputdirectory", _q("")],
         ],
     ])
+    if fab_spec is not None:
+        # KiCad places (stackup ...) first inside (setup ...).
+        setup.insert(1, _stackup_block(fab_spec))
+    return setup
 
 
 def _build_net_map(circuit) -> tuple[dict[str, int], list]:
@@ -791,15 +848,25 @@ def write_kicad_pcb(
     version: int = 20241229,
     strict_missing_footprints: bool = True,
     lib_table: dict[str, str] = None,
+    fab_spec=None,
 ):
-    """Write a complete .kicad_pcb file."""
+    """Write a complete .kicad_pcb file.
+
+    ``fab_spec`` (default ``None``): when a :class:`~skidl_layout.FabSpec` is
+    given, the board gains a real ``(setup (stackup ...))`` block describing its
+    copper/dielectric layers + finish and the board-level thickness KiCad reads
+    from the PCB file. ``fab_spec=None`` keeps the output **byte-identical** to
+    the pre-FabSpec writer. Net classes/design rules are NOT written here -- they
+    live in the ``.kicad_pro`` (skidl-eda WS-F5).
+    """
     net_map, nets = _build_net_map(circuit)
 
     board = Sexp(["kicad_pcb"])
     board.append(Sexp(["version", version]))
     board.append(Sexp(["generator", _q("skidl")]))
     board.append(Sexp(["generator_version", _q("9.0")]))
-    board.append(Sexp(["general", ["thickness", 1.6], ["legacy_teardrops", "no"]]))
+    thickness = fab_spec.board_thickness_mm if fab_spec is not None else 1.6
+    board.append(Sexp(["general", ["thickness", thickness], ["legacy_teardrops", "no"]]))
     board.append(Sexp(["paper", _q("A4")]))
 
     layers = Sexp(["layers"])
@@ -810,7 +877,7 @@ def write_kicad_pcb(
         layers.append(row)
     board.append(layers)
 
-    board.append(_default_setup())
+    board.append(_default_setup(fab_spec))
 
     board.append(Sexp(["net", 0, _q("")]))
     for net in nets:

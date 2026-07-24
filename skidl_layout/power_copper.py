@@ -82,6 +82,40 @@ class PowerCopperResult:
         }
 
 
+def _spec_route_kwargs(spec) -> dict:
+    """Route.py design-rule kwargs for ``spec`` (empty dict when off).
+
+    Empty when ``spec is None`` so the route call is byte-identical argv to the
+    pre-FabSpec path.
+    """
+    if spec is None:
+        return {}
+    return {
+        "track_width": spec.track_width_mm,
+        "clearance": spec.clearance_mm,
+        "via_size": spec.via_size_mm,
+        "via_drill": spec.via_drill_mm,
+        "board_edge_clearance": spec.board_edge_keepout_mm,
+    }
+
+
+def _spec_pour_kwargs(spec) -> dict:
+    """route_planes.py design-rule kwargs for ``spec`` (empty dict when off).
+
+    Only the via/track/clearance floor is set from the spec; the zone-clearance
+    and min-thickness pour defaults (KRT 0.2/0.1) are kept unless the spec's own
+    clearance is tighter (it never is for OSHPark), so pours stay proven.
+    """
+    if spec is None:
+        return {}
+    return {
+        "track_width": spec.track_width_mm,
+        "clearance": spec.clearance_mm,
+        "via_size": spec.via_size_mm,
+        "via_drill": spec.via_drill_mm,
+    }
+
+
 def _plane_layer_for(intent, board_layers: int) -> str:
     """Copper layer to pour a plane/pour-strategy net on.
 
@@ -108,6 +142,7 @@ def emit_power_copper(
     route_extra_args: list[str] | None = None,
     timeout_s: int = 900,
     strict_missing_footprints: bool = False,
+    fab_spec=None,
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -134,8 +169,19 @@ def emit_power_copper(
     are byte-identical. Strip sim-only parts up front
     (:func:`skidl_layout.strip_sim_only_parts`) to keep them off the board
     entirely.
+
+    ``fab_spec`` (default ``None`` -> byte-identical): a
+    :class:`~skidl_layout.FabSpec`, preset name, or ``True`` (-> OSHPark 2-layer).
+    When engaged it (a) stamps the board stackup via the writer, (b) routes
+    signals + pours planes at the spec's track/clearance/via/board-edge values,
+    and (c) clamps every planned power-track width UP to ``spec.min_track_mm``
+    (an explicit ``overrides=`` width still wins). Resolved once via
+    :func:`skidl_layout.resolve_fab_spec`.
     """
     from .writer import write_kicad_pcb
+    from .fabspec import resolve_fab_spec
+
+    spec = resolve_fab_spec(fab_spec)
 
     os.makedirs(workdir, exist_ok=True)
     workdir_abs = os.path.abspath(workdir)
@@ -149,12 +195,15 @@ def emit_power_copper(
         cutouts=getattr(result, "cutouts", None),
         lib_table=lib_table,
         strict_missing_footprints=strict_missing_footprints,
+        fab_spec=spec,
     )
 
     warnings: list[str] = []
     intents = list(getattr(result.power_plan, "route_intents", []) or [])
 
-    # Partition the plan.
+    # Partition the plan. When a fab spec is engaged, clamp each planned power
+    # width UP to the fab's minimum track (a fab never draws below its own floor;
+    # an explicit override still wins, applied after this).
     plane_nets: list[str] = []
     plane_layers: list[str] = []
     width_map: dict[str, float] = {}
@@ -163,7 +212,10 @@ def emit_power_copper(
             plane_nets.append(intent.net_name)
             plane_layers.append(_plane_layer_for(intent, board_layers))
         elif intent.strategy in _WIDE_STRATEGIES:
-            width_map[intent.net_name] = intent.width_mm
+            width = intent.width_mm
+            if spec is not None:
+                width = max(width, spec.min_track_mm)
+            width_map[intent.net_name] = width
 
     # Human vetoes: an override for any net wins (and can force a width on a net
     # the plan left at signal width). Overriding a plane net to a width demotes
@@ -184,6 +236,7 @@ def emit_power_copper(
         route_extra_args = ["--max-ripup", "10", "--max-iterations", "1000000"]
     net_selection = ["*"] + [f"!{n}" for n in plane_nets]
     routed_pcb = os.path.join(workdir_abs, "routed_power.kicad_pcb")
+    dr = _spec_route_kwargs(spec)
     krt.route_and_check(
         placed_pcb,
         workdir_abs,
@@ -193,6 +246,7 @@ def emit_power_copper(
         power_net_widths=width_map or None,
         out_path=routed_pcb,
         route_extra_args=route_extra_args,
+        **dr,
     )
 
     # Honesty: planned -> emitted widths from the routed board.
@@ -224,6 +278,7 @@ def emit_power_copper(
             timeout_s=timeout_s,
             add_gnd_vias=add_gnd_vias,
             gnd_via_distance=gnd_via_distance,
+            **_spec_pour_kwargs(spec),
         )
         if plane_summary.get("zone_count", 0) < len(plane_nets):
             warnings.append(

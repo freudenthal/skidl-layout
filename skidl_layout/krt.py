@@ -249,6 +249,34 @@ def _run_krt(args: list[str], krt_dir: str, timeout_s: int) -> subprocess.Comple
     )
 
 
+def _design_rule_flags(
+    track_width: float | None,
+    clearance: float | None,
+    via_size: float | None,
+    via_drill: float | None,
+    board_edge_clearance: float | None = None,
+) -> list[str]:
+    """Assemble the KRT design-rule CLI flags for the values that are set.
+
+    A ``None`` value emits no flag (so the router keeps its own default and the
+    argv stays byte-identical to a call that never passed a spec). Shared by
+    :func:`route_and_check` and :func:`pour_planes` (both scripts accept the same
+    ``--track-width/--clearance/--via-size/--via-drill`` names).
+    """
+    flags: list[str] = []
+    if track_width is not None:
+        flags += ["--track-width", f"{track_width:g}"]
+    if clearance is not None:
+        flags += ["--clearance", f"{clearance:g}"]
+    if via_size is not None:
+        flags += ["--via-size", f"{via_size:g}"]
+    if via_drill is not None:
+        flags += ["--via-drill", f"{via_drill:g}"]
+    if board_edge_clearance is not None:
+        flags += ["--board-edge-clearance", f"{board_edge_clearance:g}"]
+    return flags
+
+
 def route_and_check(
     pcb_path: str,
     workdir: str,
@@ -258,6 +286,11 @@ def route_and_check(
     power_net_widths: dict[str, float] | None = None,
     out_path: str | None = None,
     route_extra_args: list[str] | None = None,
+    track_width: float | None = None,
+    clearance: float | None = None,
+    via_size: float | None = None,
+    via_drill: float | None = None,
+    board_edge_clearance: float | None = None,
 ) -> RoutabilityFeedback:
     """Route ``pcb_path`` with KRT, verify connectivity + DRC, return feedback.
 
@@ -297,6 +330,10 @@ def route_and_check(
     if nets:
         route_args.append("--nets")
         route_args.extend(nets)
+    # Design-rule flags (from a FabSpec); each None value emits nothing, so a
+    # call with no spec is byte-identical argv to before this change.
+    route_args.extend(_design_rule_flags(
+        track_width, clearance, via_size, via_drill, board_edge_clearance))
     if route_extra_args:
         # verbatim route.py flags (e.g. ["--max-ripup", "10", "--max-iterations",
         # "1000000"] for a difficult 2-layer board, per plan-pcb-routing SKILL).
@@ -414,6 +451,12 @@ def pour_planes(
     timeout_s: int = 900,
     add_gnd_vias: bool = False,
     gnd_via_distance: float = 2.0,
+    track_width: float | None = None,
+    clearance: float | None = None,
+    via_size: float | None = None,
+    via_drill: float | None = None,
+    zone_clearance: float | None = None,
+    min_thickness: float | None = None,
 ) -> dict:
     """Pour copper planes on ``nets`` and re-verify the board.
 
@@ -456,6 +499,13 @@ def pour_planes(
 
     args = ["route_planes.py", in_abs, out_abs, "--nets", *nets,
             "--plane-layers", *plane_layers]
+    # Via/track/clearance design-rule flags (from a FabSpec); None emits nothing
+    # so a no-spec pour keeps KRT's own defaults and byte-identical argv.
+    args.extend(_design_rule_flags(track_width, clearance, via_size, via_drill))
+    if zone_clearance is not None:
+        args += ["--zone-clearance", f"{zone_clearance:g}"]
+    if min_thickness is not None:
+        args += ["--min-thickness", f"{min_thickness:g}"]
     if add_gnd_vias:
         args += ["--add-gnd-vias", "--gnd-via-distance", f"{gnd_via_distance:g}"]
     try:

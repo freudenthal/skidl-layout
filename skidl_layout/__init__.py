@@ -27,6 +27,14 @@ from .decaps import (
     refine_candidate_decaps,
     refine_decaps,
 )
+from .fabspec import (
+    FabCheckResult,
+    FabSpec,
+    FabViolation,
+    OSHPARK_2L,
+    fab_check,
+    resolve_fab_spec,
+)
 from .context import LayoutContext
 from .engine import LayoutResult, plan_layout
 from .geometry import (

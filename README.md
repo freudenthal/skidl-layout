@@ -196,6 +196,42 @@ It routes signals + wide power (`plane`/`pour` nets excluded, `wide_trunk`/
 `(zone … (fill yes))` copper, grades the final board (`out.feedback`), and sets
 `result.routability`. Never called from `plan_layout` — defaults byte-identical.
 
+## Fabricator spec (`FabSpec` — stackup, design rules, board gate)
+
+A `FabSpec` captures one fabricator's published limits (copper/drill/annular
+minimums, board size) plus the values a board is actually routed at, and one
+preset ships: **`OSHPARK_2L`** (OSHPark's 2-layer service). It is opt-in behind
+a `fab_spec=None` knob everywhere — omit it and every path is byte-identical.
+
+```python
+from skidl_layout import emit_power_copper, fab_check, resolve_fab_spec, OSHPARK_2L
+out = emit_power_copper(res, circuit, fp_lib_dirs=[fp_root], workdir="krt_work",
+                        board_layers=2, fab_spec="oshpark-2l")   # or =OSHPARK_2L / =True
+report = fab_check(out.routed_pcb_path, resolve_fab_spec("oshpark-2l"))
+print(report.summary())      # PASS / FAIL with the typed violation list
+```
+
+Engaging a spec (a) makes `write_kicad_pcb` emit a real `(setup (stackup …))`
+block, (b) routes signals + pours planes at the spec's
+track/clearance/via/board-edge values, and (c) clamps every planned power width
+up to `min_track_mm` (an explicit `overrides=` width still wins). `fab_check`
+then grades the finished board and returns a report-only `FabCheckResult`
+(`.ok`, `.violations`).
+
+**Why it matters:** KRT's default via is 0.5/0.3 → a **0.10 mm** annular ring,
+below OSHPark's 0.127 mm (5 mil) minimum, so a default-routed board fails
+OSHPark's drill check. The `oshpark-2l` preset routes vias at **0.6/0.3**
+(ring 0.15 mm ≥ 0.127) so the board is submittable.
+
+**Gated vs informational.** `fab_check` asserts: min track width, via drill,
+via annular ring, board size (min/max), copper-to-edge keepout, absence of
+blind/buried vias, and (when a KRT checkout is present) a clearance DRC graded at
+the spec clearance. Carried but **not** gated in round 1 (metadata / stackup
+only): substrate, dielectric constant, finish, soldermask/silkscreen, copper
+weight, board & core thickness, drill-slot minimum. On a non-rectangular outline
+the edge-keepout check degrades to a coarse bbox distance and says so
+(`result.edge_check_coarse`).
+
 ## Tests
 
 ```bash
