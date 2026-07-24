@@ -122,6 +122,7 @@ class TestUSBMCUBoard:
         return plan_layout(
             _usb_mcu_board(),
             fp_bboxes=COMMON_BBOXES,
+            fp_lib_dirs=[],
             constraints=LayoutConstraints(outline=self.OUTLINE),
             **kwargs,
         )
@@ -244,6 +245,7 @@ class TestSensorArrayBoard:
         return plan_layout(
             _sensor_array_board(),
             fp_bboxes=COMMON_BBOXES,
+            fp_lib_dirs=[],
             constraints=LayoutConstraints(outline=self.OUTLINE),
             **kwargs,
         )
@@ -351,6 +353,7 @@ class TestPowerBoard:
         return plan_layout(
             _power_board(),
             fp_bboxes=COMMON_BBOXES,
+            fp_lib_dirs=[],
             constraints=LayoutConstraints(outline=self.OUTLINE),
             **kwargs,
         )
@@ -455,6 +458,7 @@ class TestUIBoard:
         return plan_layout(
             _ui_board(),
             fp_bboxes=COMMON_BBOXES,
+            fp_lib_dirs=[],
             constraints=LayoutConstraints(outline=self.OUTLINE),
             **kwargs,
         )
@@ -570,6 +574,7 @@ class TestRFBoard:
         return plan_layout(
             _rf_board(),
             fp_bboxes=COMMON_BBOXES,
+            fp_lib_dirs=[],
             constraints=constraints,
             **kwargs,
         )

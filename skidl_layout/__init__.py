@@ -44,7 +44,12 @@ from .layout_quality import (
     layout_quality,
 )
 from .context import LayoutContext
-from .engine import LayoutResult, plan_layout
+from .engine import (
+    FP_LIB_DIRS_AUTO,
+    LayoutResult,
+    plan_layout,
+    resolve_fp_lib_dirs,
+)
 from .geometry import (
     FootprintGeometry,
     PadGeometry,

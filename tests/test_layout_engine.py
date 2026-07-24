@@ -86,6 +86,12 @@ class _Circuit:
         return self.nets
 
 
+# Hand-written part sizes for the constraint-logic tests below. A test that
+# names a footprint which really exists in KiCad also passes `fp_lib_dirs=[]`,
+# so the placer uses these numbers and not the installed library's geometry --
+# `plan_layout` auto-discovers that library by default, and a unit test about
+# constraint arithmetic should not change answer depending on what the host has
+# installed.
 BBOXES = {
     "Package_QFP:MCU": (12.0, 12.0),
     "Capacitor:C_0805": (2.0, 1.25),
@@ -669,6 +675,7 @@ def test_terminal_block_is_parallel_to_edge_and_faces_outward():
     result = plan_layout(
         circuit,
         fp_bboxes=BBOXES,
+        fp_lib_dirs=[],
         constraints=LayoutConstraints(outline=outline),
     )
 
@@ -1269,6 +1276,7 @@ def test_plan_layout_centers_single_qwiic_between_two_mounting_holes():
     result = plan_layout(
         circuit,
         fp_bboxes=BBOXES,
+        fp_lib_dirs=[],
         constraints=LayoutConstraints(outline=outline),
     )
 
@@ -2204,6 +2212,7 @@ def test_plan_layout_keeps_horizontal_audio_jack_row_on_edge():
     result = plan_layout(
         circuit,
         fp_bboxes=BBOXES,
+        fp_lib_dirs=[],
         constraints=LayoutConstraints(outline=outline),
     )
 
@@ -2241,6 +2250,7 @@ def test_soft_constraints_do_not_move_edge_anchored_connectors():
     result = plan_layout(
         circuit,
         fp_bboxes=BBOXES,
+        fp_lib_dirs=[],
         constraints=LayoutConstraints(
             outline=outline,
             edge_anchors=[
@@ -2601,3 +2611,57 @@ def test_plan_layout_progress_callback_emits_stages():
     silent = plan_layout(_circuit(), fp_bboxes=BBOXES, candidate_names=["baseline"])
     sig = lambda r: [(p.ref, round(p.x_mm, 4), round(p.y_mm, 4)) for p in r.placed_parts]
     assert sig(result) == sig(silent)
+
+
+# --------------------------------------------------------------------------
+# fp_lib_dirs auto-discovery (WS-2)
+# --------------------------------------------------------------------------
+
+def test_resolve_fp_lib_dirs_passes_explicit_values_through():
+    """None and [] stay themselves -- they are the deliberate opt-out."""
+    from skidl_layout import resolve_fp_lib_dirs
+
+    assert resolve_fp_lib_dirs(None) is None
+    assert resolve_fp_lib_dirs([]) == []
+    assert resolve_fp_lib_dirs(["/some/root"]) == ["/some/root"]
+
+
+def test_resolve_fp_lib_dirs_is_idempotent():
+    """Safe to call on an already-resolved value, so callers can resolve once."""
+    from skidl_layout import resolve_fp_lib_dirs
+
+    once = resolve_fp_lib_dirs("auto")
+    assert resolve_fp_lib_dirs(once) == once
+
+
+def test_resolve_fp_lib_dirs_accepts_both_spellings():
+    """The sentinel and the string "auto" mean the same thing.
+
+    skidl-eda spells the default as the string so it can keep skidl-layout an
+    optional, lazily-imported dependency.
+    """
+    from skidl_layout import FP_LIB_DIRS_AUTO, resolve_fp_lib_dirs
+
+    assert resolve_fp_lib_dirs(FP_LIB_DIRS_AUTO) == resolve_fp_lib_dirs("auto")
+
+
+def test_auto_resolves_to_a_real_root_or_none(monkeypatch):
+    """AUTO finds the KiCad root; with no KiCad it degrades to None."""
+    from skidl_layout import resolve_fp_lib_dirs
+    import skidl_layout.metrics as metrics
+
+    monkeypatch.setattr(metrics, "discover_footprint_dir", lambda: "/kicad/footprints")
+    assert resolve_fp_lib_dirs("auto") == ["/kicad/footprints"]
+
+    monkeypatch.setattr(metrics, "discover_footprint_dir", lambda: None)
+    assert resolve_fp_lib_dirs("auto") is None
+
+
+def test_plan_layout_defaults_to_auto_discovery():
+    """The default is the sentinel, not None -- that is the whole WS-2 change."""
+    import inspect
+
+    from skidl_layout import FP_LIB_DIRS_AUTO, plan_layout
+
+    default = inspect.signature(plan_layout).parameters["fp_lib_dirs"].default
+    assert default is FP_LIB_DIRS_AUTO

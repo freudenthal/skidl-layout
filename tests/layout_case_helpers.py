@@ -70,6 +70,11 @@ class _Circuit:
 # ---------------------------------------------------------------------------
 # Common footprint bounding boxes (mm)
 # ---------------------------------------------------------------------------
+# Hand-written part sizes for the benchmark cases. Callers pair these with
+# `fp_lib_dirs=[]`: `plan_layout` auto-discovers the installed KiCad footprint
+# library by default, and several of these cases name footprints that really
+# exist, so without the opt-out a case would assert against whichever geometry
+# the host has installed rather than the numbers written here.
 COMMON_BBOXES: dict[str, tuple[float, float]] = {
     # Passives
     "Resistor_SMD:R_0402_1005Metric": (1.0, 0.5),

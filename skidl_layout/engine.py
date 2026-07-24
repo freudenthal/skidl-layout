@@ -864,6 +864,43 @@ def _copy_constraints(
     return copied
 
 
+class _FpLibDirsAuto:
+    """Sentinel type for :data:`FP_LIB_DIRS_AUTO` (repr'able, singleton)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "FP_LIB_DIRS_AUTO"
+
+
+#: Default for ``fp_lib_dirs``: discover the installed KiCad footprint root.
+#:
+#: Three states, because the two obvious ones are not enough. ``AUTO`` finds the
+#: local KiCad install and places on **real** footprint geometry; on a host with
+#: no KiCad it degrades to the same ``{}`` as before, so KiCad-less CI is
+#: unaffected. An explicit ``None`` or ``[]`` means *deliberately* place on
+#: fallback part sizes -- which used to be the silent default, and produced
+#: boards placed at one set of sizes and routed at another.
+FP_LIB_DIRS_AUTO = _FpLibDirsAuto()
+
+
+def resolve_fp_lib_dirs(fp_lib_dirs):
+    """Resolve :data:`FP_LIB_DIRS_AUTO` to a concrete dir list (or ``None``).
+
+    Accepts the sentinel or the string ``"auto"``, so a package that keeps
+    ``skidl_layout`` an optional import can spell the default without importing
+    it. Idempotent, and safe on an already-resolved value, so a caller that
+    forwards the argument onward can resolve once at the top and pass the
+    result everywhere.
+    """
+    if not isinstance(fp_lib_dirs, _FpLibDirsAuto) and fp_lib_dirs != "auto":
+        return fp_lib_dirs
+    from .metrics import discover_footprint_dir
+
+    root = discover_footprint_dir()
+    return [root] if root else None
+
+
 def _footprint_names(circuit) -> set[str]:
     names = set()
     for part in circuit.parts:
@@ -3970,7 +4007,7 @@ def _finalize_candidates_parallel(
 def plan_layout(
     circuit,
     fp_bboxes: dict[str, tuple[float, float]] | None = None,
-    fp_lib_dirs: list[str] | None = None,
+    fp_lib_dirs=FP_LIB_DIRS_AUTO,
     constraints: LayoutConstraints | None = None,
     outline: BoardOutline | None = None,
     existing_pcb_path: str | None = None,
@@ -4030,7 +4067,15 @@ def plan_layout(
     so they never occupy placement, HPWL, or the auto-derived outline. It
     mutates the passed circuit (skidl ``rmv_parts`` disconnects their pins
     first). Leave it ``False`` for a pure placement of an as-built circuit.
+
+    ``fp_lib_dirs`` defaults to :data:`FP_LIB_DIRS_AUTO`, which discovers the
+    installed KiCad footprint root so placement runs on **real footprint
+    geometry**. Pass an explicit list to pin the search, or an explicit ``None``
+    / ``[]`` to place on fallback part sizes on purpose. On a host without
+    KiCad, ``AUTO`` resolves to no dirs and behaves exactly as ``None`` does.
     """
+    fp_lib_dirs = resolve_fp_lib_dirs(fp_lib_dirs)
+
     def _emit(message: str) -> None:
         if progress is not None:
             progress(message)
