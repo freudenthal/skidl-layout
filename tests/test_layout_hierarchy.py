@@ -184,6 +184,58 @@ def test_nc_net_not_in_adjacency():
 
 
 # ---------------------------------------------------------------------------
+# Adjacency key ORDER is deterministic (not id()-ordered)
+# ---------------------------------------------------------------------------
+
+def _star_circuit(n_leaves=8):
+    """A hub part joined to ``n_leaves`` others through one shared net."""
+    with Circuit() as ckt:
+        hub_net = Net("HUB")
+        for i in range(n_leaves + 1):
+            r = _make_part(f"{i + 1}k")
+            r[1] += hub_net
+            r[2] += Net(f"LEAF{i}")
+    return ckt
+
+
+def test_adjacency_key_order_is_ref_sorted():
+    """``adjacency`` keys come out in REF order, not object-``id()`` order.
+
+    ``extract_groups`` used to build ``parts_on_net`` as a ``set`` of Part
+    objects; iterating it walked them in ``id()`` order, so the adjacency dicts
+    were keyed in whatever order the interpreter happened to have allocated the
+    parts.  Downstream the placer iterates those dicts, so the *placement* moved
+    with the process's allocation history -- two identical ``plan_layout`` calls
+    in one process produced different boards.
+    """
+    ckt = _star_circuit()
+    group = next(iter(extract_groups(ckt).values()))
+    for ref, neighbours in group.adjacency.items():
+        assert list(neighbours) == sorted(neighbours), (ref, list(neighbours))
+
+
+def test_adjacency_stable_across_repeated_builds():
+    """Rebuilding the same circuit yields byte-identical adjacency ordering.
+
+    Each rebuild allocates fresh Part objects at fresh addresses, so an
+    ``id()``-ordered implementation drifts here while a ref-ordered one does not.
+    """
+    def snapshot():
+        groups = extract_groups(_star_circuit())
+        return [
+            (g.name, sorted(
+                (ref, tuple(neighbours.items()))
+                for ref, neighbours in g.adjacency.items()
+            ))
+            for g in groups.values()
+        ]
+
+    first = snapshot()
+    for _ in range(4):
+        assert snapshot() == first
+
+
+# ---------------------------------------------------------------------------
 # Return type
 # ---------------------------------------------------------------------------
 

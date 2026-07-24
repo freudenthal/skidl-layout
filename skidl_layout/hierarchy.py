@@ -41,7 +41,21 @@ def extract_groups(circuit) -> dict:
         if is_nc_net(net):
             continue
         pins = net.get_pins()
-        parts_on_net = {pin.part for pin in pins if pin.part is not None}
+        # Deduplicate by identity but iterate in REF order: a plain
+        # ``{pin.part for pin in pins}`` iterates in ``id()`` order, which leaks
+        # the process's allocation history into ``adjacency`` key order and from
+        # there into the placement itself (two identical ``plan_layout`` calls in
+        # one process produced different boards -- same class as the fork-side
+        # ``Net._traverse`` fix).
+        seen: set[int] = set()
+        parts_on_net = []
+        for pin in pins:
+            part_obj = pin.part
+            if part_obj is None or id(part_obj) in seen:
+                continue
+            seen.add(id(part_obj))
+            parts_on_net.append(part_obj)
+        parts_on_net.sort(key=lambda p: str(p.ref))
         if len(parts_on_net) < 2:
             continue
         for part in parts_on_net:
