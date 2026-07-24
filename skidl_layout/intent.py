@@ -13,6 +13,7 @@ from .constraints import (
     FixedPosition,
     KeepOut,
     NearConstraint,
+    edge_anchor_span_mm,
 )
 from .grid import grid_rows_for_refs
 from .connector_metadata import (
@@ -2053,7 +2054,155 @@ def _place_opposing_inline_connector_pair(
             plan.align_constraints.append(AlignConstraint(refs=refs, axis="y"))
 
 
-def _spread_edge_anchor_offsets(plan: PlacementIntentPlan, outline=None) -> None:
+#: Minimum edge-to-edge gap between two connectors sharing a board edge, in mm.
+#: Matches the clearance the placer's overlap test uses, so an arrangement the
+#: intent layer calls "fits" is one the placer also calls non-overlapping.
+EDGE_ANCHOR_GAP_MM = 1.0
+
+#: Mating kinds whose ``edge_preference`` is only a restatement of the weak
+#: text/net guess in :func:`_edge_for_part` -- not a physical mating
+#: requirement.  A USB receptacle mates with a cable that has to arrive from
+#: outside the board; a 1x20 pin header mates with whatever is stacked on it and
+#: has no opinion about which edge it runs down.  Only the latter may be
+#: rebalanced onto another edge.  Same pair the rest of this module already
+#: treats as "connector, unspecified".
+UNCOMMITTED_MATING_KINDS = frozenset({"generic_connector", "header"})
+
+
+def _edge_axis(edge: str, outline):
+    """``(start, length)`` of *edge*'s free axis, or ``None`` for a bad edge."""
+    edge = str(edge or "").lower()
+    if edge in {"top", "bottom"}:
+        return outline.x_min, outline.width_mm
+    if edge in {"left", "right"}:
+        return outline.y_min, outline.height_mm
+    return None
+
+
+def _anchor_spans(
+    anchors: list[EdgeAnchor],
+    edge: str,
+    part_sizes: dict[str, tuple[float, float]] | None,
+) -> dict[str, float] | None:
+    """Per-ref along-*edge* span, or ``None`` if any size is unknown.
+
+    All-or-nothing on purpose: a partial size map would let a budget silently
+    under-count the very parts (unresolved footprints) most likely to be large.
+    """
+    if not part_sizes:
+        return None
+    spans = {}
+    for anchor in anchors:
+        size = part_sizes.get(anchor.ref)
+        if not size:
+            return None
+        width, height = size
+        spans[anchor.ref] = edge_anchor_span_mm(width, height, edge, anchor.rot_deg)
+    return spans
+
+
+def _edge_load_mm(spans: dict[str, float], refs) -> float:
+    """Edge length a set of anchors consumes, gaps included."""
+    values = [spans[ref] for ref in refs if ref in spans]
+    if not values:
+        return 0.0
+    return sum(values) + EDGE_ANCHOR_GAP_MM * (len(values) - 1)
+
+
+def _balance_edge_anchor_capacity(
+    plan: PlacementIntentPlan,
+    outline=None,
+    part_sizes: dict[str, tuple[float, float]] | None = None,
+) -> None:
+    """Move anchors off an edge that is physically too short to hold them.
+
+    :func:`_edge_for_part` picks an edge from *semantics* — power in at the
+    bottom, debug on the right — with no notion of how much edge each part
+    eats.  On an MCU dev board that overloads one edge badly: a Blue Pill's two
+    1x20 headers are 51.9 mm each and both classify as "carries power" ->
+    bottom, on an 81 mm edge.  No choice of offsets can separate parts wider
+    than the space between them, so the offset spread below cannot rescue it;
+    the surplus has to move to the opposite edge.  Which is what the real Blue
+    Pill and Feather form factors do — long headers run down opposite sides.
+
+    Requires ``part_sizes``; without footprint geometry there is no budget to
+    compute and this is a no-op, leaving the legacy path untouched.
+    """
+    if outline is None or not plan.edge_anchors or not part_sizes:
+        return
+
+    # Only a connector with no *physical* reason to face a particular edge may
+    # be relocated.  A USB receptacle, barrel jack or JST battery lead carries a
+    # committed MatingIntent, and moving it would break the thing the inference
+    # was for.
+    pinned = set(plan.refs_with_kind("explicit_edge_anchor"))
+    pinned.update(
+        mating.ref
+        for mating in plan.mating_intents
+        if mating.edge_preference is not None
+        and mating.kind not in UNCOMMITTED_MATING_KINDS
+    )
+    by_edge: dict[str, list[EdgeAnchor]] = {}
+    for anchor in plan.edge_anchors:
+        by_edge.setdefault(anchor.edge.lower(), []).append(anchor)
+
+    for near_edge, far_edge in (("bottom", "top"), ("right", "left")):
+        axis = _edge_axis(near_edge, outline)
+        if axis is None:
+            continue
+        length = axis[1]
+        if length <= 0:
+            continue
+        crowded = by_edge.get(near_edge) or []
+        relief = by_edge.setdefault(far_edge, [])
+        if len(crowded) < 2:
+            continue
+
+        spans = _anchor_spans(crowded + relief, near_edge, part_sizes)
+        if spans is None:
+            continue
+
+        # Largest first: moving the longest connector relieves the most
+        # pressure, and a long header is exactly the part with no opinion about
+        # WHICH long edge it lands on.  Ties break on ref, so this is stable.
+        movable = sorted(
+            (a for a in crowded if a.ref not in pinned),
+            key=lambda a: (-spans[a.ref], a.ref),
+        )
+        while movable and _edge_load_mm(
+            spans, [a.ref for a in by_edge[near_edge]]
+        ) > length:
+            anchor = movable.pop(0)
+            moved_refs = [a.ref for a in relief] + [anchor.ref]
+            if _edge_load_mm(spans, moved_refs) > length:
+                continue          # no room over there either — leave it put
+            by_edge[near_edge] = [a for a in by_edge[near_edge] if a is not anchor]
+            anchor.edge = far_edge
+            anchor.offset_mm = None       # re-spread below on the new edge
+            relief.append(anchor)
+            _retarget_edge_intent(plan, anchor.ref, far_edge)
+            plan.warnings.append(
+                f"{anchor.ref}: moved to the {far_edge} edge -- the {near_edge} "
+                f"edge is {length:.1f} mm and its connectors need "
+                f"{_edge_load_mm(spans, [a.ref for a in crowded]):.1f} mm."
+            )
+
+
+def _retarget_edge_intent(plan: PlacementIntentPlan, ref: str, edge: str) -> None:
+    """Keep face-edge and mating records consistent with a moved anchor."""
+    for face_edge in plan.face_edges:
+        if face_edge.ref == ref:
+            face_edge.edge = edge
+    for mating in plan.mating_intents:
+        if mating.ref == ref:
+            mating.edge_preference = edge
+
+
+def _spread_edge_anchor_offsets(
+    plan: PlacementIntentPlan,
+    outline=None,
+    part_sizes: dict[str, tuple[float, float]] | None = None,
+) -> None:
     """Assign stable, spaced offsets to inferred edge anchors.
 
     Edge anchors express "this part should mate with this board edge", not
@@ -2061,6 +2210,12 @@ def _spread_edge_anchor_offsets(plan: PlacementIntentPlan, outline=None) -> None
     share an edge, midpoint placement creates avoidable overlaps and pushes
     adjacent-edge connectors into the same corner.  Spread inferred anchors
     along the available edge while keeping single anchors centered.
+
+    With ``part_sizes`` the spread is *packed*: each anchor is given the edge
+    length it actually occupies plus a gap, and the run is centred.  Even
+    spacing ignores extents, so on a board with long connectors it hands two
+    51.9 mm headers centres 15 mm apart and calls that spread.  Without sizes
+    the original even spacing stands, so size-less callers are unaffected.
     """
     if outline is None or not plan.edge_anchors:
         return
@@ -2070,14 +2225,10 @@ def _spread_edge_anchor_offsets(plan: PlacementIntentPlan, outline=None) -> None
         anchors_by_edge.setdefault(anchor.edge.lower(), []).append(anchor)
 
     for edge, anchors in anchors_by_edge.items():
-        if edge in {"top", "bottom"}:
-            start = outline.x_min
-            length = outline.width_mm
-        elif edge in {"left", "right"}:
-            start = outline.y_min
-            length = outline.height_mm
-        else:
+        axis = _edge_axis(edge, outline)
+        if axis is None:
             continue
+        start, length = axis
         if length <= 0:
             continue
 
@@ -2095,6 +2246,20 @@ def _spread_edge_anchor_offsets(plan: PlacementIntentPlan, outline=None) -> None
             if movable[0].offset_mm is None:
                 movable[0].offset_mm = start + length / 2
             continue
+
+        spans = _anchor_spans(movable, edge, part_sizes)
+        if spans is not None:
+            needed = _edge_load_mm(spans, [a.ref for a in movable])
+            if needed <= length:
+                cursor = start + (length - needed) / 2
+                for anchor in movable:
+                    span = spans[anchor.ref]
+                    anchor.offset_mm = cursor + span / 2
+                    cursor += span + EDGE_ANCHOR_GAP_MM
+                continue
+            # Over budget even after rebalancing (a genuinely overcrowded
+            # edge).  Fall through to even spacing and let validation report
+            # the residual overlap rather than inventing an outline.
 
         pad = min(max(length * 0.12, 5.0), length * 0.30)
         usable = max(0.0, length - 2 * pad)
@@ -2320,13 +2485,35 @@ def _center_breakout_connectors_with_two_mounting_holes(
             )
 
 
+def _part_sizes_by_ref(circuit, fp_bboxes) -> dict[str, tuple[float, float]]:
+    """``ref -> (width, height)`` for every part whose footprint bbox is known."""
+    if not fp_bboxes:
+        return {}
+    sizes = {}
+    for part in circuit.parts:
+        ref = str(getattr(part, "ref", "") or "")
+        footprint = str(getattr(part, "footprint", "") or "")
+        bbox = fp_bboxes.get(footprint)
+        if ref and bbox:
+            sizes[ref] = (float(bbox[0]), float(bbox[1]))
+    return sizes
+
+
 def infer_placement_intents(
     circuit,
     outline=None,
     backend_status: OptionalBackendStatus | None = None,
     assembly_policy: str | None = None,
+    fp_bboxes: dict | None = None,
 ) -> PlacementIntentPlan:
-    """Infer first-draft placement intent from schematic roles and net names."""
+    """Infer first-draft placement intent from schematic roles and net names.
+
+    ``fp_bboxes`` (``footprint name -> (width_mm, height_mm)``) is optional and
+    additive: with it, edge anchors are budgeted against the length each part
+    actually consumes on its edge, so an over-subscribed edge rebalances onto
+    its opposite and offsets are packed rather than evenly spaced.  Omitted,
+    every inference behaves exactly as before.
+    """
     plan = PlacementIntentPlan(
         assembly_policy=normalize_assembly_policy(assembly_policy),
         backend_status=backend_status or optional_backend_status()
@@ -2551,5 +2738,7 @@ def infer_placement_intents(
         part_text_by_ref=part_text_by_ref,
         outline=outline,
     )
-    _spread_edge_anchor_offsets(plan, outline)
+    part_sizes = _part_sizes_by_ref(circuit, fp_bboxes)
+    _balance_edge_anchor_capacity(plan, outline, part_sizes)
+    _spread_edge_anchor_offsets(plan, outline, part_sizes)
     return plan

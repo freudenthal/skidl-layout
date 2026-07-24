@@ -11,6 +11,7 @@ from .constraints import (
     FixedPosition,
     KeepOut,
     LayoutConstraints,
+    edge_anchor_rotation,
 )
 from .hierarchy import PlacementGroup
 from .roles import DECAP_VALUE_RE, GND_NET_RE, POWER_NET_RE, is_nc_net, is_ui_grid_part
@@ -323,20 +324,11 @@ def _edge_anchor_position(
 
     # Auto-rotate so the part's long axis runs coplanar to the edge.
     # A tall part (h > w) on a horizontal edge needs 90° rotation, and
-    # a wide part (w > h) on a vertical edge likewise.
-    if anchor.rot_deg is not None:
-        rot = anchor.rot_deg
-        ew, eh = (height, width) if rot % 180 == 90 else (width, height)
-    else:
-        horizontal_edge = edge in {"top", "bottom"}
-        tall = height > width * 1.3
-        wide = width > height * 1.3
-        if (horizontal_edge and tall) or (not horizontal_edge and wide):
-            rot = 90.0
-            ew, eh = height, width
-        else:
-            rot = 0.0
-            ew, eh = width, height
+    # a wide part (w > h) on a vertical edge likewise.  The rule lives in
+    # constraints.edge_anchor_rotation so the intent layer, which budgets edge
+    # length against this rotation, reads it from the same place.
+    rot = edge_anchor_rotation(width, height, edge, anchor.rot_deg)
+    ew, eh = (height, width) if rot % 180 == 90 else (width, height)
 
     if edge in {"top", "bottom"}:
         x = anchor.offset_mm if anchor.offset_mm is not None else x_mid
@@ -795,7 +787,9 @@ def place_parts(
         from .candidates import _merge_inferred_edge_anchors
         from .intent import infer_placement_intents
 
-        intent_plan = infer_placement_intents(circuit, outline=constraints.outline)
+        intent_plan = infer_placement_intents(
+            circuit, outline=constraints.outline, fp_bboxes=fp_bboxes
+        )
         constraints = _merge_inferred_edge_anchors(constraints, intent_plan)
 
     fixed_map = {fp.ref: fp for fp in (constraints.fixed or [])}

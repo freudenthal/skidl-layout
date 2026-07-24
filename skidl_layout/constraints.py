@@ -92,6 +92,49 @@ class EdgeAnchor:
     rot_deg: float | None = None
 
 
+HORIZONTAL_EDGES = frozenset({"top", "bottom"})
+VERTICAL_EDGES = frozenset({"left", "right"})
+
+
+def edge_anchor_rotation(
+    width: float,
+    height: float,
+    edge: str,
+    rot_deg: float | None = None,
+) -> float:
+    """Rotation that runs a part's long axis coplanar to *edge*.
+
+    An explicit ``rot_deg`` always wins.  Otherwise a tall part on a horizontal
+    edge — and a wide part on a vertical one — turns 90 degrees.  Lives here so
+    the placer (which applies the rotation) and the intent layer (which has to
+    predict it to reserve edge length) can never disagree about it.
+    """
+    if rot_deg is not None:
+        return rot_deg
+    horizontal_edge = str(edge or "").lower() in HORIZONTAL_EDGES
+    tall = height > width * 1.3
+    wide = width > height * 1.3
+    if (horizontal_edge and tall) or (not horizontal_edge and wide):
+        return 90.0
+    return 0.0
+
+
+def edge_anchor_span_mm(
+    width: float,
+    height: float,
+    edge: str,
+    rot_deg: float | None = None,
+) -> float:
+    """Length a part consumes *along* ``edge`` once its anchor rotation applies.
+
+    This is the quantity edge budgeting cares about: a 1x20 pin header is
+    3.6 x 51.9 mm unrotated, but it eats 51.9 mm of whichever edge it mates to.
+    """
+    rot = edge_anchor_rotation(width, height, edge, rot_deg)
+    span_w, span_h = (height, width) if rot % 180 == 90 else (width, height)
+    return span_w if str(edge or "").lower() in HORIZONTAL_EDGES else span_h
+
+
 @dataclass
 class AlignConstraint:
     refs: list[str]

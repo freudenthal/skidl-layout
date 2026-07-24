@@ -693,7 +693,9 @@ def _finalize_identity_probe(circuit, fp_lib_dirs):
         resolved_outline = density_outline
         resolved_constraints.outline = resolved_outline
     groups = extract_groups(circuit)
-    intent_plan = infer_placement_intents(circuit, outline=resolved_outline)
+    intent_plan = infer_placement_intents(
+        circuit, outline=resolved_outline, fp_bboxes=resolved_bboxes
+    )
     power_topology = infer_power_topology(circuit)
     candidates = generate_placement_candidates(
         groups,
@@ -4080,6 +4082,7 @@ def plan_layout(
         circuit,
         outline=resolved_outline,
         assembly_policy=assembly_policy,
+        fp_bboxes=resolved_bboxes,
     )
     power_topology = infer_power_topology(circuit)
     resolved_candidate_names = _resolve_candidate_names(candidate_names)

@@ -1653,3 +1653,122 @@ def test_audio_ic_far_from_rf():
 
     # Audio IC should have analog_separation intent
     assert "analog_separation" in _kinds(plan, "U2")
+
+
+
+# --------------------------------------------------------------------------
+# Edge-length budgeting (long-connector placement)
+# --------------------------------------------------------------------------
+
+_OPPOSITE_EDGE_PAIRS = ({"top", "bottom"}, {"left", "right"})
+
+#: footprint -> (width, height) mm, as plan_layout resolves them.
+_HEADER_1X20 = "Connector_PinHeader_2.54mm:PinHeader_1x20_P2.54mm_Vertical"
+_USB_C = "Connector_USB:USB_C_Receptacle"
+_EDGE_SIZES = {_HEADER_1X20: (3.59, 51.86), _USB_C: (10.69, 8.98)}
+
+
+def _long_header_circuit():
+    """Three 1x20 headers + a USB jack, the headers all on one edge.
+
+    Three, not two: an exactly-two-header board already splits via
+    ``_place_opposing_header_pair``, so it would not exercise budgeting at all.
+    Three 51.9 mm headers cannot share any edge of a board this size.
+    """
+    v5 = _Net("+5V")
+    gnd = _Net("GND")
+    headers = [
+        _Part(f"J{i}", name="GPIO pin header", footprint=_HEADER_1X20,
+              nets=[v5, gnd], pins=20)
+        for i in (3, 4, 5)
+    ]
+    usb = _Part("J1", name="USB_C_Receptacle", footprint=_USB_C,
+                nets=[v5, gnd], pins=16)
+    return _Circuit(headers + [usb], [v5, gnd])
+
+
+def _anchor_edges(plan):
+    return {anchor.ref: anchor.edge for anchor in plan.edge_anchors}
+
+
+def test_long_headers_rebalance_onto_the_opposite_edge():
+    """The WS-1 fix: an over-subscribed edge sheds its surplus to the opposite."""
+    plan = infer_placement_intents(
+        _long_header_circuit(),
+        outline=BoardOutline(80.0, 120.0),
+        fp_bboxes=_EDGE_SIZES,
+    )
+
+    edges = _anchor_edges(plan)
+    header_edges = {edges["J3"], edges["J4"], edges["J5"]}
+    assert any(header_edges <= pair and len(header_edges) == 2
+               for pair in _OPPOSITE_EDGE_PAIRS), (
+        f"three 51.9 mm headers still share one edge: {edges}"
+    )
+
+
+def test_committed_connectors_are_never_relocated():
+    """A USB jack's edge is a physical fact, not a guess -- it stays put."""
+    plan = infer_placement_intents(
+        _long_header_circuit(),
+        outline=BoardOutline(80.0, 120.0),
+        fp_bboxes=_EDGE_SIZES,
+    )
+
+    assert _anchor_edges(plan)["J1"] == "bottom"
+
+
+def test_edge_budgeting_is_a_no_op_without_footprint_sizes():
+    """Size-less callers keep the original even spread, offset for offset."""
+    circuit = _long_header_circuit()
+    outline = BoardOutline(80.0, 120.0)
+
+    def rows(plan):
+        return sorted((a.ref, a.edge, a.offset_mm) for a in plan.edge_anchors)
+
+    legacy = rows(infer_placement_intents(circuit, outline=outline))
+    explicit_none = rows(
+        infer_placement_intents(circuit, outline=outline, fp_bboxes=None)
+    )
+
+    assert legacy == explicit_none
+    # ...and that legacy spread is the pre-fix one: all three long headers
+    # crammed onto a single edge, which is what sizes are needed to notice.
+    edges = {ref: edge for ref, edge, _ in legacy}
+    assert edges["J3"] == edges["J4"] == edges["J5"]
+
+
+def test_packed_offsets_reserve_each_connector_its_own_extent():
+    """Offsets are spaced by each part's span, not spread evenly."""
+    sig = _Net("SIG")
+    gnd = _Net("GND")
+    parts = [
+        _Part("J1", name="GPIO pin header", footprint="H20",
+              nets=[sig, gnd], pins=20),
+        _Part("J2", name="GPIO pin header", footprint="H4",
+              nets=[sig, gnd], pins=4),
+        _Part("J3", name="GPIO pin header", footprint="H4",
+              nets=[sig, gnd], pins=4),
+    ]
+    sizes = {"H20": (3.59, 51.86), "H4": (3.59, 10.16)}
+
+    # Tall enough to hold all three, so this exercises packing, not rebalancing.
+    plan = infer_placement_intents(
+        _Circuit(parts, [sig, gnd]),
+        outline=BoardOutline(90.0, 200.0),
+        fp_bboxes=sizes,
+    )
+
+    anchors = {a.ref: a for a in plan.edge_anchors}
+    assert len({a.edge for a in anchors.values()}) == 1, "expected one edge"
+
+    # They run down a vertical edge unrotated, so each span is its height.
+    spans = {"J1": 51.86, "J2": 10.16, "J3": 10.16}
+    ordered = sorted(anchors.values(), key=lambda a: a.offset_mm)
+    for lower, upper in zip(ordered, ordered[1:]):
+        separation = upper.offset_mm - lower.offset_mm
+        needed = (spans[lower.ref] + spans[upper.ref]) / 2
+        assert separation >= needed, (
+            f"{lower.ref} and {upper.ref} centres are {separation:.1f} mm "
+            f"apart but together span {needed * 2:.1f} mm"
+        )
