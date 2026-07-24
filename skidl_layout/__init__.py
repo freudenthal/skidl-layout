@@ -36,6 +36,13 @@ from .fabspec import (
     resolve_fab_spec,
     write_krt_fab_overrides,
 )
+from .layout_quality import (
+    ADVISORY_CODES,
+    BLOCKING_CODES,
+    LayoutQualityResult,
+    QualityIssue,
+    layout_quality,
+)
 from .context import LayoutContext
 from .engine import LayoutResult, plan_layout
 from .geometry import (
