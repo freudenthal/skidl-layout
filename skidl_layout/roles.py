@@ -90,6 +90,54 @@ def is_nc_net(net) -> bool:
     return isinstance(net, _NCNet)
 
 
+def is_sim_only_part(part) -> bool:
+    """True for a part that exists only for SPICE simulation and can never be
+    placed on a board.
+
+    The signal is deliberately narrow: the part has **no physical footprint**
+    AND comes from KiCad's ``Simulation_SPICE`` symbol library (the stimulus /
+    behavioural sources ``VDC``/``VPULSE``/``VSIN``/``IDC``/``BSOURCE`` … and the
+    simulation-only device symbols). A footprint-less part from a *real* library
+    is a genuine missing-footprint defect, not a sim source, so it is NOT
+    reported here (it still surfaces as ``missing_refs`` in the write). Neither
+    are schematic-only power markers (``#PWR``/``PWR_FLAG``) — the writer already
+    drops those. A physical part whose simulation happens to be disabled
+    (``Sim_Enable="0"`` on a real connector, say) keeps its footprint and is
+    therefore correctly kept.
+    """
+    if part is None:
+        return False
+    footprint = str(getattr(part, "footprint", "") or "").strip()
+    if footprint:
+        return False
+    lib = getattr(part, "lib", None)
+    lib_id = str(
+        getattr(lib, "filename", "") or getattr(part, "libname", "") or ""
+    ).strip().lower()
+    return lib_id == "simulation_spice"
+
+
+def sim_only_parts(circuit) -> list:
+    """Return the circuit's :func:`is_sim_only_part` parts (never mutates)."""
+    return [p for p in (getattr(circuit, "parts", None) or []) if is_sim_only_part(p)]
+
+
+def strip_sim_only_parts(circuit) -> list:
+    """Remove the circuit's simulation-only stimulus parts in place and return
+    them.
+
+    Uses skidl's ``circuit.rmv_parts`` (which first ``disconnect()``\\ s each
+    part's pins, so the remaining nets stay consistent for downstream
+    placement/scoring). A no-op returning ``[]`` when there are no sim-only
+    parts or the object has no ``rmv_parts`` (e.g. a picklable snapshot).
+    """
+    victims = sim_only_parts(circuit)
+    rmv = getattr(circuit, "rmv_parts", None)
+    if victims and callable(rmv):
+        rmv(*victims)
+    return victims
+
+
 @dataclass
 class PartRole:
     ref: str

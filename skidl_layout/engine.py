@@ -3983,6 +3983,7 @@ def plan_layout(
     max_candidates: int | None = None,
     parallel_workers: int | None = None,
     progress=None,
+    strip_sim_only: bool = False,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
 
@@ -4020,10 +4021,27 @@ def plan_layout(
     subprocesses that never re-import the calling script, so **no
     ``if __name__ == "__main__":`` guard is required** (round-7 WS25). Per-ref
     ``progress`` lines are suppressed in parallel mode.
+
+    ``strip_sim_only`` (default ``False`` -> byte-identical) removes
+    ``Simulation_SPICE`` stimulus parts (VDC/VPULSE/… — no footprint) from
+    ``circuit`` before placement via :func:`skidl_layout.strip_sim_only_parts`,
+    so they never occupy placement, HPWL, or the auto-derived outline. It
+    mutates the passed circuit (skidl ``rmv_parts`` disconnects their pins
+    first). Leave it ``False`` for a pure placement of an as-built circuit.
     """
     def _emit(message: str) -> None:
         if progress is not None:
             progress(message)
+    # Opt-in (default False -> byte-identical): drop Simulation_SPICE stimulus
+    # parts (no footprint) so they never occupy placement / HPWL / the derived
+    # outline. Mutates the passed circuit via skidl ``rmv_parts`` (pins are
+    # disconnected first, keeping the remaining nets consistent).
+    if strip_sim_only:
+        from .roles import strip_sim_only_parts
+        stripped = strip_sim_only_parts(circuit)
+        if stripped:
+            _emit(f"stripped {len(stripped)} sim-only part(s): "
+                  f"{', '.join(getattr(p, 'ref', '?') for p in stripped)}")
     fp_geometries = _resolve_geometries(circuit, fp_lib_dirs)
     resolved_bboxes = _resolve_bboxes(circuit, fp_bboxes, fp_lib_dirs)
     geometry_boxes = geometry_bboxes(fp_geometries)

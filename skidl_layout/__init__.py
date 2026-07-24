@@ -68,7 +68,14 @@ from .refinement import (
     refine_placement,
 )
 from .report import CandidateReport, NetExplanation, PartExplanation, PlacementReport
-from .roles import PartRole, classify_part, classify_parts
+from .roles import (
+    PartRole,
+    classify_part,
+    classify_parts,
+    is_sim_only_part,
+    sim_only_parts,
+    strip_sim_only_parts,
+)
 from .routability import RoutabilityFeedback
 from .krt import (
     KrtNotFoundError,

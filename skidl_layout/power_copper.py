@@ -107,6 +107,7 @@ def emit_power_copper(
     gnd_via_distance: float = 2.0,
     route_extra_args: list[str] | None = None,
     timeout_s: int = 900,
+    strict_missing_footprints: bool = False,
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -123,6 +124,16 @@ def emit_power_copper(
     :class:`PowerCopperResult` whose ``summary()`` shows planned -> emitted per
     net (any net whose plan couldn't be honoured gets a warning line -- never
     silence). Not called from ``plan_layout`` / ``evaluate_circuit``.
+
+    ``strict_missing_footprints`` (default ``False``) matches the lenient
+    placement write: a placed part with no resolvable footprint (e.g. a
+    ``Simulation_SPICE`` stimulus source that slipped through) is dropped with a
+    warning instead of raising, so the copper stage is never *stricter* than the
+    board it was handed. Set ``True`` for a physical-BOM board where a missing
+    footprint must be a hard error. On a fully-footprinted board the two modes
+    are byte-identical. Strip sim-only parts up front
+    (:func:`skidl_layout.strip_sim_only_parts`) to keep them off the board
+    entirely.
     """
     from .writer import write_kicad_pcb
 
@@ -137,6 +148,7 @@ def emit_power_copper(
         outline=result.outline,
         cutouts=getattr(result, "cutouts", None),
         lib_table=lib_table,
+        strict_missing_footprints=strict_missing_footprints,
     )
 
     warnings: list[str] = []
