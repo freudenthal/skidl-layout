@@ -77,16 +77,37 @@ LOW_SPREAD_RATIO = 0.25
 UNDERUSED_OUTLINE_RATIO = 0.45
 LARGE_MARGIN_RATIO = 0.35
 
-#: Default congestion threshold. **His value, on his scale -- treat as
-#: uncalibrated here.** ``congestion_score`` is not a shared definition between
-#: the two engines: measured on qtpy_samd21 ours reads 145-451 depending only on
-#: outline size, and 425 on a perfectly clean funcgen placement, so at 80.0 this
-#: code fires on essentially every board above ~20 parts and carries no signal.
-#: It is kept as the documented default for comparability and exposed as the
-#: ``congestion_threshold`` argument; calibrating it needs the board population
-#: WS-H3 + ``scripts/bench_layout.py`` are there to produce. Pass ``None`` to
+#: Default congestion threshold, **on this engine's scale and NORMALIZED per
+#: part**. Calibrated 2026-07-24 against the 10-board ``scripts/bench_layout.py``
+#: population, all of which place cleanly:
+#:
+#:     board             parts   raw    per-part
+#:     sipm_tia              5   22.2      4.44
+#:     ads1115              12   29.7      2.48
+#:     bme280               16   74.3      4.64
+#:     trinket              18   90.3      5.02
+#:     esp32c3              32  117.0      3.66
+#:     stm32_bluepill       32  190.0      5.94
+#:     funcgen              62  396.3      6.39
+#:     qtpy_samd21          36  249.7      6.94
+#:     feather_nrf52840     42  379.5      9.04
+#:     feather_rp2040       49  460.7      9.40
+#:
+#: The harvested default was 80.0 on *his* RAW scale; ours reads 22-461 RAW,
+#: tracking board SIZE almost perfectly (r ~ part count), so a raw threshold is a
+#: "big board" flag with no congestion signal -- at 80.0 it fired on 8 of these
+#: 10 clean boards. Dividing by part count flattens that: every clean board here
+#: reads 2.48-9.40 per part regardless of size. The default sits just above that
+#: clean-population max so HIGH_CONGESTION is a quiet advisory tail flag -- it
+#: stays silent on anything as good as our worst clean board and only fires on a
+#: placement denser-per-part than any we have shipped. Re-derive from a fresh
+#: ``bench_layout.py --json`` if the placer's density changes. Pass ``None`` to
 #: disable the check entirely.
-HIGH_CONGESTION_THRESHOLD = 80.0
+HIGH_CONGESTION_PER_PART_THRESHOLD = 12.0
+
+#: Back-compat alias for the constant's old name (still the documented knob name
+#: in older callers); the value is now the normalized per-part trip point.
+HIGH_CONGESTION_THRESHOLD = HIGH_CONGESTION_PER_PART_THRESHOLD
 
 # The spread/margin/compactness family is meaningless on a tiny board, so his
 # code gates the whole family behind a minimum size. Same gate here.
@@ -195,10 +216,11 @@ def layout_quality(
             :func:`~skidl_layout.emit_power_copper` (or the equivalent keys
             ``unrouted_nets`` / ``broken_nets`` / ``drc_violation_count``), so
             routing outcomes join the same taxonomy. ``None`` -> placement-only.
-        congestion_threshold: the ``HIGH_CONGESTION`` trip point. Defaults to the
-            harvested :data:`HIGH_CONGESTION_THRESHOLD`, which is **not
-            calibrated to this engine's congestion scale** -- see that constant.
-            Pass ``None`` to skip the congestion check.
+        congestion_threshold: the ``HIGH_CONGESTION`` trip point, compared
+            against congestion **per placed part**. Defaults to
+            :data:`HIGH_CONGESTION_PER_PART_THRESHOLD`, calibrated on this
+            engine's scale from the 10-board benchmark population (see that
+            constant). Pass ``None`` to skip the congestion check.
 
     Returns:
         A :class:`LayoutQualityResult`. Never raises on a rule breach.
@@ -277,16 +299,20 @@ def layout_quality(
     if score is None:
         return LayoutQualityResult(issues=issues)
 
-    # -- congestion ---------------------------------------------------------
+    # -- congestion (normalized per part; see the threshold constant) -------
     congestion = _num(getattr(score, "congestion_score", 0.0))
+    n_placed = len(getattr(result, "placed_parts", None) or [])
+    congestion_per_part = congestion / n_placed if n_placed else 0.0
     routed_clean = bool(plane) and not unrouted and not drc
     if (congestion_threshold is not None
-            and congestion >= congestion_threshold and not routed_clean):
+            and congestion_per_part >= congestion_threshold and not routed_clean):
         regions = list(getattr(score, "congestion_regions", None) or [])
         issues.append(QualityIssue(
             "HIGH_CONGESTION", _WARNING,
-            f"layout congestion is high ({congestion:.1f})",
+            f"layout congestion is high ({congestion_per_part:.1f} per part)",
             evidence={"congestion_score": round(congestion, 1),
+                      "congestion_per_part": round(congestion_per_part, 2),
+                      "part_count": n_placed,
                       "regions": regions[:5]},
             recommendation=(
                 "Placement feedback, not a board size problem: try group "

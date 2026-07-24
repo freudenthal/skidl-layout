@@ -149,19 +149,45 @@ def test_a_clean_route_reports_nothing():
 
 
 # --------------------------------------------------------------------------
-# Congestion (threshold is a parameter -- the harvested default is his scale)
+# Congestion (calibrated 2026-07-24: NORMALIZED per part, default 12.0)
 # --------------------------------------------------------------------------
 
 def test_congestion_fires_above_the_threshold():
-    result = _result(score=_score(congestion_score=HIGH_CONGESTION_THRESHOLD + 1))
+    # 10 parts * per-part just over the default 12.0 -> raw 130 -> fires.
+    result = _result(parts=10,
+                     score=_score(congestion_score=(HIGH_CONGESTION_THRESHOLD + 1) * 10))
     quality = layout_quality(result)
     assert _codes(quality) == ["HIGH_CONGESTION"]
     assert quality.ok is True          # advisory only
 
 
+def test_congestion_is_normalized_by_part_count():
+    """The same RAW congestion is fine on a big board, loud on a small one.
+
+    This is the whole point of the calibration: raw congestion tracks board
+    size, so it must be divided by part count before it carries any signal.
+    """
+    raw = 300.0
+    big = _result(parts=60, score=_score(congestion_score=raw))    # 5.0 / part
+    small = _result(parts=10, score=_score(congestion_score=raw))  # 30.0 / part
+    assert "HIGH_CONGESTION" not in _codes(layout_quality(big))
+    assert "HIGH_CONGESTION" in _codes(layout_quality(small))
+
+
+def test_calibrated_default_is_quiet_on_the_worst_clean_benchmark_board():
+    """feather_rp2040 -- the densest clean board in the population (9.40/part)."""
+    result = _result(parts=49, score=_score(congestion_score=460.7))
+    assert "HIGH_CONGESTION" not in _codes(layout_quality(result))
+
+
+def test_calibrated_default_is_loud_on_a_synthetically_congested_board():
+    result = _result(parts=20, score=_score(congestion_score=20 * 15.0))  # 15/part
+    assert "HIGH_CONGESTION" in _codes(layout_quality(result))
+
+
 def test_congestion_is_suppressed_by_a_clean_route():
     """A board that routed clean is not congested in any way that matters."""
-    result = _result(score=_score(congestion_score=500.0))
+    result = _result(parts=10, score=_score(congestion_score=500.0))  # 50/part
     quality = layout_quality(result, route_summary={
         "unrouted_nets": [], "broken_nets": [], "drc_violation_count": 0,
     })
@@ -169,10 +195,10 @@ def test_congestion_is_suppressed_by_a_clean_route():
 
 
 def test_congestion_threshold_is_tunable_and_disablable():
-    result = _result(score=_score(congestion_score=200.0))
-    assert _codes(layout_quality(result, congestion_threshold=300.0)) == []
+    result = _result(parts=10, score=_score(congestion_score=200.0))  # 20/part
+    assert _codes(layout_quality(result, congestion_threshold=30.0)) == []
     assert _codes(layout_quality(result, congestion_threshold=None)) == []
-    assert _codes(layout_quality(result, congestion_threshold=100.0)) == [
+    assert _codes(layout_quality(result, congestion_threshold=10.0)) == [
         "HIGH_CONGESTION"
     ]
 
