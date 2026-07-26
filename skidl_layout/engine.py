@@ -41,6 +41,7 @@ from .placer import (
     _footprint_name,
 )
 from .power import PowerRoutePlan, infer_power_topology, plan_power_routes
+from .power_roles import PowerStagePlan, classify_power_roles
 from .reader import read_board_outline
 from .refinement import (
     _clone_placed,
@@ -79,6 +80,11 @@ class LayoutResult:
     fp_geometries: dict[str, FootprintGeometry] | None = None
     routability: RoutabilityFeedback | None = None
     cutouts: list[BoardCutout] | None = None
+    #: Power-electronics roles read off the netlist (switch node, commutation
+    #: loop, sense resistor, feedback divider). Report-only and computed *after*
+    #: the placement is final, so it can never influence it. ``None`` when the
+    #: classifier was not run; an empty plan when it found no converter.
+    power_stage_plan: PowerStagePlan | None = None
 
     @property
     def ok(self) -> bool:
@@ -118,6 +124,8 @@ class LayoutResult:
             result["routability"] = self.routability.to_dict()
         if self.intent_plan is not None:
             result["intent_plan"] = self.intent_plan.to_dict()
+        if self.power_stage_plan is not None and self.power_stage_plan.stages:
+            result["power_stage_plan"] = self.power_stage_plan.to_dict()
         if self.outline is not None:
             result["outline"] = {
                 "x_min_mm": self.outline.x_min,
@@ -147,6 +155,11 @@ class LayoutResult:
             lines.append(self.routability.summary())
         if self.intent_plan is not None:
             lines.append(self.intent_plan.summary())
+        # Silent on a board with no switching converter -- most boards.
+        if self.power_stage_plan is not None:
+            power_stages = self.power_stage_plan.summary()
+            if power_stages:
+                lines.append(power_stages)
         if self.outline is not None:
             lines.insert(
                 0,
@@ -4514,6 +4527,10 @@ def plan_layout(
         board_layers=board_layers,
         ctx=ctx,
     )
+    # Report-only, and deliberately here: the placement is already selected, so
+    # naming the power roles cannot feed back into it. Reads the netlist only --
+    # no positions in, no positions out.
+    power_stage_plan = classify_power_roles(circuit, ctx=ctx)
     candidate_validations[selected_candidate.name] = validation
     candidate_scores[selected_candidate.name] = score
     report = build_placement_report(
@@ -4539,4 +4556,5 @@ def plan_layout(
         fp_geometries=fp_geometries,
         routability=routability,
         cutouts=list(getattr(selected_constraints, "cutouts", []) or []),
+        power_stage_plan=power_stage_plan,
     )

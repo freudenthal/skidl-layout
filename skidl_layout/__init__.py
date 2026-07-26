@@ -82,6 +82,14 @@ from .power import (
     infer_power_topology,
     plan_power_routes,
 )
+from .power_roles import (
+    CommutationLoop,
+    PowerDevice,
+    PowerStage,
+    PowerStagePlan,
+    classify_devices,
+    classify_power_roles,
+)
 from .reader import read_board_outline, read_footprint_bboxes, read_placed_positions
 from .refinement import (
     RefinementResult,
