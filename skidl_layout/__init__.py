@@ -82,6 +82,12 @@ from .power import (
     infer_power_topology,
     plan_power_routes,
 )
+from .power_metrics import (
+    LoopGeometry,
+    PowerMetrics,
+    StageMetrics,
+    measure_power_layout,
+)
 from .power_roles import (
     CommutationLoop,
     PowerDevice,

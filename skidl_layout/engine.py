@@ -41,6 +41,7 @@ from .placer import (
     _footprint_name,
 )
 from .power import PowerRoutePlan, infer_power_topology, plan_power_routes
+from .power_metrics import PowerMetrics, measure_power_layout
 from .power_roles import PowerStagePlan, classify_power_roles
 from .reader import read_board_outline
 from .refinement import (
@@ -85,6 +86,11 @@ class LayoutResult:
     #: the placement is final, so it can never influence it. ``None`` when the
     #: classifier was not run; an empty plan when it found no converter.
     power_stage_plan: PowerStagePlan | None = None
+    #: Loop area / node lengths / separations measured from the final placement
+    #: against ``power_stage_plan`` (power-layout Phase 2, Stage A). Report-only
+    #: and computed after the placement is final. ``None`` when the measurement
+    #: was not run; an empty result when there was no power stage to measure.
+    power_metrics: PowerMetrics | None = None
 
     @property
     def ok(self) -> bool:
@@ -126,6 +132,8 @@ class LayoutResult:
             result["intent_plan"] = self.intent_plan.to_dict()
         if self.power_stage_plan is not None and self.power_stage_plan.stages:
             result["power_stage_plan"] = self.power_stage_plan.to_dict()
+        if self.power_metrics is not None and self.power_metrics.stages:
+            result["power_metrics"] = self.power_metrics.to_dict()
         if self.outline is not None:
             result["outline"] = {
                 "x_min_mm": self.outline.x_min,
@@ -160,6 +168,10 @@ class LayoutResult:
             power_stages = self.power_stage_plan.summary()
             if power_stages:
                 lines.append(power_stages)
+        if self.power_metrics is not None:
+            power_numbers = self.power_metrics.summary()
+            if power_numbers:
+                lines.append(power_numbers)
         if self.outline is not None:
             lines.insert(
                 0,
@@ -203,6 +215,9 @@ class _FinalizeParams:
     intent_plan: PlacementIntentPlan
     derive_outline_if_missing: bool
     constraints: LayoutConstraints | None
+    #: Phase 2 Stage B. Defaulted so every existing construction site (and any
+    #: pickled worker payload from before it existed) keeps the OFF behavior.
+    power_score: bool = False
 
 
 def _note_move(
@@ -659,13 +674,21 @@ def _finalize_candidate_impl(
         constraints=candidate_constraints,
         fp_geometries=fp_geometries,
     )
-    score = _apply_panel_mechanical_outline_score(
+    panel_score = _apply_panel_mechanical_outline_score(
         edge_score,
         placed_parts,
         resolved_bboxes,
         candidate_outline,
         intent_plan,
         fp_geometries=fp_geometries,
+    )
+    score = _apply_power_loop_score(
+        panel_score,
+        placed_parts,
+        circuit,
+        ctx,
+        fp_geometries,
+        params.power_score,
     )
     candidate.score = score.score
     finalized = _FinalizedCandidate(
@@ -738,6 +761,10 @@ def _finalize_identity_probe(circuit, fp_lib_dirs):
         intent_plan=intent_plan,
         derive_outline_if_missing=True,
         constraints=None,
+        # Left on the default (OFF) deliberately: this probe exists to assert
+        # the DEFAULT path is live/snapshot byte-identical. The parallel worker
+        # path pickles the `params_early` bundle built in plan_layout, which is
+        # where the flag is actually threaded.
     )
     live_fin, _ = _finalize_candidate_impl(
         copy.deepcopy(candidate), circuit, params, live_ctx, None, None
@@ -1477,6 +1504,153 @@ def _physical_or_placed_bounds(
     if geometry is not None:
         return geometry.transformed_physical_bounds(placed)
     return _placed_bounds(placed, fp_bboxes, fp_geometries)
+
+
+# --------------------------------------------------------------------------- #
+# Power-loop scoring -- power-layout Phase 2, Stage B. OFF by default.
+# --------------------------------------------------------------------------- #
+
+#: Per-term ceilings, in the style of every existing term
+#: (``min(total_hpwl / 50.0, 30.0)``, ``min(crossing_count * 2.0, 20.0)``, ...).
+#: The overall cap is what stops a power board being decided by this term alone.
+_POWER_LOOSENESS_GAIN, _POWER_LOOSENESS_CAP = 8.0, 20.0
+_POWER_BOWTIE_PENALTY = 10.0
+_POWER_FB_GAIN, _POWER_FB_CAP = 2.0, 10.0
+_POWER_SENSE_GAIN, _POWER_SENSE_CAP = 1.0, 10.0
+_POWER_SMALL_SIGNAL_GAIN, _POWER_SMALL_SIGNAL_CAP = 1.0, 8.0
+_POWER_KELVIN_PENALTY = 6.0
+_POWER_TOTAL_CAP = 60.0
+
+
+def _power_loop_penalty(power_metrics) -> tuple[float, list[str]]:
+    """``(penalty, warnings)`` for a measured power layout. Pure and testable.
+
+    Every trip point is imported from :mod:`~skidl_layout.layout_quality`, which
+    is where they were calibrated and where the population table that justifies
+    them lives -- a second copy here is how the two drift apart.
+
+    MEASURED on the Phase-0 oracle (three placements of one netlist whose
+    correct ordering is known):  B 0.0  <  A 39.9  <  A' 44.6. That ranking, not
+    the absolute numbers, is what Stage B is gated on.
+    """
+    from .layout_quality import (
+        FB_NODE_LENGTH_MM_THRESHOLD,
+        HOT_LOOP_LOOSENESS_THRESHOLD,
+        SENSE_RETURN_MM_THRESHOLD,
+        SMALL_SIGNAL_SEPARATION_FLOOR_MM,
+    )
+
+    penalty = 0.0
+    warnings: list[str] = []
+    for stage in list(getattr(power_metrics, "stages", None) or []):
+        who = stage.controller_ref or "power stage"
+        for loop in stage.loops:
+            if loop.self_intersecting:
+                penalty += _POWER_BOWTIE_PENALTY
+                warnings.append(
+                    f"{who}: commutation loop {' -> '.join(loop.member_refs)} "
+                    f"traces a bow tie"
+                )
+            ratio = loop.looseness_ratio
+            if ratio is not None and ratio > HOT_LOOP_LOOSENESS_THRESHOLD:
+                penalty += min(
+                    (ratio - HOT_LOOP_LOOSENESS_THRESHOLD) * _POWER_LOOSENESS_GAIN,
+                    _POWER_LOOSENESS_CAP,
+                )
+                warnings.append(
+                    f"{who}: commutation loop encloses {ratio:.2f}x the area "
+                    f"these parts admit"
+                )
+        fb_mm = (stage.fb_node or {}).get("fb_top_to_fb_pad_mm")
+        if fb_mm is not None and fb_mm > FB_NODE_LENGTH_MM_THRESHOLD:
+            penalty += min(
+                (fb_mm - FB_NODE_LENGTH_MM_THRESHOLD) * _POWER_FB_GAIN,
+                _POWER_FB_CAP,
+            )
+            warnings.append(f"{who}: feedback node runs {fb_mm:.1f}mm")
+        sense_mm = (stage.sense_return or {}).get("sense_r_to_switch_mm")
+        if sense_mm is not None and sense_mm > SENSE_RETURN_MM_THRESHOLD:
+            penalty += min(
+                (sense_mm - SENSE_RETURN_MM_THRESHOLD) * _POWER_SENSE_GAIN,
+                _POWER_SENSE_CAP,
+            )
+            warnings.append(f"{who}: sense return runs {sense_mm:.1f}mm")
+        # The one FLOOR in the family: separation is good, so the comparison
+        # runs the other way. Kept visually apart for exactly that reason.
+        ss_mm = (stage.small_signal or {}).get("min_mm")
+        if ss_mm is not None and ss_mm < SMALL_SIGNAL_SEPARATION_FLOOR_MM:
+            penalty += min(
+                (SMALL_SIGNAL_SEPARATION_FLOOR_MM - ss_mm) * _POWER_SMALL_SIGNAL_GAIN,
+                _POWER_SMALL_SIGNAL_CAP,
+            )
+            warnings.append(
+                f"{who}: small-signal parts come within {ss_mm:.1f}mm of the "
+                f"switch node"
+            )
+        if (stage.kelvin or {}).get("taps_output_cap") is False:
+            penalty += _POWER_KELVIN_PENALTY
+            warnings.append(
+                f"{who}: feedback divider taps "
+                f"{stage.kelvin.get('neighbour_ref')}, not an output capacitor"
+            )
+    return min(penalty, _POWER_TOTAL_CAP), warnings
+
+
+def _apply_power_loop_score(
+    score: LayoutScore,
+    placed_parts: list[PlacedPart],
+    circuit,
+    ctx,
+    fp_geometries: dict[str, FootprintGeometry] | None,
+    enabled: bool,
+) -> LayoutScore:
+    """Let the power-layout metrics choose between placement candidates.
+
+    OFF by default and doing nothing at all when off -- with ``enabled`` False
+    this returns ``score`` unchanged without so much as classifying, which is
+    what makes the default byte-identical (gate G5).
+
+    ⚠ Unlike the two adjusters before it in the chain, this one moves
+    ``score.penalty`` as well as ``score.score``. Candidate selection keys on
+    ``-finalized.score.penalty`` (see the ``max()`` in ``plan_layout``), so a
+    term that only lowered ``score.score`` would pass every test, print a
+    plausible number, and change precisely zero placements.
+    """
+    if not enabled or circuit is None:
+        return score
+
+    plan = ctx.power_stage_plan_for(circuit) if ctx is not None else None
+    if plan is None or not plan.stages:
+        return score
+
+    metrics = measure_power_layout(
+        placed_parts, plan, circuit=circuit, fp_geometries=fp_geometries
+    )
+    penalty, findings = _power_loop_penalty(metrics)
+    if penalty <= 0.0:
+        return score
+
+    warnings = list(score.warnings)
+    for message in findings:
+        if message not in warnings:
+            warnings.append(message)
+    return replace(
+        score,
+        score=max(0.0, score.score - penalty),
+        penalty=score.penalty + penalty,
+        warning_count=len(warnings),
+        warnings=warnings,
+    )
+
+
+def _resolve_power_score(power_score: bool | None) -> bool:
+    """Explicit kwarg > ``SKIDL_LAYOUT_POWER_SCORE`` > default OFF."""
+    if power_score is not None:
+        return bool(power_score)
+    env = os.environ.get("SKIDL_LAYOUT_POWER_SCORE")
+    if env is None:
+        return False
+    return env.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _apply_panel_mechanical_outline_score(
@@ -4036,6 +4210,7 @@ def plan_layout(
     parallel_workers: int | None = None,
     progress=None,
     strip_sim_only: bool = False,
+    power_score: bool | None = None,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
 
@@ -4057,6 +4232,15 @@ def plan_layout(
     finalization, selection). Default ``None`` is silent and has zero behavioral
     effect. Placement can take minutes on a large board; a callback that prints
     (with ``flush=True``) makes it observable when stdout is redirected.
+
+    ``power_score`` (power-layout Phase 2, Stage B) lets the power-layout
+    metrics — commutation-loop looseness, feedback-node and sense-return length,
+    small-signal separation, the Kelvin tap target — take part in choosing
+    between placement candidates. **Default OFF**, and off it is a true no-op:
+    nothing is classified and every placement is byte-identical to before the
+    term existed. ``SKIDL_LAYOUT_POWER_SCORE`` is the env default; an explicit
+    kwarg wins. It only bites on a board that classifies as a switching
+    converter — on everything else the term returns immediately.
 
     ``parallel_workers`` controls refining the unique candidates' pass-1 trio
     (orientation/decap/placement) and their post-anchor finalize concurrently in
@@ -4143,6 +4327,7 @@ def plan_layout(
         fp_bboxes=resolved_bboxes,
     )
     power_topology = infer_power_topology(circuit)
+    resolved_power_score = _resolve_power_score(power_score)
     resolved_candidate_names = _resolve_candidate_names(candidate_names)
     candidates = generate_placement_candidates(
         groups,
@@ -4204,6 +4389,7 @@ def plan_layout(
         intent_plan=intent_plan,
         derive_outline_if_missing=derive_outline_if_missing,
         constraints=constraints,
+        power_score=resolved_power_score,
     )
 
     # WS18/WS22: opt-in parallel machinery. The picklable snapshot is built at
@@ -4531,6 +4717,15 @@ def plan_layout(
     # naming the power roles cannot feed back into it. Reads the netlist only --
     # no positions in, no positions out.
     power_stage_plan = classify_power_roles(circuit, ctx=ctx)
+    # Phase 2 Stage A: geometry over the plan the line above produced. Also
+    # report-only, and also after selection -- the placement it measures is
+    # already final, so measuring it cannot change it.
+    power_metrics = measure_power_layout(
+        placed_parts,
+        power_stage_plan,
+        circuit=circuit,
+        fp_geometries=fp_geometries,
+    )
     candidate_validations[selected_candidate.name] = validation
     candidate_scores[selected_candidate.name] = score
     report = build_placement_report(
@@ -4557,4 +4752,5 @@ def plan_layout(
         routability=routability,
         cutouts=list(getattr(selected_constraints, "cutouts", []) or []),
         power_stage_plan=power_stage_plan,
+        power_metrics=power_metrics,
     )

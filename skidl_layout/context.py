@@ -52,6 +52,8 @@ class LayoutContext:
     # contract (callers must not mutate them).
     power_topology: object | None = None
     power_nets_by_layers: dict[int, list] = field(default_factory=dict)
+    # Same lazy-memo contract, for the Phase-2 opt-in power scorer term.
+    power_stage_plan: object | None = None
 
     def power_nets_for(self, circuit, board_layers: int):
         if board_layers not in self.power_nets_by_layers:
@@ -68,6 +70,20 @@ class LayoutContext:
 
             self.power_topology = infer_power_topology(circuit)
         return self.power_topology
+
+    def power_stage_plan_for(self, circuit):
+        """Memoized :func:`~skidl_layout.power_roles.classify_power_roles`.
+
+        The plan is a pure function of the netlist, so it is circuit-invariant
+        in exactly the sense this cache exists for. Only the opt-in Phase-2
+        scorer term calls it during placement; workers rebuild the context from
+        a snapshot and so pay the ~3 ms once each.
+        """
+        if self.power_stage_plan is None:
+            from .power_roles import classify_power_roles
+
+            self.power_stage_plan = classify_power_roles(circuit)
+        return self.power_stage_plan
 
     @staticmethod
     def from_circuit(circuit) -> LayoutContext:

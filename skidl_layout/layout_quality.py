@@ -58,12 +58,24 @@ BLOCKING_CODES = frozenset({
 })
 
 #: Codes that are placement *feedback* -- a board can ship with these.
+#: The ``BULK_CAP_DISTANCE`` / ``FB_NODE_LENGTH`` / ``HOT_LOOP_*`` /
+#: ``KELVIN_TAP_TARGET`` / ``SENSE_RETURN_LENGTH`` / ``SW_NODE_SPAN`` family is
+#: power-layout Phase 2 and reads :attr:`LayoutResult.power_metrics`; **all of it
+#: is advisory**, so a board with a mediocre hot loop still ships and
+#: ``LayoutQualityResult.ok`` is unchanged for every existing board.
 ADVISORY_CODES = frozenset({
+    "BULK_CAP_DISTANCE",
+    "FB_NODE_LENGTH",
     "FRONT_PANEL_TRACE_SPAN",
     "HIGH_CONGESTION",
+    "HOT_LOOP_AREA",
+    "HOT_LOOP_SELF_INTERSECTING",
+    "KELVIN_TAP_TARGET",
     "LOW_PART_SPREAD",
     "OUTLINE_UNDERUSED",
     "ROUTE_BROKEN_NET",
+    "SENSE_RETURN_LENGTH",
+    "SW_NODE_SPAN",
     "UNUSED_OUTLINE_REGION",
 })
 
@@ -108,6 +120,71 @@ HIGH_CONGESTION_PER_PART_THRESHOLD = 12.0
 #: Back-compat alias for the constant's old name (still the documented knob name
 #: in older callers); the value is now the normalized per-part trip point.
 HIGH_CONGESTION_THRESHOLD = HIGH_CONGESTION_PER_PART_THRESHOLD
+
+# --- power-layout thresholds (Phase 2, WS-6) -------------------------------
+# CALIBRATED 2026-07-26 against the ONLY placements in the corpus that yield a
+# power stage. **That is four placements of two netlists** -- honestly thin, and
+# said so here so the next reader knows how much to trust these numbers. The
+# variant-ranking oracle is what the scorer term is actually gated on; these
+# trip points are a convenience over the numbers, not the numbers themselves.
+#
+#   placement                              loose  perim  bowtie  FB_pad  sense  SWspan  bulk  kelvin
+#   lt3757_boost B  (hand floorplan)        0.82   0.99    no      2.40   7.50   16.62  15.13  COUT1
+#   avalanche_laser_driver (default placer) 0.60   1.11    no      7.37  15.30   21.17  44.85  R9
+#   lt3757_boost A  (default placer)        1.71   1.69   YES     13.17  14.79   15.21   7.61  J2
+#   lt3757_boost A' (default, B's outline)  4.59   2.25    no     10.88  26.40   16.00   9.02  J2
+#
+# lt3757_boost B is the ground truth: it is the LT3757 datasheet Figure-11
+# floorplan transcribed by hand, it beats A/A' 2-5x on every placement-driven
+# requirement, and it is the only one of the three that routes to completion.
+# A and A' are the known-bad controls. Each trip point below sits just outside
+# B, so the code is a quiet tail flag rather than a "this is a power board"
+# flag. Pass ``None`` to any of them to disable that check.
+
+#: ``HOT_LOOP_AREA``, on the loop's **normalized** looseness -- effective area
+#: over the area of a square whose perimeter is the tightest these parts admit
+#: (see ``power_metrics.LoopGeometry``). Raw mm2 is NOT usable as a threshold:
+#: hot-loop area on a 30 x 24 mm board and on a 100 x 80 mm board are not the
+#: same quantity, which is the ``HIGH_CONGESTION`` lesson above repeated.
+#: 1.20 clears B (0.82) and avalanche (0.60) and fires on A (1.71) and A' (4.59).
+HOT_LOOP_LOOSENESS_THRESHOLD = 1.20
+
+#: ``FB_NODE_LENGTH``, in **mm** -- divider top to the controller's FB pad. A
+#: genuinely absolute quantity: a feedback node does not get to be longer
+#: because the board is bigger. 8.0 clears B (2.40) and fires on A (13.17) and
+#: A' (10.88); avalanche sits just under at 7.37.
+FB_NODE_LENGTH_MM_THRESHOLD = 8.0
+
+#: ``SENSE_RETURN_LENGTH``, in **mm** -- sense resistor to the switch it
+#: measures. Absolute for the same reason. 10.0 clears B (7.50) and fires on
+#: A (14.79), A' (26.40) and avalanche (15.30).
+SENSE_RETURN_MM_THRESHOLD = 10.0
+
+#: Small-signal separation **floor**, in mm -- the one number in this family
+#: where BIGGER IS BETTER. No quality code carries it (the Phase 2 plan's code
+#: list does not include one); it exists because the opt-in scorer term reads
+#: it, and because putting it anywhere but beside its own calibration is how
+#: thresholds drift. 14.0 clears B (16.62) and fires on A (8.95), A' (11.15)
+#: and avalanche (7.90).
+SMALL_SIGNAL_SEPARATION_FLOOR_MM = 14.0
+
+#: ``SW_NODE_SPAN`` -- **DISABLED (None), deliberately.** MEASURED: the span of
+#: the switch-node parts orders the corpus A 15.21 < A' 16.00 < B 16.62, i.e.
+#: the hand floorplan is the *worst*, while the routed SW copper area it is
+#: supposed to proxy for orders B 4.65 < A 5.75 < A' 7.53 -- exactly inverted.
+#: Phase 2 plan bail-out 4 applies: the number ships, the code does not. The
+#: honest measurement is ``SW_NODE_COPPER_AREA`` on a routed board (Phase 5).
+#: Set a float to enable it anyway.
+SW_NODE_SPAN_MM_THRESHOLD = None
+
+#: ``BULK_CAP_DISTANCE`` -- **DISABLED (None), deliberately.** Same bail-out.
+#: MEASURED: A 7.61 < A' 9.02 < B 15.13, again inverting the known ranking. The
+#: cause is structural rather than a bad number -- on a boost the commutation
+#: loop is output-side, so the *input* capacitor's distance to it encodes no
+#: design intent, and it is the input cap that dominates this metric on all
+#: three variants. A defensible version needs a per-rail loop, which is Phase 3
+#: work. Set a float to enable it anyway.
+BULK_CAP_DISTANCE_MM_THRESHOLD = None
 
 # The spread/margin/compactness family is meaningless on a tiny board, so his
 # code gates the whole family behind a minimum size. Same gate here.
@@ -203,10 +280,197 @@ def _outline_area_mm2(outline) -> float:
     return max(0.0, width) * max(0.0, height)
 
 
+def _power_issues(
+    result,
+    hot_loop_looseness_threshold,
+    fb_node_threshold_mm,
+    sense_return_threshold_mm,
+    sw_node_span_threshold_mm,
+    bulk_cap_threshold_mm,
+) -> list:
+    """Power-layout advisories read off ``result.power_metrics`` (Phase 2).
+
+    ``getattr`` rather than an attribute access so a ``LayoutResult`` built by an
+    older caller, or a hand-rolled stand-in in a test, keeps working.
+    """
+    metrics = getattr(result, "power_metrics", None)
+    stages = list(getattr(metrics, "stages", None) or [])
+    if not stages:
+        return []
+
+    issues: list = []
+    for stage in stages:
+        who = stage.controller_ref or "power stage"
+        for loop in stage.loops:
+            members = " -> ".join(loop.member_refs)
+            if loop.self_intersecting:
+                issues.append(QualityIssue(
+                    "HOT_LOOP_SELF_INTERSECTING", _WARNING,
+                    f"{who}: the commutation loop {members} traces a bow tie",
+                    evidence={"controller": stage.controller_ref,
+                              "member_refs": list(loop.member_refs),
+                              "shoelace_area_mm2": loop.area_mm2,
+                              "convex_hull_area_mm2": loop.convex_hull_area_mm2,
+                              "effective_area_mm2": loop.effective_area_mm2},
+                    recommendation=(
+                        f"Reorder the physical placement of {members} to follow "
+                        "the current path -- a crossed loop encloses far more "
+                        "area than its raw shoelace figure suggests."
+                    ),
+                ))
+            if (hot_loop_looseness_threshold is not None
+                    and loop.looseness_ratio is not None
+                    and loop.looseness_ratio >= hot_loop_looseness_threshold):
+                issues.append(QualityIssue(
+                    "HOT_LOOP_AREA", _WARNING,
+                    f"{who}: the commutation loop {members} encloses "
+                    f"{loop.looseness_ratio:.2f}x the area these parts admit",
+                    evidence={"controller": stage.controller_ref,
+                              "member_refs": list(loop.member_refs),
+                              "effective_area_mm2": loop.effective_area_mm2,
+                              "perimeter_mm": loop.perimeter_mm,
+                              "longest_edge_mm": loop.longest_edge_mm,
+                              "min_perimeter_mm": loop.min_perimeter_mm,
+                              "looseness_ratio": loop.looseness_ratio,
+                              "threshold": hot_loop_looseness_threshold},
+                    recommendation=(
+                        f"Pull {members} together; the longest hop is "
+                        f"{_longest_edge_label(loop)}. Loop inductance goes with "
+                        "enclosed area, so this is the highest-value move on the "
+                        "board."
+                    ),
+                ))
+
+        fb = stage.fb_node or {}
+        fb_mm = fb.get("fb_top_to_fb_pad_mm")
+        if (fb_node_threshold_mm is not None and fb_mm is not None
+                and fb_mm >= fb_node_threshold_mm):
+            issues.append(QualityIssue(
+                "FB_NODE_LENGTH", _WARNING,
+                f"{who}: the feedback node runs {fb_mm:.1f}mm from "
+                f"{fb.get('fb_top')} to the FB pin",
+                evidence={"controller": stage.controller_ref,
+                          "fb_top": fb.get("fb_top"),
+                          "fb_bottom": fb.get("fb_bottom"),
+                          "feedback_net": fb.get("feedback_net"),
+                          "fb_top_to_fb_pad_mm": fb_mm,
+                          "fb_top_to_fb_bottom_mm": fb.get("fb_top_to_fb_bottom_mm"),
+                          "threshold_mm": fb_node_threshold_mm},
+                recommendation=(
+                    f"Move {fb.get('fb_top')} and {fb.get('fb_bottom')} against "
+                    f"{stage.controller_ref}'s FB pin -- this node is high "
+                    "impedance and picks up whatever the switch node radiates."
+                ),
+            ))
+
+        sense = stage.sense_return or {}
+        sense_mm = sense.get("sense_r_to_switch_mm")
+        if (sense_return_threshold_mm is not None and sense_mm is not None
+                and sense_mm >= sense_return_threshold_mm):
+            issues.append(QualityIssue(
+                "SENSE_RETURN_LENGTH", _WARNING,
+                f"{who}: the sense resistor {sense.get('sense_resistor_ref')} "
+                f"sits {sense_mm:.1f}mm from the switch it measures",
+                evidence={"controller": stage.controller_ref,
+                          "sense_resistor_ref": sense.get("sense_resistor_ref"),
+                          "sense_r_to_switch_mm": sense_mm,
+                          "sense_r_to_controller_gnd_pad_mm":
+                              sense.get("sense_r_to_controller_gnd_pad_mm"),
+                          "sense_r_to_controller_sense_pad_mm":
+                              sense.get("sense_r_to_controller_sense_pad_mm"),
+                          "threshold_mm": sense_return_threshold_mm},
+                recommendation=(
+                    f"Put {sense.get('sense_resistor_ref')} directly at the "
+                    "switch's source/emitter and take the sense line back to the "
+                    "controller as a pair -- this loop carries the full switch "
+                    "current."
+                ),
+            ))
+
+        kelvin = stage.kelvin or {}
+        if kelvin.get("taps_output_cap") is False:
+            issues.append(QualityIssue(
+                "KELVIN_TAP_TARGET", _WARNING,
+                f"{who}: the feedback divider {kelvin.get('fb_top')} taps "
+                f"{kelvin.get('neighbour_ref')}, not an output capacitor",
+                evidence={"controller": stage.controller_ref,
+                          "fb_top": kelvin.get("fb_top"),
+                          "output_rail": kelvin.get("output_rail"),
+                          "neighbour_ref": kelvin.get("neighbour_ref"),
+                          "neighbour_mm": kelvin.get("neighbour_mm"),
+                          "nearest_output_cap_ref":
+                              kelvin.get("nearest_output_cap_ref"),
+                          "nearest_output_cap_mm":
+                              kelvin.get("nearest_output_cap_mm")},
+                recommendation=(
+                    f"Move {kelvin.get('fb_top')} beside "
+                    f"{kelvin.get('nearest_output_cap_ref') or 'an output cap'}: "
+                    "the rail routes as a Euclidean MST, so the nearest part is "
+                    "the one it actually senses, and sensing at the rectifier "
+                    "puts the divider on the high-dV/dt end of the net."
+                ),
+            ))
+
+        span = (stage.switch_node or {}).get("span_mm")
+        if (sw_node_span_threshold_mm is not None and span is not None
+                and span >= sw_node_span_threshold_mm):
+            issues.append(QualityIssue(
+                "SW_NODE_SPAN", _WARNING,
+                f"{who}: the switch node spans {span:.1f}mm",
+                evidence={"controller": stage.controller_ref,
+                          "switch_node": stage.switch_node,
+                          "threshold_mm": sw_node_span_threshold_mm},
+                recommendation=(
+                    "Tighten the switch, magnetics and rectifier around one "
+                    "another; switch-node copper is the board's main radiator."
+                ),
+            ))
+
+        bulk = stage.bulk_caps or {}
+        bulk_mm = bulk.get("max_mm")
+        if (bulk_cap_threshold_mm is not None and bulk_mm is not None
+                and bulk_mm >= bulk_cap_threshold_mm):
+            issues.append(QualityIssue(
+                "BULK_CAP_DISTANCE", _WARNING,
+                f"{who}: {bulk.get('worst_ref')} sits {bulk_mm:.1f}mm from the "
+                "commutation loop",
+                evidence={"controller": stage.controller_ref,
+                          "worst_ref": bulk.get("worst_ref"),
+                          "max_mm": bulk_mm,
+                          "distances_mm": bulk.get("distances_mm"),
+                          "threshold_mm": bulk_cap_threshold_mm},
+                recommendation=(
+                    f"Bring {bulk.get('worst_ref')} in toward the loop it "
+                    "supplies."
+                ),
+            ))
+
+    for warning in list(getattr(metrics, "warnings", None) or []):
+        issues.append(QualityIssue(
+            "HOT_LOOP_AREA", _WARNING,
+            f"power metrics incomplete: {warning}",
+            evidence={"warning": warning},
+            recommendation="Check that every loop member was placed.",
+        ))
+    return issues
+
+
+def _longest_edge_label(loop) -> str:
+    if not loop.edges_mm:
+        return "unknown"
+    key = max(loop.edges_mm, key=lambda k: (loop.edges_mm[k], k))
+    return f"{key} at {loop.edges_mm[key]:.1f}mm"
+
+
 def layout_quality(
     result,
     route_summary=None,
     congestion_threshold=HIGH_CONGESTION_THRESHOLD,
+    hot_loop_looseness_threshold=HOT_LOOP_LOOSENESS_THRESHOLD,
+    fb_node_threshold_mm=FB_NODE_LENGTH_MM_THRESHOLD,
+    sense_return_threshold_mm=SENSE_RETURN_MM_THRESHOLD,
+    sw_node_span_threshold_mm=SW_NODE_SPAN_MM_THRESHOLD,
+    bulk_cap_threshold_mm=BULK_CAP_DISTANCE_MM_THRESHOLD,
 ) -> LayoutQualityResult:
     """Classify a :class:`~skidl_layout.LayoutResult` into typed quality issues.
 
@@ -221,9 +485,21 @@ def layout_quality(
             :data:`HIGH_CONGESTION_PER_PART_THRESHOLD`, calibrated on this
             engine's scale from the 10-board benchmark population (see that
             constant). Pass ``None`` to skip the congestion check.
+        hot_loop_looseness_threshold: ``HOT_LOOP_AREA`` trip point, on the
+            **normalized** looseness ratio. See
+            :data:`HOT_LOOP_LOOSENESS_THRESHOLD`.
+        fb_node_threshold_mm: ``FB_NODE_LENGTH`` trip point in mm.
+        sense_return_threshold_mm: ``SENSE_RETURN_LENGTH`` trip point in mm.
+        sw_node_span_threshold_mm: ``SW_NODE_SPAN`` trip point in mm.
+            **Defaults to ``None`` (off)** -- the metric was measured to invert
+            the known ranking; see :data:`SW_NODE_SPAN_MM_THRESHOLD`.
+        bulk_cap_threshold_mm: ``BULK_CAP_DISTANCE`` trip point in mm.
+            **Defaults to ``None`` (off)**, same reason; see
+            :data:`BULK_CAP_DISTANCE_MM_THRESHOLD`.
 
     Returns:
-        A :class:`LayoutQualityResult`. Never raises on a rule breach.
+        A :class:`LayoutQualityResult`. Never raises on a rule breach. The
+        power-layout codes are all advisory, so ``.ok`` is unaffected by them.
     """
     issues: list = []
     validation = getattr(result, "validation", None)
@@ -295,6 +571,17 @@ def layout_quality(
                 "pin KRT's neck-down floor via write_krt_fab_overrides()."
             ),
         ))
+
+    # -- power layout (Phase 2). Independent of `score`, so it runs before the
+    # score-less early return: a result carrying power_metrics still gets them.
+    issues.extend(_power_issues(
+        result,
+        hot_loop_looseness_threshold,
+        fb_node_threshold_mm,
+        sense_return_threshold_mm,
+        sw_node_span_threshold_mm,
+        bulk_cap_threshold_mm,
+    ))
 
     if score is None:
         return LayoutQualityResult(issues=issues)
