@@ -373,3 +373,51 @@ def test_cap_chain_deterministic(tmp_path):
     a = route_and_check(pcb, str(tmp_path / "a")).to_dict()
     b = route_and_check(pcb, str(tmp_path / "b")).to_dict()
     assert a == b
+
+
+# --------------------------------------------------------------------------
+# Phase 4: the counts are token-bounded, and zones are tallied per net.
+# --------------------------------------------------------------------------
+
+# A pad's (zone_connect 2) is the substring that used to inflate zone_count by
+# one per pad -- enough to mask power_copper's under-pour warning.
+ZONE_CONNECT_BOARD = """
+(kicad_pcb
+  (footprint "R_0603"
+    (pad "1" smd rect (at 0 0) (zone_connect 2) (net 3 "GND"))
+    (pad "2" smd rect (at 1 0) (zone_connect 2) (net 4 "VOUT"))
+  )
+  (zone
+    (net 3)
+    (net_name "GND")
+    (layer "B.Cu")
+    (fill yes)
+  )
+  (zone
+    (net 4)
+    (net_name "VOUT")
+    (layer "F.Cu")
+    (fill yes)
+  )
+)
+"""
+
+
+def test_parse_zone_summary_ignores_zone_connect_pads():
+    summary = krt._parse_zone_summary(ZONE_CONNECT_BOARD)
+    # Two real zones; the two (zone_connect 2) pads must not count.
+    assert summary["zone_count"] == 2
+    assert ZONE_CONNECT_BOARD.count("(zone") == 4  # what the old count returned
+
+
+def test_zone_counts_by_net():
+    assert krt._zone_counts_by_net(ZONE_CONNECT_BOARD) == {"GND": 1, "VOUT": 1}
+    assert krt._zone_counts_by_net("(kicad_pcb)") == {}
+    # a zone with no net_name is tallied under "" rather than dropped silently
+    assert krt._zone_counts_by_net("(zone (fill yes))") == {"": 1}
+
+
+def test_zone_counts_by_net_multi_zone_same_net():
+    text = (ZONE_CONNECT_BOARD
+            + '(zone (net 3) (net_name "GND") (layer "F.Cu") (fill yes))\n')
+    assert krt._zone_counts_by_net(text)["GND"] == 2

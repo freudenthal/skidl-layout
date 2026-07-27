@@ -348,3 +348,145 @@ def test_power_warnings_roles_passthrough_identical():
     )
 
     assert with_roles == plain
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: opt-in suffixed-rail recognition + the pour policy.
+# Both default OFF; every assertion below pairs the ON behaviour with the OFF
+# one, because the OFF path is what placement/scoring resolve through.
+# --------------------------------------------------------------------------- #
+def _suffixed_circuit():
+    """A supply rail whose name today routes at signal width."""
+    vin12 = _Net("VIN_12V")
+    hv = _Net("HV_RAIL")
+    gnd = _Net("GND")
+    gnd_sense = _Net("GND_SENSE")
+    j1 = _Part("J1", name="barrel jack", footprint="Connector:Barrel",
+               nets=[vin12, gnd], pins=2)
+    u1 = _Part("U1", name="boost controller", footprint="Package_SO:MSOP-10",
+               nets=[vin12, hv, gnd, gnd_sense], pins=4)
+    c1 = _Part("C1", value="10uF", footprint="Capacitor:C_0805",
+               nets=[vin12, gnd])
+    c2 = _Part("C2", value="10uF", footprint="Capacitor:C_0805",
+               nets=[hv, gnd])
+    r1 = _Part("R1", value="1M", footprint="Resistor:R_0603",
+               nets=[hv, gnd_sense])
+    return _Circuit([j1, u1, c1, c2, r1],
+                    [vin12, hv, gnd, gnd_sense])
+
+
+def test_suffixed_rails_are_invisible_by_default():
+    names = [n.name for n in identify_power_nets(_suffixed_circuit())]
+    assert names == ["GND"]  # VIN_12V / HV_RAIL route at signal width today
+
+
+def test_include_suffixed_recognises_suffixed_rails():
+    nets = {n.name: n for n in
+            identify_power_nets(_suffixed_circuit(), include_suffixed=True)}
+    assert set(nets) == {"GND", "VIN_12V", "HV_RAIL"}
+    assert nets["VIN_12V"].kind == "supply"
+    assert nets["HV_RAIL"].kind == "supply"
+    # VIN_12V's base name is high-current, so the suffixed form inherits the
+    # 0.8mm width and priority 95 -- the whole point of recognising it.
+    assert nets["VIN_12V"].suggested_width_mm == 0.8
+    assert nets["VIN_12V"].priority == 95
+    assert nets["HV_RAIL"].suggested_width_mm == 0.25
+
+
+def test_include_suffixed_never_turns_a_ground_name_into_a_supply():
+    nets = {n.name: n for n in
+            identify_power_nets(_suffixed_circuit(), include_suffixed=True)}
+    assert "GND_SENSE" not in nets  # no ground base sits in the suffix regex
+
+
+def test_suffix_matrix():
+    from skidl_layout.power import _net_kind
+
+    for name in ("VIN_12V", "HV_RAIL", "VBAT_A", "24V_OUT", "+5V_USB", "3V3-A",
+                 "HV"):
+        assert _net_kind(name) is None, name
+        assert _net_kind(name, include_suffixed=True) == "supply", name
+    for name in ("GND_SENSE", "AGND_1", "SW", "SW_SENSE", "FBX", "N$3"):
+        assert _net_kind(name, include_suffixed=True) is None, name
+    for name in ("GND", "AGND"):
+        assert _net_kind(name, include_suffixed=True) == "ground", name
+
+
+def _pour_policy_strategy(kind, refs, policy, board_layers=2, width=0.25):
+    from skidl_layout.power import PowerNet, _strategy
+
+    net = PowerNet(name="VOUT", kind=kind, refs=[f"R{i}" for i in range(refs)],
+                   suggested_width_mm=width)
+    return _strategy(net, board_layers, refs, policy)
+
+
+def test_pour_policy_none_is_the_historical_ladder():
+    assert _pour_policy_strategy("supply", 6, None) == "trunk"
+    assert _pour_policy_strategy("supply", 6, None, width=0.8) == "wide_trunk"
+    assert _pour_policy_strategy("ground", 6, None) == "pour"
+    assert _pour_policy_strategy("supply", 1, None) == "fanout_only"
+
+
+def test_pour_policy_auto_promotes_on_ref_count():
+    assert _pour_policy_strategy("supply", 6, "auto") == "pour"
+    assert _pour_policy_strategy("supply", 4, "auto") == "pour"
+    assert _pour_policy_strategy("supply", 3, "auto") == "trunk"
+    # a 4+ layer board promotes to a real plane, not a 2-layer pour
+    assert _pour_policy_strategy("supply", 6, "auto", board_layers=4) == "plane"
+    # a single-ref net is still fanout_only -- there is nothing to pour to
+    assert _pour_policy_strategy("supply", 1, "auto") == "fanout_only"
+
+
+def test_pour_policy_explicit_list():
+    assert _pour_policy_strategy("supply", 6, ["VOUT"]) == "pour"
+    assert _pour_policy_strategy("supply", 6, ["vout"]) == "pour"  # case-folded
+    assert _pour_policy_strategy("supply", 6, ["VIN"]) == "trunk"
+    assert _pour_policy_strategy("supply", 2, ["VOUT"]) == "pour"  # list ignores count
+
+
+def test_pour_policy_rejects_an_unknown_string():
+    import pytest
+
+    with pytest.raises(ValueError, match="unknown pour_policy"):
+        _pour_policy_strategy("supply", 6, "aggressive")
+
+
+def test_plan_power_routes_threads_both_flags():
+    circuit = _suffixed_circuit()
+    placed = [
+        PlacedPart("J1", 0.0, 0.0, 0.0, "Connector:Barrel"),
+        PlacedPart("U1", 10.0, 0.0, 0.0, "Package_SO:MSOP-10"),
+        PlacedPart("C1", 5.0, 5.0, 0.0, "Capacitor:C_0805"),
+        PlacedPart("C2", 15.0, 5.0, 0.0, "Capacitor:C_0805"),
+        PlacedPart("R1", 20.0, 5.0, 0.0, "Resistor:R_0603"),
+    ]
+    off = {i.net_name: i.strategy for i in
+           plan_power_routes(circuit, placed).route_intents}
+    assert set(off) == {"GND"}
+
+    on = {i.net_name: i.strategy for i in plan_power_routes(
+        circuit, placed, include_suffixed=True).route_intents}
+    assert on == {"GND": "pour", "VIN_12V": "wide_trunk", "HV_RAIL": "trunk"}
+
+    poured = {i.net_name: i.strategy for i in plan_power_routes(
+        circuit, placed, include_suffixed=True, pour_policy="auto").route_intents}
+    # VIN_12V has 3 placed refs, HV_RAIL 3 -> neither reaches the auto floor
+    assert poured == on
+    listed = {i.net_name: i.strategy for i in plan_power_routes(
+        circuit, placed, include_suffixed=True,
+        pour_policy=["VIN_12V"]).route_intents}
+    assert listed["VIN_12V"] == "pour"
+    assert listed["HV_RAIL"] == "trunk"
+
+
+def test_ctx_memo_is_bypassed_when_recognition_is_widened():
+    """The ctx power-net memo keys only on board_layers, not on the flag."""
+    circuit = _suffixed_circuit()
+    placed = [PlacedPart(r, float(i * 5), 0.0, 0.0, "") for i, r in
+              enumerate(["J1", "U1", "C1", "C2", "R1"])]
+    ctx = LayoutContext.from_circuit(circuit)
+    plan_power_routes(circuit, placed, ctx=ctx)  # primes the memo, unwidened
+    widened = plan_power_routes(circuit, placed, ctx=ctx, include_suffixed=True)
+    assert {n.name for n in widened.nets} == {"GND", "VIN_12V", "HV_RAIL"}
+    # and the memo is not poisoned for the default path
+    assert {n.name for n in plan_power_routes(circuit, placed, ctx=ctx).nets} == {"GND"}

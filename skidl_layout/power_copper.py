@@ -49,6 +49,12 @@ class PowerCopperResult:
     plane_summary: dict = field(default_factory=dict)
     feedback: RoutabilityFeedback | None = None
     warnings: list[str] = field(default_factory=list)
+    #: Supply nets the pour policy promoted from a trunk to poured copper
+    #: (Phase 4). Empty on the default path.
+    promoted_nets: list[str] = field(default_factory=list)
+    #: Zones actually written per net, read back off the final board. Empty
+    #: when nothing was poured.
+    zones_by_net: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = ["Power copper emitted:"]
@@ -59,8 +65,15 @@ class PowerCopperResult:
             emitted_str = f"{emitted:.2f}mm" if emitted is not None else "no trace"
             lines.append(f"  wide {net}: planned {planned:.2f}mm -> {emitted_str}")
         for net, layer in zip(self.plane_nets, self.plane_layers):
-            zones = self.plane_summary.get("zone_count", 0)
-            lines.append(f"  plane {net}: pour on {layer} ({zones} zone(s) total)")
+            total = self.plane_summary.get("zone_count", 0)
+            # Per-net when we could read it back, so a promotion that poured
+            # nothing shows a 0 rather than hiding behind the board total.
+            mine = self.zones_by_net.get(net)
+            kind = "promoted" if net in self.promoted_nets else "plane"
+            count = (
+                f"{mine} zone(s)" if mine is not None else f"{total} zone(s) total"
+            )
+            lines.append(f"  {kind} {net}: pour on {layer} ({count})")
         if self.feedback is not None:
             lines.append(self.feedback.summary())
         if self.warnings:
@@ -79,6 +92,8 @@ class PowerCopperResult:
             "plane_summary": dict(self.plane_summary),
             "feedback": self.feedback.to_dict() if self.feedback else None,
             "warnings": list(self.warnings),
+            "promoted_nets": list(self.promoted_nets),
+            "zones_by_net": dict(self.zones_by_net),
         }
 
 
@@ -116,15 +131,30 @@ def _spec_pour_kwargs(spec) -> dict:
     }
 
 
-def _plane_layer_for(intent, board_layers: int) -> str:
+def _plane_layer_for(
+    intent,
+    board_layers: int,
+    promoted: bool = False,
+    supply_pour_layer: str | None = None,
+) -> str:
     """Copper layer to pour a plane/pour-strategy net on.
 
     4+ layers: honour the plan's ``suggested_layer`` (e.g. In1.Cu). 2-layer:
     force B.Cu so F.Cu stays free for signal routing (``_suggest_layer`` biases
     signals to F.Cu; a GND pour belongs on the back), matching SKILL Step 8.
+
+    ``promoted`` (Phase 4, default ``False`` -> byte-identical) marks a *supply*
+    net the pour policy lifted out of the trunk ladder. On a 2-layer board those
+    pour on **F.Cu** while GND keeps B.Cu -- Figure 11's shape: a ground pour
+    underneath, VIN/VOUT regions on top. Several promoted nets share F.Cu; KRT
+    Voronoi-partitions a multi-net layer. ``supply_pour_layer`` overrides that
+    choice (``"B.Cu"`` shares the back copper with GND -- the measured fallback
+    if F.Cu regions cost routing completion).
     """
     if board_layers >= 4:
         return intent.layer
+    if promoted:
+        return supply_pour_layer or "F.Cu"
     return "B.Cu"
 
 
@@ -143,6 +173,12 @@ def emit_power_copper(
     timeout_s: int = 900,
     strict_missing_footprints: bool = False,
     fab_spec=None,
+    pour_policy=None,
+    include_suffixed: bool = False,
+    supply_pour_layer: str | None = None,
+    route_promoted: bool = True,
+    zone_clearance: float | None = None,
+    min_thickness: float | None = None,
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -177,6 +213,31 @@ def emit_power_copper(
     and (c) clamps every planned power-track width UP to ``spec.min_track_mm``
     (an explicit ``overrides=`` width still wins). Resolved once via
     :func:`skidl_layout.resolve_fab_spec`.
+
+    **Phase-4 knobs (all default OFF -> byte-identical).** ``pour_policy`` and
+    ``include_suffixed`` are handed to a *recomputed*
+    :func:`~skidl_layout.power.plan_power_routes` (this function holds both
+    ``result`` and ``circuit`` already); with neither engaged the default-path
+    ``result.power_plan`` is read exactly as before. That recompute is why the
+    knobs cannot reach placement: ``plan_power_routes`` is also called from
+    inside ``score_placement``, and those call sites never pass them.
+
+    - ``pour_policy``: ``None`` (historical ladder), ``"auto"`` (a supply net
+      with >= ``power.POUR_AUTO_MIN_REFS`` placed refs earns poured copper), or
+      an explicit list of net names. An ``overrides`` width still demotes a
+      promoted net back to a wide trace -- the human veto stays strongest.
+    - ``include_suffixed``: recognise suffixed rail names (``VIN_12V``,
+      ``HV_RAIL``) as supplies so they stop routing at signal width.
+    - ``supply_pour_layer``: where promoted supply nets pour on a 2-layer board
+      (default ``"F.Cu"``; ``"B.Cu"`` shares the back copper with GND).
+    - ``route_promoted`` (default ``True``): a promoted net keeps its routed
+      trunk *and* gets the pour, instead of being excluded from routing the way
+      a ground plane is. Measured on the Figure-11 boost: excluded, VOUT's F.Cu
+      region fragments behind the signal tracks and ``check_connected`` reports
+      it broken; with the trunk kept, every net closes. No effect when nothing
+      is promoted.
+    - ``zone_clearance`` / ``min_thickness``: forwarded to ``pour_planes``
+      (``None`` emits no flag, so KRT's own pour defaults stand).
     """
     from .writer import write_kicad_pcb
     from .fabspec import resolve_fab_spec
@@ -199,18 +260,60 @@ def emit_power_copper(
     )
 
     warnings: list[str] = []
-    intents = list(getattr(result.power_plan, "route_intents", []) or [])
+
+    # Phase-4 recognition/policy knobs recompute the plan here rather than
+    # anywhere placement can see. With neither engaged this is the default path
+    # verbatim.
+    power_plan = result.power_plan
+    if pour_policy is not None or include_suffixed:
+        from .power import plan_power_routes
+
+        power_plan = plan_power_routes(
+            circuit,
+            result.placed_parts,
+            board_layers=board_layers,
+            include_suffixed=include_suffixed,
+            pour_policy=pour_policy,
+        )
+    intents = list(getattr(power_plan, "route_intents", []) or [])
+    net_kinds = {
+        n.name: n.kind for n in (getattr(power_plan, "nets", None) or [])
+    }
 
     # Partition the plan. When a fab spec is engaged, clamp each planned power
     # width UP to the fab's minimum track (a fab never draws below its own floor;
     # an explicit override still wins, applied after this).
     plane_nets: list[str] = []
     plane_layers: list[str] = []
+    promoted_nets: list[str] = []
     width_map: dict[str, float] = {}
     for intent in intents:
         if intent.strategy in _PLANE_STRATEGIES:
+            # A *supply* net that pours only ever got there via the policy --
+            # ground pours on the historical path too.
+            promoted = net_kinds.get(intent.net_name) == "supply"
             plane_nets.append(intent.net_name)
-            plane_layers.append(_plane_layer_for(intent, board_layers))
+            plane_layers.append(
+                _plane_layer_for(
+                    intent,
+                    board_layers,
+                    promoted=promoted,
+                    supply_pour_layer=supply_pour_layer,
+                )
+            )
+            if promoted:
+                promoted_nets.append(intent.net_name)
+                if route_promoted:
+                    # Keep the trunk AND pour the region. A ground plane owns a
+                    # whole layer, so excluding it from routing is right; a
+                    # promoted supply pours on a *signal* layer whose tracks
+                    # fence its region into islands, and a 2-layer board has no
+                    # second copper for the pour to stitch back through. The
+                    # routed backbone is what makes the pour additive.
+                    width = intent.width_mm
+                    if spec is not None:
+                        width = max(width, spec.min_track_mm)
+                    width_map[intent.net_name] = width
         elif intent.strategy in _WIDE_STRATEGIES:
             width = intent.width_mm
             if spec is not None:
@@ -227,6 +330,8 @@ def emit_power_copper(
                 idx = plane_nets.index(net)
                 plane_nets.pop(idx)
                 plane_layers.pop(idx)
+                if net in promoted_nets:
+                    promoted_nets.remove(net)
                 warnings.append(f"{net}: override width demoted plane -> wide trace")
 
     # Route: all nets except the plane nets (poured next), wide power at width.
@@ -234,7 +339,14 @@ def emit_power_copper(
     # signal net; harmless on an easy board. Caller can override.
     if route_extra_args is None:
         route_extra_args = ["--max-ripup", "10", "--max-iterations", "1000000"]
-    net_selection = ["*"] + [f"!{n}" for n in plane_nets]
+    # A promoted net that keeps its trunk stays IN the route selection; the
+    # pour then adds area around a backbone that already reaches every pad.
+    routed_promoted = (
+        {n for n in promoted_nets if n in width_map} if route_promoted else set()
+    )
+    net_selection = ["*"] + [
+        f"!{n}" for n in plane_nets if n not in routed_promoted
+    ]
     routed_pcb = os.path.join(workdir_abs, "routed_power.kicad_pcb")
     dr = _spec_route_kwargs(spec)
     krt.route_and_check(
@@ -265,9 +377,17 @@ def emit_power_copper(
 
     # Pour the plane nets on the routed board, or fall through if none.
     plane_summary: dict = {}
+    zones_by_net: dict[str, int] = {}
     final_pcb = routed_pcb
     if plane_nets:
         final_pcb = os.path.join(workdir_abs, "power_copper.kicad_pcb")
+        pour_kwargs = dict(_spec_pour_kwargs(spec))
+        # None emits no flag at all, so a knobless pour keeps KRT's defaults and
+        # byte-identical argv.
+        if zone_clearance is not None:
+            pour_kwargs["zone_clearance"] = zone_clearance
+        if min_thickness is not None:
+            pour_kwargs["min_thickness"] = min_thickness
         plane_summary = krt.pour_planes(
             routed_pcb,
             final_pcb,
@@ -278,8 +398,19 @@ def emit_power_copper(
             timeout_s=timeout_s,
             add_gnd_vias=add_gnd_vias,
             gnd_via_distance=gnd_via_distance,
-            **_spec_pour_kwargs(spec),
+            **pour_kwargs,
         )
+        # Read the zones back per net: a promotion that poured nothing must be
+        # visible, not averaged into a board total.
+        try:
+            with open(final_pcb, "r", encoding="utf-8", errors="replace") as handle:
+                zones_by_net = krt._zone_counts_by_net(handle.read())
+        except OSError:
+            zones_by_net = {}
+        for net in plane_nets:
+            if zones_by_net and not zones_by_net.get(net):
+                kind = "promoted" if net in promoted_nets else "plane"
+                warnings.append(f"{net}: {kind} to a pour but no zone was written")
         if plane_summary.get("zone_count", 0) < len(plane_nets):
             warnings.append(
                 f"poured {plane_summary.get('zone_count', 0)} zone(s) for "
@@ -309,6 +440,8 @@ def emit_power_copper(
         plane_summary=plane_summary,
         feedback=feedback,
         warnings=warnings,
+        promoted_nets=promoted_nets,
+        zones_by_net=zones_by_net,
     )
     logger.info("Power copper: %s", outcome.summary().replace("\n", " | "))
     return outcome

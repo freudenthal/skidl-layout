@@ -188,13 +188,41 @@ def _segment_widths_by_net(pcb_text: str) -> dict[str, float]:
 
 
 def _parse_zone_summary(pcb_text: str) -> dict:
-    """Count poured copper in a board: zones, filled polygons, vias, segments."""
+    """Count poured copper in a board: zones, filled polygons, vias, segments.
+
+    Counts are **token-bounded** (``\\(zone\\b``), not raw substrings. A plain
+    ``count("(zone")`` also matches every pad's ``(zone_connect ...)``, which
+    over-reported ``zone_count`` by one per such pad -- enough to mask
+    ``power_copper``'s under-pour warning. ``\\b`` does not match before ``_``,
+    so ``(zone_connect`` no longer counts as a zone.
+    """
     return {
-        "zone_count": pcb_text.count("(zone"),
-        "filled_polygon_count": pcb_text.count("(filled_polygon"),
-        "via_count": pcb_text.count("(via"),
-        "segment_count": pcb_text.count("(segment"),
+        "zone_count": len(re.findall(r"\(zone\b", pcb_text)),
+        "filled_polygon_count": len(re.findall(r"\(filled_polygon\b", pcb_text)),
+        "via_count": len(re.findall(r"\(via\b", pcb_text)),
+        "segment_count": len(re.findall(r"\(segment\b", pcb_text)),
     }
+
+
+_ZONE_NET_NAME_RE = re.compile(r'\(net_name\s+"?([^")\s]*)"?\s*\)')
+
+
+def _zone_counts_by_net(pcb_text: str) -> dict[str, int]:
+    """Zones written per net name, read off a poured board.
+
+    A zone block opens with ``(zone`` and names its net a couple of lines in
+    (``(net 3)`` / ``(net_name "GND")``). Splitting on the zone token and taking
+    the first ``net_name`` in each chunk is enough -- nothing else in a
+    ``.kicad_pcb`` emits ``net_name`` -- and it is what makes a promoted net
+    that poured *nothing* visible instead of hidden inside a board total.
+    """
+    counts: dict[str, int] = {}
+    chunks = re.split(r"\(zone\b", pcb_text)
+    for chunk in chunks[1:]:
+        match = _ZONE_NET_NAME_RE.search(chunk)
+        name = match.group(1) if match else ""
+        counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 def _feedback_from_outputs(

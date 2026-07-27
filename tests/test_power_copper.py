@@ -60,12 +60,21 @@ def patched(monkeypatch, tmp_path):
         return RoutabilityFeedback(source="kicad_routing_tools")
 
     def fake_pour(pcb_path, out_path, nets, plane_layers, workdir, krt_dir=None,
-                  timeout_s=900, add_gnd_vias=False, gnd_via_distance=2.0):
+                  timeout_s=900, add_gnd_vias=False, gnd_via_distance=2.0,
+                  **kwargs):
         cap["pour_nets"] = nets
         cap["pour_layers"] = plane_layers
         cap["add_gnd_vias"] = add_gnd_vias
+        cap["pour_kwargs"] = kwargs
+        # One zone per requested net, named the way KiCad names them, so the
+        # per-net read-back in emit_power_copper sees real data. A net listed in
+        # cap["pour_empty"] is poured but written no zone (the failure mode the
+        # promoted-but-silent warning exists for).
         with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("(zone (fill yes))\n")
+            for net in nets:
+                if net in cap.get("pour_empty", ()):
+                    continue
+                fh.write(f'(zone\n\t(net_name "{net}")\n\t(fill yes)\n)\n')
         return {"zone_count": len(nets), "filled_polygon_count": len(nets),
                 "connected_ok": True, "unrouted_nets": [], "broken_nets": [],
                 "drc_violation_count": 0, "via_count": 0, "segment_count": 1}
@@ -175,3 +184,200 @@ def test_result_summary_and_to_dict():
     d = res.to_dict()
     assert d["plane_nets"] == ["GND"]
     assert d["feedback"]["total_nets"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: the pour policy, suffixed recognition, layer assignment and the
+# zone_clearance / min_thickness pass-through. All default OFF.
+# --------------------------------------------------------------------------- #
+class _Net:
+    def __init__(self, name, pins=()):
+        self.name = name
+        self._pins = list(pins)
+
+    def get_pins(self):
+        return self._pins
+
+
+class _Pin:
+    def __init__(self, part, net):
+        self.part = part
+        self.net = net
+        self.func = None
+        net._pins.append(self)
+
+
+class _Part:
+    def __init__(self, ref, nets):
+        self.ref = ref
+        self.value = ""
+        self.name = ""
+        self.footprint = ""
+        self.pins = [_Pin(self, n) for n in nets]
+
+
+class _Circuit:
+    """A boost-shaped netlist: GND everywhere, VOUT on six refs, VIN on five."""
+
+    def __init__(self):
+        self.gnd = _Net("GND")
+        self.vout = _Net("VOUT")
+        self.vin_12v = _Net("VIN_12V")
+        self.sw = _Net("SW")
+        self.parts = []
+        for ref, nets in (
+            ("U1", [self.gnd, self.vin_12v, self.sw]),
+            ("D1", [self.sw, self.vout]),
+            ("C1", [self.vout, self.gnd]),
+            ("C2", [self.vout, self.gnd]),
+            ("C3", [self.vout, self.gnd]),
+            ("C4", [self.vout, self.gnd]),
+            ("R1", [self.vout, self.gnd]),
+            ("C5", [self.vin_12v, self.gnd]),
+            ("C6", [self.vin_12v, self.gnd]),
+            ("L1", [self.vin_12v, self.sw]),
+            ("J1", [self.vin_12v, self.gnd]),
+        ):
+            self.parts.append(_Part(ref, nets))
+
+    def get_nets(self):
+        return [self.gnd, self.vout, self.vin_12v, self.sw]
+
+
+def _placed(circuit):
+    from skidl_layout.writer import PlacedPart
+
+    return [PlacedPart(p.ref, float(i * 3), 0.0, 0.0, "")
+            for i, p in enumerate(circuit.parts)]
+
+
+def _result_for(circuit):
+    from skidl_layout.power import plan_power_routes
+
+    placed = _placed(circuit)
+    return _FakeResult(plan_power_routes(circuit, placed), placed_parts=placed)
+
+
+def test_knobs_off_reads_the_default_plan(patched):
+    cap, tmp_path = patched
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    out = emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2)
+    # Only GND pours; VOUT is a trunk, VIN_12V is invisible to the plan today.
+    assert cap["pour_nets"] == ["GND"]
+    assert cap["pour_layers"] == ["B.Cu"]
+    assert out.promoted_nets == []
+    assert "VIN_12V" not in cap["route_widths"]
+    # no zone_clearance / min_thickness flags reach KRT
+    assert cap["pour_kwargs"] == {}
+
+
+def test_pour_policy_auto_promotes_supplies_to_fcu(patched):
+    cap, tmp_path = patched
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    out = emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2,
+                            pour_policy="auto")
+    # VOUT has 6 placed refs -> promoted. GND keeps the back copper; the
+    # promoted supply pours on the front, which is Figure 11's shape.
+    assert set(cap["pour_nets"]) == {"GND", "VOUT"}
+    layers = dict(zip(cap["pour_nets"], cap["pour_layers"]))
+    assert layers == {"GND": "B.Cu", "VOUT": "F.Cu"}
+    assert out.promoted_nets == ["VOUT"]
+    # A promoted net keeps its trunk (route_promoted default True), so only the
+    # ground plane is excluded from routing; the pour is additive.
+    assert set(cap["route_nets"]) == {"*", "!GND"}
+    assert cap["route_widths"]["VOUT"] == 0.3
+    assert out.zones_by_net == {"GND": 1, "VOUT": 1}
+    assert "promoted VOUT: pour on F.Cu (1 zone(s))" in out.summary()
+
+
+def test_route_promoted_false_excludes_the_promoted_net(patched):
+    cap, tmp_path = patched
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    out = emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2,
+                            pour_policy="auto", route_promoted=False)
+    assert set(cap["route_nets"]) == {"*", "!GND", "!VOUT"}
+    assert cap["route_widths"] is None  # nothing left to carry as a wide trace
+    assert out.promoted_nets == ["VOUT"]
+
+
+def test_include_suffixed_reaches_the_copper(patched):
+    cap, tmp_path = patched
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2,
+                      include_suffixed=True)
+    # VIN_12V now carries its high-current width instead of routing at signal
+    assert cap["route_widths"]["VIN_12V"] == 0.8
+    assert cap["pour_nets"] == ["GND"]
+
+
+def test_include_suffixed_plus_auto_promotes_the_suffixed_rail(patched):
+    cap, tmp_path = patched
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    out = emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2,
+                            include_suffixed=True, pour_policy="auto")
+    assert set(out.promoted_nets) == {"VOUT", "VIN_12V"}  # 6 and 5 refs
+    assert set(cap["pour_nets"]) == {"GND", "VOUT", "VIN_12V"}
+    layers = dict(zip(cap["pour_nets"], cap["pour_layers"]))
+    assert layers["GND"] == "B.Cu"
+    assert layers["VOUT"] == layers["VIN_12V"] == "F.Cu"  # shared, Voronoi-split
+    # both promoted nets keep their trunks under the routed pour
+    assert cap["route_widths"] == {"VOUT": 0.3, "VIN_12V": 0.8}
+
+
+def test_supply_pour_layer_is_the_bailout_fallback(patched):
+    cap, tmp_path = patched
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2,
+                      pour_policy="auto", supply_pour_layer="B.Cu")
+    assert dict(zip(cap["pour_nets"], cap["pour_layers"])) == {
+        "GND": "B.Cu", "VOUT": "B.Cu"}
+
+
+def test_override_still_beats_a_promotion(patched):
+    cap, tmp_path = patched
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    out = emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2,
+                            pour_policy="auto", overrides={"VOUT": 1.5})
+    assert cap["pour_nets"] == ["GND"]
+    assert out.promoted_nets == []
+    assert cap["route_widths"]["VOUT"] == 1.5
+    assert any("demoted" in w for w in out.warnings)
+
+
+def test_promotion_that_pours_nothing_warns(patched):
+    cap, tmp_path = patched
+    cap["pour_empty"] = {"VOUT"}
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    out = emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2,
+                            pour_policy="auto")
+    assert any("VOUT: promoted to a pour but no zone was written" in w
+               for w in out.warnings)
+    assert out.zones_by_net == {"GND": 1}
+
+
+def test_zone_clearance_and_min_thickness_pass_through(patched):
+    cap, tmp_path = patched
+    circuit = _Circuit()
+    result = _result_for(circuit)
+    emit_power_copper(result, circuit, [], str(tmp_path), board_layers=2,
+                      zone_clearance=0.3, min_thickness=0.2)
+    assert cap["pour_kwargs"] == {"zone_clearance": 0.3, "min_thickness": 0.2}
+
+
+def test_plane_layer_for_promoted():
+    intent = _intent("VOUT", "pour", 0.3, "F.Cu")
+    assert _plane_layer_for(intent, 2) == "B.Cu"
+    assert _plane_layer_for(intent, 2, promoted=True) == "F.Cu"
+    assert _plane_layer_for(intent, 2, promoted=True,
+                            supply_pour_layer="B.Cu") == "B.Cu"
+    # 4+ layers still honour the plan's own layer, promoted or not
+    inner = _intent("VOUT", "plane", 0.3, "In2.Cu")
+    assert _plane_layer_for(inner, 4, promoted=True) == "In2.Cu"

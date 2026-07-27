@@ -12,6 +12,44 @@ HIGH_CURRENT_NET_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --------------------------------------------------------------------------- #
+# Opt-in suffixed-rail recognition (Phase 4, default OFF everywhere).
+#
+# ``roles.POWER_NET_RE`` is deliberately NOT widened: it has 37 consumers across
+# 13 modules, most of them placement-side, and ``plan_power_routes`` is called
+# from inside ``score_placement`` (its corridors feed the congestion penalty,
+# which candidate selection keys on).  Widening the shared regex would silently
+# move placements.  So the widening lives here instead, behind
+# ``include_suffixed=`` -- engaged only by ``emit_power_copper``, which is
+# request-only.
+#
+# The base alternatives are ``POWER_NET_RE``'s plus ``HV``; each tolerates one
+# ``[_-]``-suffix: VIN_12V, HV_RAIL, VBAT_A, 24V_OUT.  Ground names are NOT in
+# the base set, so GND_SENSE-style names can never become supplies.
+# --------------------------------------------------------------------------- #
+_SUPPLY_BASE_ALTERNATIVES = (
+    r"VCC|VDD|VDDA|VDDD|AVDD|DVDD|IOVDD|"
+    r"VBUS|VIN|VOUT|VRAW|VBAT|BAT|BATT|VREF|HV|V\d+|"
+    r"[+-]?\d+(?:V\d*|\.\d+V)"
+)
+_SUFFIX = r"(?:[_-][A-Za-z0-9_]+)?"
+
+SUPPLY_SUFFIX_NET_RE = re.compile(
+    rf"^({_SUPPLY_BASE_ALTERNATIVES}){_SUFFIX}$",
+    re.IGNORECASE,
+)
+HIGH_CURRENT_SUFFIX_NET_RE = re.compile(
+    rf"^(VBUS|VIN|VRAW|BAT|BATT|5V|\+5V){_SUFFIX}$",
+    re.IGNORECASE,
+)
+
+#: ``pour_policy="auto"`` promotes a supply net to a pour at this many placed
+#: refs.  Calibrated on the LT3757 Figure-11 boost: promotes VIN (5) and VOUT
+#: (6) -- the datasheet figure's two top-side regions -- and leaves SW (3, and
+#: not a supply name anyway) a routed track, which is correct: SW is a node, not
+#: a rail.
+POUR_AUTO_MIN_REFS = 4
+
 
 @dataclass
 class PowerNet:
@@ -169,10 +207,20 @@ class PowerRoutePlan:
         return "\n".join(lines)
 
 
-def _net_kind(name: str) -> str | None:
+def _net_kind(name: str, include_suffixed: bool = False) -> str | None:
+    """Classify ``name`` as ``"ground"`` / ``"supply"`` / ``None``.
+
+    ``include_suffixed`` (default **False** -> byte-identical) additionally
+    accepts suffixed supply-rail names (``VIN_12V``, ``HV_RAIL``) via
+    :data:`SUPPLY_SUFFIX_NET_RE`.  The ground test still runs first and the
+    suffix alternatives contain no ground bases, so a ``GND_SENSE``-style name
+    stays unclassified either way -- it can never be promoted to a supply.
+    """
     if GND_NET_RE.match(name):
         return "ground"
     if POWER_NET_RE.match(name) or HIGH_CURRENT_NET_RE.match(name):
+        return "supply"
+    if include_suffixed and SUPPLY_SUFFIX_NET_RE.match(name):
         return "supply"
     return None
 
@@ -316,8 +364,16 @@ def _is_storage_part(part, nets: list[str]) -> bool:
     )
 
 
-def _suggest_width(name: str, kind: str, refs: list[str]) -> float:
+def _is_high_current(name: str, include_suffixed: bool = False) -> bool:
     if HIGH_CURRENT_NET_RE.match(name):
+        return True
+    return bool(include_suffixed and HIGH_CURRENT_SUFFIX_NET_RE.match(name))
+
+
+def _suggest_width(
+    name: str, kind: str, refs: list[str], include_suffixed: bool = False
+) -> float:
+    if _is_high_current(name, include_suffixed):
         return 0.8
     if kind == "ground" or len(refs) >= 6:
         return 0.3
@@ -332,10 +388,12 @@ def _suggest_layer(kind: str, board_layers: int) -> str:
     return "F.Cu"
 
 
-def _priority(name: str, kind: str, refs: list[str]) -> int:
+def _priority(
+    name: str, kind: str, refs: list[str], include_suffixed: bool = False
+) -> int:
     if kind == "ground":
         return 100
-    if HIGH_CURRENT_NET_RE.match(name):
+    if _is_high_current(name, include_suffixed):
         return 95
     return min(90, 60 + len(refs) * 3)
 
@@ -474,10 +532,43 @@ def infer_power_topology(circuit) -> PowerTopology:
     return PowerTopology(chains=chains, warnings=warnings)
 
 
-def _strategy(net: PowerNet, board_layers: int, placed_ref_count: int) -> str:
+def _pour_promoted(net: PowerNet, placed_ref_count: int, pour_policy) -> bool:
+    """Does ``pour_policy`` promote this supply net to poured copper?
+
+    ``"auto"`` -> any supply net with at least :data:`POUR_AUTO_MIN_REFS` placed
+    refs.  A list/tuple/set of net names -> exactly those (case-insensitive).
+    """
+    if pour_policy is None:
+        return False
+    if isinstance(pour_policy, str):
+        if pour_policy == "auto":
+            return placed_ref_count >= POUR_AUTO_MIN_REFS
+        raise ValueError(
+            f"unknown pour_policy {pour_policy!r} (expected None, 'auto', or a "
+            "list of net names)"
+        )
+    wanted = {str(n).casefold() for n in pour_policy}
+    return net.name.casefold() in wanted
+
+
+def _strategy(
+    net: PowerNet,
+    board_layers: int,
+    placed_ref_count: int,
+    pour_policy=None,
+) -> str:
+    """Route strategy for ``net``.
+
+    ``pour_policy`` (default **None** -> the historical ladder, byte-identical)
+    is the Phase-4 promote-to-plane knob: with a policy, a *supply* net can earn
+    ``"pour"`` (2-layer) / ``"plane"`` (4+) instead of a trunk.  Ground is
+    unaffected -- it already pours.
+    """
     if placed_ref_count <= 1:
         return "fanout_only"
     if net.kind == "ground":
+        return "plane" if board_layers >= 4 else "pour"
+    if _pour_promoted(net, placed_ref_count, pour_policy):
         return "plane" if board_layers >= 4 else "pour"
     if board_layers >= 4:
         return "internal_rail"
@@ -486,11 +577,13 @@ def _strategy(net: PowerNet, board_layers: int, placed_ref_count: int) -> str:
     return "trunk"
 
 
-def identify_power_nets(circuit, board_layers: int = 2) -> list[PowerNet]:
+def identify_power_nets(
+    circuit, board_layers: int = 2, include_suffixed: bool = False
+) -> list[PowerNet]:
     power_nets: list[PowerNet] = []
     for net in circuit.get_nets():
         name = str(getattr(net, "name", "") or "")
-        kind = _net_kind(name)
+        kind = _net_kind(name, include_suffixed=include_suffixed)
         if kind is None:
             continue
         refs = _pin_refs(net)
@@ -499,9 +592,13 @@ def identify_power_nets(circuit, board_layers: int = 2) -> list[PowerNet]:
                 name=name,
                 kind=kind,
                 refs=refs,
-                suggested_width_mm=_suggest_width(name, kind, refs),
+                suggested_width_mm=_suggest_width(
+                    name, kind, refs, include_suffixed=include_suffixed
+                ),
                 suggested_layer=_suggest_layer(kind, board_layers),
-                priority=_priority(name, kind, refs),
+                priority=_priority(
+                    name, kind, refs, include_suffixed=include_suffixed
+                ),
             )
         )
     power_nets.sort(key=lambda n: (-n.priority, n.name))
@@ -546,6 +643,7 @@ def _route_intents(
     power_nets: list[PowerNet],
     placed_parts: list[PlacedPart],
     board_layers: int,
+    pour_policy=None,
 ) -> list[PowerRouteIntent]:
     placed = {pp.ref: pp for pp in placed_parts}
     intents: list[PowerRouteIntent] = []
@@ -555,7 +653,7 @@ def _route_intents(
         intents.append(
             PowerRouteIntent(
                 net_name=net.name,
-                strategy=_strategy(net, board_layers, len(refs)),
+                strategy=_strategy(net, board_layers, len(refs), pour_policy),
                 layer=net.suggested_layer,
                 width_mm=net.suggested_width_mm,
                 priority=net.priority,
@@ -674,16 +772,38 @@ def plan_power_routes(
     placed_parts: list[PlacedPart],
     board_layers: int = 2,
     ctx=None,
+    include_suffixed: bool = False,
+    pour_policy=None,
 ) -> PowerRoutePlan:
-    if ctx is not None:
+    """Plan per-net power widths / strategies / corridors for a placement.
+
+    ⚠ This is **not** report-only: ``scoring.score_placement`` calls it per
+    candidate and feeds its corridors to the congestion penalty.  Both Phase-4
+    knobs therefore default OFF, and every existing call site leaves them off.
+
+    ``include_suffixed`` widens recognition to suffixed rail names
+    (:func:`_net_kind`); ``pour_policy`` lets a supply net earn poured copper
+    (:func:`_strategy`).  Engaged only by ``power_copper.emit_power_copper``.
+    """
+    # The context's power-net memo is keyed only by board_layers, so it is
+    # valid only for the default (unwidened) recognition.
+    if ctx is not None and not include_suffixed:
         power_nets = ctx.power_nets_for(circuit, board_layers)
         topology = ctx.power_topology_for(circuit)
         roles = ctx.roles
     else:
-        power_nets = identify_power_nets(circuit, board_layers=board_layers)
-        topology = infer_power_topology(circuit)
-        roles = None
-    route_intents = _route_intents(power_nets, placed_parts, board_layers)
+        power_nets = identify_power_nets(
+            circuit, board_layers=board_layers, include_suffixed=include_suffixed
+        )
+        topology = (
+            ctx.power_topology_for(circuit)
+            if ctx is not None
+            else infer_power_topology(circuit)
+        )
+        roles = ctx.roles if ctx is not None else None
+    route_intents = _route_intents(
+        power_nets, placed_parts, board_layers, pour_policy=pour_policy
+    )
     corridors = _corridors(route_intents, placed_parts)
     warnings = _power_warnings(circuit, placed_parts, power_nets, roles=roles)
     warnings.extend(topology.warnings)
