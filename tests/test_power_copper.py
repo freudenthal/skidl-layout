@@ -533,3 +533,177 @@ def test_shrink_ladder_walks_down_to_one_via():
     assert ladder[-1] == (1, 1)
     assert all(c >= 1 and r >= 1 for c, r in ladder)
     assert power_copper._shrink_ladder(1, 1) == [(1, 1)]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6: the current merge. Currents are DATA -- these tests hand
+# emit_power_copper a plain dict, exactly as a human or the skidl-eda producer
+# would. Nothing here simulates anything.
+# --------------------------------------------------------------------------- #
+def test_currents_default_off_is_byte_identical(patched):
+    """No dict -> the Phase-4/5 path verbatim, and an empty record."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(
+        _intent("GND", "pour", 0.3, "F.Cu"),
+        _intent("VIN_12V", "wide_trunk", 0.8, "F.Cu"),
+    ))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2)
+    assert cap["route_widths"] == {"VIN_12V": 0.8}
+    assert out.current_widths == {}
+    assert out.to_dict()["current_widths"] == {}
+
+
+def test_current_widens_a_planned_net(patched):
+    """2 A on a 0.3mm-planned net -> the IPC 0.781mm reaches the router."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VOUT", "trunk", 0.3, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"VOUT": 2.0})
+    assert cap["route_widths"]["VOUT"] == pytest.approx(0.781, abs=0.01)
+    row = out.current_widths["VOUT"]
+    assert row["applied"] is True
+    assert row["i_rms_a"] == 2.0
+    assert row["planned_width_mm"] == 0.3
+    assert row["ipc_width_mm"] == pytest.approx(0.781, abs=0.01)
+
+
+def test_a_current_may_only_widen_never_narrow(patched):
+    """A smaller IPC width than the plan's is ignored -- the floor stands."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VIN_12V", "wide_trunk", 0.8, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"VIN_12V": 0.5})
+    assert cap["route_widths"] == {"VIN_12V": 0.8}
+    row = out.current_widths["VIN_12V"]
+    assert row["applied_width_mm"] == 0.8
+    assert "may only widen" in row["reason"]
+
+
+def test_a_current_without_a_plan_entry_is_recorded_not_widened(patched):
+    """The SW node's case: measured, deliberately left at signal width."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VIN_12V", "wide_trunk", 0.8, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"SW": 4.44})
+    assert "SW" not in cap["route_widths"]
+    row = out.current_widths["SW"]
+    assert row["applied"] is False
+    assert row["applied_width_mm"] is None
+    assert row["ipc_width_mm"] == pytest.approx(2.35, abs=0.01)
+    assert "not in the power plan" in row["reason"]
+
+
+def test_a_poured_net_is_recorded_not_widened(patched):
+    """GND owns a layer; a trunk width for it is meaningless."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("GND", "pour", 0.3, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"GND": 4.4})
+    assert cap["route_widths"] is None
+    assert out.current_widths["GND"]["applied"] is False
+
+
+def test_cap_warns_with_both_numbers(patched):
+    """A silent clamp is a lie with units -- bail-out 2's honesty requirement."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VIN_12V", "wide_trunk", 0.8, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"VIN_12V": 4.44},
+                            current_max_width_mm=1.2)
+    assert cap["route_widths"]["VIN_12V"] == pytest.approx(1.2)
+    warning = next(w for w in out.warnings if "caps it" in w)
+    assert "2.35mm" in warning and "1.20mm" in warning
+    row = out.current_widths["VIN_12V"]
+    assert row["capped"] is True
+    assert row["ipc_width_mm"] == pytest.approx(2.35, abs=0.01)
+    assert row["applied_width_mm"] == pytest.approx(1.2)
+
+
+def test_human_override_still_beats_the_simulator(patched):
+    """Phase 4's veto rule, unchanged: the human wins and the record says so."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VIN_12V", "wide_trunk", 0.8, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"VIN_12V": 4.44},
+                            overrides={"VIN_12V": 0.6})
+    assert cap["route_widths"] == {"VIN_12V": 0.6}
+    row = out.current_widths["VIN_12V"]
+    assert row["overridden"] is True
+    assert row["applied_width_mm"] == pytest.approx(0.6)
+    assert any("the human veto wins" in w for w in out.warnings)
+
+
+def test_delta_t_is_honoured(patched):
+    """A hotter allowed rise buys a narrower track."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VOUT", "trunk", 0.3, "F.Cu")))
+    emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                      net_currents={"VOUT": 2.0}, current_delta_t_c=20.0)
+    hot = cap["route_widths"]["VOUT"]
+    emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                      net_currents={"VOUT": 2.0}, current_delta_t_c=10.0)
+    assert hot < cap["route_widths"]["VOUT"]
+
+
+def test_spec_copper_weight_reaches_the_sizing(patched):
+    """2 oz copper halves the width the same current asks for."""
+    import dataclasses
+
+    import skidl_layout as SL
+
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VOUT", "trunk", 0.3, "F.Cu")))
+    heavy = dataclasses.replace(SL.OSHPARK_2L, copper_weight_oz=2.0,
+                                name="2oz(test)")
+    emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                      fab_spec=heavy, net_currents={"VOUT": 2.0})
+    assert cap["route_widths"]["VOUT"] == pytest.approx(0.781 / 2, abs=0.01)
+
+
+def test_high_voltage_creepage_warning_is_report_only(patched):
+    """The loud path: nothing on the boost twin exceeds 30V, so unit-test it."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(
+        _intent("HV_RAIL", "wide_trunk", 0.8, "F.Cu"),
+        _intent("GND", "pour", 0.3, "F.Cu"),
+    ))
+    before = emit_power_copper(result, object(), [], str(tmp_path),
+                               board_layers=2, net_currents={"HV_RAIL": 0.5})
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"HV_RAIL": 0.5},
+                            net_voltages={"HV_RAIL": 400.0, "GND": 0.0})
+    warning = next(w for w in out.warnings if "creepage" in w)
+    assert "400.0V" in warning
+    # report-only: the copper is identical either way
+    assert out.width_map == before.width_map
+
+
+def test_creepage_warning_is_quiet_below_the_threshold(patched):
+    """The boost twin's own case: ~24V says nothing."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VOUT", "trunk", 0.3, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"VOUT": 2.0},
+                            net_voltages={"VOUT": 23.9})
+    assert not any("creepage" in w for w in out.warnings)
+
+
+def test_current_widths_reach_summary_and_to_dict(patched):
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VOUT", "trunk", 0.3, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"VOUT": 2.0, "SW": 4.44})
+    text = out.summary()
+    assert "current VOUT: 2.000A -> IPC 0.78mm, applied" in text
+    assert "current SW: 4.440A -> IPC 2.35mm, recorded only" in text
+    assert set(out.to_dict()["current_widths"]) == {"VOUT", "SW"}
+
+
+def test_zero_current_does_not_widen_or_appear(patched):
+    """Absent != zero (Phase 5's rule) -- a 0A net is simply not sized."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("VOUT", "trunk", 0.3, "F.Cu")))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            net_currents={"VOUT": 0.0})
+    assert cap["route_widths"] == {"VOUT": 0.3}
+    assert out.current_widths == {}

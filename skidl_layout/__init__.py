@@ -48,6 +48,10 @@ from .copper_post import (
     find_exposed_pad,
     plan_thermal_vias,
 )
+from .current_widths import (
+    ipc2221_width_mm,
+    widths_from_currents,
+)
 from .layout_quality import (
     ADVISORY_CODES,
     BLOCKING_CODES,

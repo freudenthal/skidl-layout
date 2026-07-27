@@ -36,6 +36,14 @@ _PLANE_STRATEGIES = {"plane", "pour"}
 _WIDE_STRATEGIES = {"wide_trunk", "trunk", "internal_rail"}
 # "fanout_only" and anything else: no special power treatment.
 
+#: Above this peak node voltage (Phase 6) a poured or current-widened net earns
+#: a report-only creepage/clearance warning. Nothing in this stack models
+#: creepage geometry; the warning exists so a board that needs it says so
+#: instead of passing silently. 30 V is the usual "beyond this, spacing tables
+#: start to matter" line (IPC-2221 Table 6-1 crosses into its first widened
+#: band there); it is a *notice* threshold, not a design rule.
+CREEPAGE_WARN_VOLTS = 30.0
+
 
 @dataclass
 class PowerCopperResult:
@@ -59,6 +67,12 @@ class PowerCopperResult:
     #: ``thermal_vias=False``. On the shipped ``oshpark-2l`` spec this is the
     #: **refusal**: ``refused=True``, ``count=0``, with the reason recorded.
     thermal_vias: dict | None = None
+    #: Per-net sizing record (Phase 6), one row per net a current was measured
+    #: for -- ``{net: {i_rms_a, ipc_width_mm, applied_width_mm, applied}}``.
+    #: A net with a current but no plan entry (the SW node, a signal net) is
+    #: recorded with ``applied=False``: measured, deliberately not widened.
+    #: Empty on the default path.
+    current_widths: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = ["Power copper emitted:"]
@@ -68,6 +82,17 @@ class PowerCopperResult:
             emitted = self.emitted_widths.get(net)
             emitted_str = f"{emitted:.2f}mm" if emitted is not None else "no trace"
             lines.append(f"  wide {net}: planned {planned:.2f}mm -> {emitted_str}")
+        # measured current -> the width the physics asks for (Phase 6)
+        for net in sorted(self.current_widths):
+            row = self.current_widths[net]
+            verdict = (
+                f"applied {row['applied_width_mm']:.2f}mm"
+                if row.get("applied") else "recorded only (not in the power plan)"
+            )
+            lines.append(
+                f"  current {net}: {row['i_rms_a']:.3f}A -> IPC "
+                f"{row['ipc_width_mm']:.2f}mm, {verdict}"
+            )
         thermal = self.thermal_vias or {}
         if thermal:
             if thermal.get("refused"):
@@ -108,6 +133,7 @@ class PowerCopperResult:
             "promoted_nets": list(self.promoted_nets),
             "zones_by_net": dict(self.zones_by_net),
             "thermal_vias": dict(self.thermal_vias) if self.thermal_vias else None,
+            "current_widths": {k: dict(v) for k, v in self.current_widths.items()},
         }
 
 
@@ -196,6 +222,10 @@ def emit_power_copper(
     thermal_vias: bool = False,
     thermal_via_pitch_mm: float | None = None,
     thermal_via_edge_margin_mm: float = 0.0,
+    net_currents: dict[str, float] | None = None,
+    current_delta_t_c: float = 10.0,
+    current_max_width_mm: float | None = None,
+    net_voltages: dict[str, float] | None = None,
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -276,6 +306,36 @@ def emit_power_copper(
     enforces). Should the array cost DRC, it is retried smaller and, failing
     that, dropped entirely -- a board with a DRC violation is never shipped in
     exchange for vias.
+
+    **Phase-6 knobs (all default OFF -> byte-identical).** ``net_currents`` is a
+    plain ``{net_name: amps_rms}`` dict -- **data, not a simulation
+    dependency**. This module never imports ``skidl.sim`` and never runs
+    ngspice; a measured dict from :func:`skidl_eda.measure_net_currents` and a
+    hand-written one are equally valid, and the caller owns the mapping from
+    whatever circuit was simulated onto this board's net names.
+
+    When given, each named net **that the power plan already carries a width
+    for** is widened to ``max(planned, ipc2221_width_mm(current))``
+    (:mod:`skidl_layout.current_widths`). Three properties are deliberate:
+
+    - **A current can only widen.** A narrower IPC width than the plan's is
+      ignored: the magic ladder's floor also encodes drop and impedance
+      judgement, not only heat.
+    - **A human ``overrides`` width still wins absolutely.** The merge runs
+      *before* the veto, so a deliberate demote beats the simulator -- Phase
+      4's rule, unchanged.
+    - **Only planned nets are widened.** A net with a measured current but no
+      plan entry -- the switch node, ground-as-a-plane, a signal net -- is
+      *recorded* in ``result.current_widths`` with ``applied=False`` and left
+      alone. Widening the SW node collides head-on with
+      ``SW_NODE_COPPER_AREA``, a trade no gate can referee yet.
+
+    ``current_delta_t_c`` (default 10 C) is the allowed temperature rise;
+    ``current_max_width_mm`` caps the result and **warns with both numbers**
+    when it bites, because a silent clamp is a lie with units. ``net_voltages``
+    (``{net: v_peak}``) drives one report-only warning: a poured or
+    current-widened net above :data:`CREEPAGE_WARN_VOLTS` says that creepage
+    and clearance are not modeled here. It never changes behavior.
     """
     from .writer import write_kicad_pcb
     from .fabspec import resolve_fab_spec
@@ -358,6 +418,24 @@ def emit_power_copper(
                 width = max(width, spec.min_track_mm)
             width_map[intent.net_name] = width
 
+    # Measured currents (Phase 6): the physics widens what the ladder guessed.
+    # Runs BEFORE the override veto so a human demote still beats the sim, and
+    # touches only nets the plan already carries -- see the docstring.
+    current_records: dict[str, dict] = {}
+    if net_currents:
+        current_records = _merge_current_widths(
+            width_map, net_currents, spec,
+            delta_t_c=current_delta_t_c,
+            max_width_mm=current_max_width_mm,
+            warnings=warnings,
+        )
+    _warn_high_voltage(
+        net_voltages,
+        poured=plane_nets,
+        widened=[n for n, r in current_records.items() if r["applied"]],
+        warnings=warnings,
+    )
+
     # Human vetoes: an override for any net wins (and can force a width on a net
     # the plan left at signal width). Overriding a plane net to a width demotes
     # it to a wide trace.
@@ -371,6 +449,18 @@ def emit_power_copper(
                 if net in promoted_nets:
                     promoted_nets.remove(net)
                 warnings.append(f"{net}: override width demoted plane -> wide trace")
+            # The veto is stronger than the sim; the record must say so rather
+            # than keep claiming a width the board will not carry.
+            record = current_records.get(net)
+            if record is not None and record["applied"]:
+                if abs(width - record["applied_width_mm"]) > 1e-9:
+                    warnings.append(
+                        f"{net}: override {width:.2f}mm overrode the "
+                        f"current-sized {record['applied_width_mm']:.2f}mm "
+                        f"(IPC {record['ipc_width_mm']:.2f}mm at "
+                        f"{record['i_rms_a']:.3f}A) -- the human veto wins")
+                record["applied_width_mm"] = width
+                record["overridden"] = True
 
     # Route: all nets except the plane nets (poured next), wide power at width.
     # A congested 2-layer board needs the SKILL's rip-up budget to close every
@@ -496,9 +586,99 @@ def emit_power_copper(
         promoted_nets=promoted_nets,
         zones_by_net=zones_by_net,
         thermal_vias=thermal_dict,
+        current_widths=current_records,
     )
     logger.info("Power copper: %s", outcome.summary().replace("\n", " | "))
     return outcome
+
+
+def _merge_current_widths(
+    width_map: dict,
+    net_currents: dict,
+    spec,
+    delta_t_c: float,
+    max_width_mm: float | None,
+    warnings: list,
+) -> dict:
+    """Widen ``width_map`` in place from measured currents; return the record.
+
+    The record is per **measured** net, not per widened net: a current that did
+    not reach the board is the interesting half of the story (the SW node), and
+    dropping it would make the result look as though nothing was measured.
+    """
+    from .current_widths import widths_from_currents
+
+    # Uncapped first, so the cap has an honest number to be reported against.
+    honest = widths_from_currents(net_currents, spec=spec, delta_t_c=delta_t_c)
+
+    records: dict[str, dict] = {}
+    for net, ipc_width in sorted(honest.items()):
+        applied_width = ipc_width
+        if max_width_mm is not None and ipc_width > float(max_width_mm) + 1e-9:
+            applied_width = float(max_width_mm)
+        planned = width_map.get(net)
+        row = {
+            "i_rms_a": float(net_currents[net]),
+            "ipc_width_mm": round(ipc_width, 4),
+            "planned_width_mm": round(planned, 4) if planned is not None else None,
+            "applied_width_mm": None,
+            "applied": False,
+            "capped": applied_width < ipc_width - 1e-9,
+            "delta_t_c": float(delta_t_c),
+        }
+        if planned is None:
+            # Measured, deliberately not widened: no plan entry to widen.
+            row["reason"] = (
+                "not in the power plan's width map (a plane, the switch node, "
+                "or a signal net) -- recorded, not widened")
+            records[net] = row
+            continue
+        merged = max(planned, applied_width)
+        width_map[net] = merged
+        row["applied_width_mm"] = round(merged, 4)
+        row["applied"] = True
+        if row["capped"]:
+            warnings.append(
+                f"{net}: current {row['i_rms_a']:.3f}A needs {ipc_width:.2f}mm "
+                f"(IPC-2221, dT {delta_t_c:g}C) but current_max_width_mm "
+                f"caps it at {float(max_width_mm):.2f}mm -- the track is "
+                "narrower than the physics asks for")
+        elif merged <= planned + 1e-9:
+            row["reason"] = (
+                f"IPC width {ipc_width:.3f}mm <= planned {planned:.3f}mm; "
+                "the plan's floor stands (a current may only widen)")
+        records[net] = row
+    return records
+
+
+def _warn_high_voltage(
+    net_voltages: dict | None,
+    poured: list,
+    widened: list,
+    warnings: list,
+) -> None:
+    """Report-only creepage notice for high-voltage copper (Phase 6).
+
+    Never changes behavior. Creepage/clearance geometry is out of scope for
+    this phase -- the point of the warning is that a board needing it stops
+    passing *silently*.
+    """
+    if not net_voltages:
+        return
+    interesting = set(poured) | set(widened)
+    for net in sorted(interesting):
+        v_peak = net_voltages.get(net)
+        if v_peak is None:
+            continue
+        try:
+            volts = abs(float(v_peak))
+        except (TypeError, ValueError):
+            continue
+        if volts > CREEPAGE_WARN_VOLTS:
+            warnings.append(
+                f"{net}: peak {volts:.1f}V exceeds {CREEPAGE_WARN_VOLTS:g}V -- "
+                "creepage/clearance spacing is NOT modeled by this stack "
+                "(report-only; check the fab's spacing table by hand)")
 
 
 def _apply_thermal_vias(
