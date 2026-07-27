@@ -12,6 +12,7 @@ from .constraints import (
 from .intent import PlacementIntentPlan, RepeatedChannelIntent
 from .placer import place_parts
 from .power import PowerTopology
+from .power_constraints import generate_power_constraints
 from .writer import PlacedPart
 
 # NOTE: ``scoring._net_ref_lists`` is imported LAZILY inside the alpha_relax
@@ -282,6 +283,73 @@ def _with_power_topology(
                 NearConstraint(ref=ref, target_ref=target_ref, distance_mm=10.0)
             )
     return powered
+
+
+def _footprint_by_ref(circuit) -> dict[str, str]:
+    """``ref -> footprint name``, the geometry key the power generator needs.
+
+    ``fp_bboxes`` / ``fp_geometries`` are keyed by *footprint*; a
+    :class:`~skidl_layout.power_roles.PowerStagePlan` knows only refs.
+    """
+    out: dict[str, str] = {}
+    for part in getattr(circuit, "parts", None) or []:
+        ref = getattr(part, "ref", None)
+        footprint = getattr(part, "footprint", None)
+        if ref is not None and footprint:
+            out[str(ref)] = str(footprint)
+    return out
+
+
+def _with_power_stage_plan(
+    constraints: LayoutConstraints,
+    intent_plan: PlacementIntentPlan | None,
+    power_stage_plan,
+    fp_bboxes: dict[str, tuple[float, float]],
+    fp_geometries: dict[str, object] | None,
+    footprint_by_ref: dict[str, str],
+) -> LayoutConstraints:
+    """Power-layout Phase 3 -- constraints synthesized from the stage plan.
+
+    What :func:`_with_power_topology` gestures at with name-regex chains and a
+    hardcoded 10 mm, done from the topology instead: the commutation loop's own
+    conduction hops, the feedback divider, and the small-signal stand-off, each
+    sized from the two parts' courtyard half-diagonals.
+
+    Generated constraints are appended to a **copy** -- they live on
+    ``candidate.constraints`` and never on the user's. That distinction is
+    load-bearing: ``engine._constraint_floorplan_refs(user_constraints)`` feeds
+    ``protected_refs``, so a generated near/far posing as user input would
+    freeze half the board out of the legalization passes. A user-declared pair
+    always wins over a generated one.
+    """
+    planned = _merge_inferred_edge_anchors(constraints, intent_plan)
+    if power_stage_plan is None or not getattr(power_stage_plan, "stages", None):
+        return planned
+
+    generated = generate_power_constraints(
+        power_stage_plan,
+        footprint_by_ref=footprint_by_ref,
+        fp_bboxes=fp_bboxes,
+        fp_geometries=fp_geometries,
+        outline=planned.outline,
+    )
+
+    existing_near = {(c.ref, c.target_ref) for c in planned.near}
+    for constraint in generated.near:
+        key = (constraint.ref, constraint.target_ref)
+        if key not in existing_near:
+            planned.near.append(constraint)
+            existing_near.add(key)
+
+    existing_far = {(c.ref, c.target_ref) for c in planned.far}
+    for constraint in generated.far:
+        key = (constraint.ref, constraint.target_ref)
+        if key not in existing_far:
+            planned.far.append(constraint)
+            existing_far.add(key)
+
+    planned.zones.extend(generated.zones)
+    return planned
 
 
 def _with_cluster_zone(
@@ -591,6 +659,7 @@ def generate_placement_candidates(
     fp_geometries: dict[str, object] | None = None,
     requested: list[str] | None = None,
     circuit=None,
+    power_stage_plan=None,
 ) -> list[PlacementCandidate]:
     """Generate deterministic placement candidates from available intent.
 
@@ -599,6 +668,13 @@ def generate_placement_candidates(
     Its semantics byte-match ``engine._filter_candidates``: de-dup keeping
     order, unknown names raise ``ValueError`` listing the strategies whose
     conditions hold for this circuit.
+
+    ``power_stage_plan`` (power-layout Phase 3) adds the ``power_stage_first``
+    strategy, whose constraints are synthesized from the plan by
+    :func:`~skidl_layout.power_constraints.generate_power_constraints`. It
+    defaults to ``None`` -- so every existing caller emits the historical
+    candidate set byte for byte -- and even when supplied it adds nothing on a
+    board whose plan has no stages.
     """
     seed_memo: list[tuple[LayoutConstraints, list[PlacedPart]]] = []
 
@@ -707,6 +783,31 @@ def generate_placement_candidates(
             )
         )
         post_transforms["alpha_relax"] = _alpha_post
+
+    # Power-layout Phase 3: the plan-derived strategy. Appended at the very tail
+    # -- after optional_backend_ready and alpha_relax -- so the historical
+    # emission order is untouched (hazard #5), and only when the plan actually
+    # found a switching stage, so a board with no converter emits the exact same
+    # candidate list whether the caller passed a plan or not.
+    if power_stage_plan is not None and getattr(power_stage_plan, "stages", None):
+        _fp_by_ref = _footprint_by_ref(circuit)
+        specs.append(
+            (
+                "power_stage_first",
+                lambda: _with_power_stage_plan(
+                    constraints,
+                    intent_plan,
+                    power_stage_plan,
+                    fp_bboxes,
+                    fp_geometries,
+                    _fp_by_ref,
+                ),
+                [
+                    "commutation loop, feedback divider and small-signal "
+                    "stand-off constrained from the power-stage plan"
+                ],
+            )
+        )
 
     # Validate + filter BEFORE building seeds. Semantics byte-match
     # engine._filter_candidates (plan hazard #6): available = names whose

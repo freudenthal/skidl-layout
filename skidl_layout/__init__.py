@@ -82,6 +82,10 @@ from .power import (
     infer_power_topology,
     plan_power_routes,
 )
+from .power_constraints import (
+    PowerConstraintSet,
+    generate_power_constraints,
+)
 from .power_metrics import (
     LoopGeometry,
     PowerMetrics,

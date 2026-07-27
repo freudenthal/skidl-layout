@@ -1643,11 +1643,38 @@ def _apply_power_loop_score(
     )
 
 
-def _resolve_power_score(power_score: bool | None) -> bool:
-    """Explicit kwarg > ``SKIDL_LAYOUT_POWER_SCORE`` > default OFF."""
+def _resolve_power_score(power_score: bool | None, implied_by: bool = False) -> bool:
+    """Explicit kwarg > ``SKIDL_LAYOUT_POWER_SCORE`` > ``implied_by`` > OFF.
+
+    ``implied_by`` is Phase 3's coupling and defaults False, so every existing
+    caller resolves exactly as before. It is set when ``power_constraints`` is
+    on, because MEASURED: generating the ``power_stage_first`` candidate without
+    the power term in the selection key changed nothing at all on the boost
+    (penalty 39.93 -> 39.93 derived, 44.62 -> 44.62 shared). The candidate is
+    built and refined; the ordinary score simply has no opinion about
+    commutation loops, so it is never the one that wins. With the term on, the
+    same candidate wins by 24.7 penalty points. An explicit
+    ``power_score=False`` still means False -- the caller who wants to watch the
+    constraints lose can.
+    """
     if power_score is not None:
         return bool(power_score)
     env = os.environ.get("SKIDL_LAYOUT_POWER_SCORE")
+    if env is not None:
+        return env.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(implied_by)
+
+
+def _resolve_power_constraints(power_constraints: bool | None) -> bool:
+    """Explicit kwarg > ``SKIDL_LAYOUT_POWER_CONSTRAINTS`` > default OFF.
+
+    Power-layout Phase 3's knob, deliberately the same three-line shape as
+    :func:`_resolve_power_score` above: two opt-ins that resolve differently
+    would be a bug waiting for whoever reads only one of them.
+    """
+    if power_constraints is not None:
+        return bool(power_constraints)
+    env = os.environ.get("SKIDL_LAYOUT_POWER_CONSTRAINTS")
     if env is None:
         return False
     return env.strip().lower() not in ("", "0", "false", "no", "off")
@@ -4211,6 +4238,7 @@ def plan_layout(
     progress=None,
     strip_sim_only: bool = False,
     power_score: bool | None = None,
+    power_constraints: bool | None = None,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
 
@@ -4241,6 +4269,19 @@ def plan_layout(
     term existed. ``SKIDL_LAYOUT_POWER_SCORE`` is the env default; an explicit
     kwarg wins. It only bites on a board that classifies as a switching
     converter — on everything else the term returns immediately.
+
+    ``power_constraints`` (power-layout Phase 3) adds one extra placement
+    candidate, ``power_stage_first``, whose ``Near``/``Far`` constraints are
+    **synthesized from the power-stage plan** — the commutation loop's own
+    conduction hops, the feedback divider, and a small-signal stand-off from the
+    switch node, each sized from the two parts' courtyard half-diagonals rather
+    than a flat millimetre. **Default OFF**, and off it is a true no-op: the
+    netlist is not even classified. Turning it on also turns ``power_score`` on
+    unless that is set explicitly — MEASURED: a generated candidate the
+    selection key has no opinion about is built, refined, and never chosen.
+    ``SKIDL_LAYOUT_POWER_CONSTRAINTS`` is the env default; an explicit kwarg
+    wins. A board whose plan finds no switching stage emits the historical
+    candidate set unchanged in either flag state.
 
     ``parallel_workers`` controls refining the unique candidates' pass-1 trio
     (orientation/decap/placement) and their post-anchor finalize concurrently in
@@ -4327,7 +4368,17 @@ def plan_layout(
         fp_bboxes=resolved_bboxes,
     )
     power_topology = infer_power_topology(circuit)
-    resolved_power_score = _resolve_power_score(power_score)
+    # Phase 3, opt-in: the plan the candidate generator synthesizes constraints
+    # from. Classified HERE rather than off `ctx` because `ctx` is built after
+    # the candidates are (see below), and paid for only when the flag is on
+    # (~3 ms on 49 parts) so the default path is a true no-op.
+    resolved_power_constraints = _resolve_power_constraints(power_constraints)
+    resolved_power_score = _resolve_power_score(
+        power_score, implied_by=resolved_power_constraints
+    )
+    candidate_power_plan = (
+        classify_power_roles(circuit) if resolved_power_constraints else None
+    )
     resolved_candidate_names = _resolve_candidate_names(candidate_names)
     candidates = generate_placement_candidates(
         groups,
@@ -4338,6 +4389,7 @@ def plan_layout(
         fp_geometries=fp_geometries,
         requested=resolved_candidate_names,
         circuit=circuit,
+        power_stage_plan=candidate_power_plan,
     )
 
     ctx = LayoutContext.from_circuit(circuit)
