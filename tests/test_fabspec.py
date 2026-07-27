@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import pytest
@@ -155,6 +156,91 @@ def test_fab_check_no_outline_skips_size(tmp_path):
     res = fab_check(str(p), OSHPARK_2L, run_drc=False)
     assert "board_size" not in res.checked
     assert any("no Edge.Cuts" in n for n in res.notes)
+
+
+# -- via_in_pad (power-layout Phase 5, WS-4) -------------------------------
+# Round 1's capability block checked only blind/buried, so a thermal via array
+# under an exposed pad -- which emit_power_copper(thermal_vias=True) can now
+# produce -- would have been graded clean on a spec that forbids it.
+
+_PAD_FOOTPRINT = (
+    '  (footprint "QFN"\n'
+    '    (at 20 15{rot})\n'
+    '    (property "Reference" "U1")\n'
+    '    (pad "9" smd rect (at 0 0{rot}) (size 2.0 3.0)\n'
+    '      (layers "F.Cu" "F.Mask") (net 1 "V5"))\n'
+    '    (pad "9" smd rect (at 0 0{rot}) (size 6.0 6.0)\n'
+    '      (layers "F.Paste") (net 1 "V5"))\n'
+    '  )\n'
+)
+
+
+def test_fab_check_flags_a_via_inside_an_smd_pad(tmp_path):
+    body = _PAD_FOOTPRINT.format(rot="") + (
+        '  (via (at 20.4 15.6) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))\n'
+    )
+    res = fab_check(_write(tmp_path, body), OSHPARK_2L, run_drc=False)
+    hits = [v for v in res.violations if v.rule == "via_in_pad"]
+    assert len(hits) == 1
+    assert "U1.9" in hits[0].obj
+    assert "via_in_pad" in res.checked
+
+
+def test_fab_check_clears_a_via_outside_every_pad(tmp_path):
+    body = _PAD_FOOTPRINT.format(rot="") + (
+        '  (via (at 24 15) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))\n'
+    )
+    res = fab_check(_write(tmp_path, body), OSHPARK_2L, run_drc=False)
+    assert not [v for v in res.violations if v.rule == "via_in_pad"]
+
+
+def test_fab_check_skips_the_rule_when_the_fab_allows_via_in_pad(tmp_path):
+    body = _PAD_FOOTPRINT.format(rot="") + (
+        '  (via (at 20.4 15.6) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))\n'
+    )
+    permissive = dataclasses.replace(OSHPARK_2L, via_in_pad=True, name="permissive")
+    res = fab_check(_write(tmp_path, body), permissive, run_drc=False)
+    assert not [v for v in res.violations if v.rule == "via_in_pad"]
+    assert "via_in_pad" not in res.checked
+
+
+def test_fab_check_via_in_pad_honours_pad_rotation(tmp_path):
+    # The pad is 2.0 wide x 3.0 tall in its own frame, so unrotated it reaches
+    # 1.0 mm along board X and 1.5 mm along board Y. At 90 degrees those swap.
+    # Both vias sit 1.4 mm from the pad centre -- one along X, one along Y --
+    # so exactly one is inside, and which one flips with the rotation.
+    vias = (
+        '  (via (at 21.4 15) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))\n'
+        '  (via (at 20 16.4) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))\n'
+    )
+    turned = fab_check(_write(tmp_path, _PAD_FOOTPRINT.format(rot=" 90") + vias),
+                       OSHPARK_2L, run_drc=False)
+    hits = [v for v in turned.violations if v.rule == "via_in_pad"]
+    assert len(hits) == 1
+    assert "21.40" in hits[0].obj
+
+    upright = fab_check(_write(tmp_path, _PAD_FOOTPRINT.format(rot="") + vias),
+                        OSHPARK_2L, run_drc=False)
+    hits = [v for v in upright.violations if v.rule == "via_in_pad"]
+    assert len(hits) == 1
+    assert "16.40" in hits[0].obj
+
+
+def test_fab_check_via_in_pad_ignores_paste_only_apertures(tmp_path):
+    # The 6x6 F.Paste aperture would swallow this via; it is not copper.
+    body = _PAD_FOOTPRINT.format(rot="") + (
+        '  (via (at 22.5 17.5) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))\n'
+    )
+    res = fab_check(_write(tmp_path, body), OSHPARK_2L, run_drc=False)
+    assert not [v for v in res.violations if v.rule == "via_in_pad"]
+
+
+def test_fab_check_via_in_pad_is_reported_once_per_via(tmp_path):
+    body = _PAD_FOOTPRINT.format(rot="") + (
+        '  (via (at 20 15) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))\n'
+    )
+    res = fab_check(_write(tmp_path, body), OSHPARK_2L, run_drc=False)
+    assert len([v for v in res.violations if v.rule == "via_in_pad"]) == 1
 
 
 def test_fab_check_result_to_dict_shape(tmp_path):

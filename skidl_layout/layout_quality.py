@@ -75,6 +75,7 @@ ADVISORY_CODES = frozenset({
     "OUTLINE_UNDERUSED",
     "ROUTE_BROKEN_NET",
     "SENSE_RETURN_LENGTH",
+    "SW_NODE_COPPER_AREA",
     "SW_NODE_SPAN",
     "UNUSED_OUTLINE_REGION",
 })
@@ -172,10 +173,37 @@ SMALL_SIGNAL_SEPARATION_FLOOR_MM = 14.0
 #: the switch-node parts orders the corpus A 15.21 < A' 16.00 < B 16.62, i.e.
 #: the hand floorplan is the *worst*, while the routed SW copper area it is
 #: supposed to proxy for orders B 4.65 < A 5.75 < A' 7.53 -- exactly inverted.
-#: Phase 2 plan bail-out 4 applies: the number ships, the code does not. The
-#: honest measurement is ``SW_NODE_COPPER_AREA`` on a routed board (Phase 5).
+#: Phase 2 plan bail-out 4 applies: the number ships, the code does not.
+#: **The honest measurement now EXISTS and ships**: ``SW_NODE_COPPER_AREA``
+#: below, emitted by :func:`routed_copper_issues` off a routed board. Span stays
+#: ``None`` because it is still wrong, not because it is still unanswered.
 #: Set a float to enable it anyway.
 SW_NODE_SPAN_MM_THRESHOLD = None
+
+#: ``SW_NODE_COPPER_AREA``, in **mm2** -- ``sum(length x width)`` over the
+#: switch node's routed track copper (Phase 5, WS-2). Absolute for the same
+#: reason ``FB_NODE_LENGTH`` is: the switch node is the board's main radiator
+#: and does not get to radiate more because the board is bigger, so unlike
+#: ``HOT_LOOP_AREA`` this needs no size normalizer.
+#:
+#: **This code can only fire on a ROUTED board**, so it is NOT emitted by
+#: :func:`layout_quality` -- placement has no copper to measure. Call
+#: :func:`routed_copper_issues` from the copper stage instead.
+#:
+#: MEASURED on the three Figure-11 variants' routed boards, and the ordering is
+#: the right way round: **B 4.654 < A 5.754 < A' 7.530** (hand floorplan best),
+#: versus avalanche's auto-placed flyback at **11.632** (a 38.8 mm switch node).
+#:
+#: 6.5 clears B by **40 %** -- the same headroom ``HOT_LOOP_AREA`` gives it
+#: (1.20 vs 0.82, 46 %) -- and fires on A' and avalanche. It deliberately does
+#: **not** fire on A (5.754), which sits only 24 % above B: there is no number
+#: that both flags A and keeps this family's "quiet tail flag" margin, and a
+#: trip point 12 % above the best floorplan anyone has drawn would be noise on
+#: any real board. A is not missed in practice -- it already trips
+#: ``HOT_LOOP_AREA``, ``FB_NODE_LENGTH`` and ``SENSE_RETURN_LENGTH``. Lower this
+#: toward 5.2 only with evidence that 5-6 mm2 of switch-node copper is
+#: measurably bad, rather than merely worse. Set ``None`` to disable.
+SW_NODE_COPPER_AREA_MM2_THRESHOLD = 6.5
 
 #: ``BULK_CAP_DISTANCE`` -- **DISABLED (None), deliberately.** Same bail-out.
 #: MEASURED: A 7.61 < A' 9.02 < B 15.13, again inverting the known ranking. The
@@ -681,4 +709,87 @@ def layout_quality(
             ),
         ))
 
+    return LayoutQualityResult(issues=issues)
+
+
+# --------------------------------------------------------------------------
+# Routed-board copper (Phase 5, WS-2)
+# --------------------------------------------------------------------------
+
+def routed_copper_issues(
+    pcb_path,
+    power_stage_plan,
+    sw_node_copper_threshold_mm2=SW_NODE_COPPER_AREA_MM2_THRESHOLD,
+    copper=None,
+) -> LayoutQualityResult:
+    """``SW_NODE_COPPER_AREA`` off a **routed** board -- the honest switch-node metric.
+
+    Separate from :func:`layout_quality` on purpose. Every other power code in
+    this module reads :attr:`LayoutResult.power_metrics`, which is computed from
+    a *placement*; this one needs copper that only exists after routing, so it
+    cannot live on the placement-time path and is called by the copper stage
+    instead::
+
+        plan = result.power_stage_plan
+        quality = routed_copper_issues(power_copper_result.routed_pcb_path, plan)
+
+    Why it exists: Phase 2's ``SW_NODE_SPAN`` tried to *predict* this quantity
+    from part positions and ranked the known-good floorplan worst (see
+    :data:`SW_NODE_SPAN_MM_THRESHOLD`). Rather than sharpen the proxy, Phase 5
+    measures the thing itself.
+
+    Args:
+        pcb_path: a routed ``.kicad_pcb``. Ignored when ``copper`` is supplied.
+        power_stage_plan: a ``PowerStagePlan`` (or its ``to_dict()``) -- the
+            switch-node **nets** are read from it, never guessed from names.
+        sw_node_copper_threshold_mm2: trip point in mm2; ``None`` disables.
+        copper: optionally a pre-read ``{net: NetCopper}`` from
+            :func:`skidl_layout.read_routed_copper`, so a caller that already
+            has it does not re-parse the board.
+
+    Returns:
+        A :class:`LayoutQualityResult`. Advisory only -- ``.ok`` stays ``True``.
+        An unrouted switch node (no segments on the net, e.g. because it was
+        poured instead) emits nothing: absent copper is not zero copper.
+    """
+    payload = (power_stage_plan.to_dict()
+               if hasattr(power_stage_plan, "to_dict") else power_stage_plan) or {}
+    stages = payload.get("stages") or []
+    if not stages or sw_node_copper_threshold_mm2 is None:
+        return LayoutQualityResult(issues=[])
+
+    if copper is None:
+        from .copper_fill import read_routed_copper
+
+        wanted = {net for stage in stages
+                  for net in (stage.get("switch_node_nets") or [])}
+        copper = read_routed_copper(pcb_path, nets=wanted or None)
+
+    issues: list = []
+    for stage in stages:
+        who = stage.get("controller_ref") or "power stage"
+        for net in stage.get("switch_node_nets") or []:
+            row = copper.get(net)
+            if row is None:
+                continue
+            area = float(getattr(row, "copper_area_mm2", 0.0))
+            if area < sw_node_copper_threshold_mm2:
+                continue
+            issues.append(QualityIssue(
+                "SW_NODE_COPPER_AREA", _WARNING,
+                f"{who}: the switch node {net} carries {area:.2f}mm2 of "
+                f"routed copper",
+                evidence={"controller": stage.get("controller_ref"),
+                          "switch_node_net": net,
+                          "copper_area_mm2": area,
+                          "max_width_mm": getattr(row, "max_width_mm", None),
+                          "length_mm": getattr(row, "length_mm", None),
+                          "segments": getattr(row, "segments", None),
+                          "threshold_mm2": sw_node_copper_threshold_mm2},
+                recommendation=(
+                    "Shorten the switch node rather than narrowing it: this is "
+                    "the board's main radiating surface, and its area is set by "
+                    "how far apart the switch, magnetics and rectifier sit."
+                ),
+            ))
     return LayoutQualityResult(issues=issues)

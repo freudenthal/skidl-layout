@@ -55,6 +55,10 @@ class PowerCopperResult:
     #: Zones actually written per net, read back off the final board. Empty
     #: when nothing was poured.
     zones_by_net: dict[str, int] = field(default_factory=dict)
+    #: The thermal-via array's outcome (Phase 5), or ``None`` when
+    #: ``thermal_vias=False``. On the shipped ``oshpark-2l`` spec this is the
+    #: **refusal**: ``refused=True``, ``count=0``, with the reason recorded.
+    thermal_vias: dict | None = None
 
     def summary(self) -> str:
         lines = ["Power copper emitted:"]
@@ -64,6 +68,15 @@ class PowerCopperResult:
             emitted = self.emitted_widths.get(net)
             emitted_str = f"{emitted:.2f}mm" if emitted is not None else "no trace"
             lines.append(f"  wide {net}: planned {planned:.2f}mm -> {emitted_str}")
+        thermal = self.thermal_vias or {}
+        if thermal:
+            if thermal.get("refused"):
+                lines.append(f"  thermal vias: REFUSED -- {thermal.get('reason')}")
+            else:
+                lines.append(
+                    f"  thermal vias: {thermal.get('count', 0)} on "
+                    f"{thermal.get('net')} ({thermal.get('reason')})"
+                )
         for net, layer in zip(self.plane_nets, self.plane_layers):
             total = self.plane_summary.get("zone_count", 0)
             # Per-net when we could read it back, so a promotion that poured
@@ -94,6 +107,7 @@ class PowerCopperResult:
             "warnings": list(self.warnings),
             "promoted_nets": list(self.promoted_nets),
             "zones_by_net": dict(self.zones_by_net),
+            "thermal_vias": dict(self.thermal_vias) if self.thermal_vias else None,
         }
 
 
@@ -179,6 +193,9 @@ def emit_power_copper(
     route_promoted: bool = True,
     zone_clearance: float | None = None,
     min_thickness: float | None = None,
+    thermal_vias: bool = False,
+    thermal_via_pitch_mm: float | None = None,
+    thermal_via_edge_margin_mm: float = 0.0,
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -238,6 +255,27 @@ def emit_power_copper(
       is promoted.
     - ``zone_clearance`` / ``min_thickness``: forwarded to ``pour_planes``
       (``None`` emits no flag, so KRT's own pour defaults stand).
+
+    **Phase-5 knob (default OFF -> byte-identical).** ``thermal_vias`` stamps a
+    via array into the controller's exposed pad *after* the pour and *before*
+    the board is graded, so the graded board is the final one. The pad is found
+    topologically (the ``PowerStagePlan``'s ``controller_ref`` +
+    ``ground_net``, then that footprint's largest pad on ground) -- never by
+    reference or footprint name.
+
+    ⚠ **A thermal via array under an exposed pad IS via-in-pad**, and the
+    shipped ``oshpark-2l`` spec declares ``via_in_pad=False``. On that spec the
+    array **refuses**: nothing is emitted, a warning names the capability, and
+    ``result.thermal_vias["refused"]`` is True. That is the default outcome for
+    every board this stack currently ships, and :func:`skidl_layout.fab_check`
+    now grades the rule so a board carrying an array cannot pass a spec that
+    forbids one. ``thermal_via_pitch_mm`` overrides the default
+    ``via_size + clearance`` pitch; ``thermal_via_edge_margin_mm`` demands that
+    much pad copper outside each via's own copper (default 0.0 -- "fully inside
+    the pad"; the annular ring is a via-internal rule the spec already
+    enforces). Should the array cost DRC, it is retried smaller and, failing
+    that, dropped entirely -- a board with a DRC violation is never shipped in
+    exchange for vias.
     """
     from .writer import write_kicad_pcb
     from .fabspec import resolve_fab_spec
@@ -429,6 +467,21 @@ def emit_power_copper(
 
     # Grade the final board (zone-aware connectivity) and attach it.
     feedback = krt.check_board(final_pcb, krt_dir=krt_dir, timeout_s=timeout_s)
+
+    # -- thermal vias under the exposed pad (Phase 5, WS-3) ------------------
+    # Runs AFTER the pour and BEFORE the graded board is settled, so what gets
+    # graded is what ships. The refusal path costs nothing: it never touches the
+    # board, so `feedback` above stands unchanged.
+    thermal_dict = None
+    if thermal_vias:
+        final_pcb, feedback, thermal_dict, thermal_warnings = _apply_thermal_vias(
+            final_pcb, workdir_abs, result, spec, feedback,
+            pitch_mm=thermal_via_pitch_mm,
+            edge_margin_mm=thermal_via_edge_margin_mm,
+            krt_dir=krt_dir, timeout_s=timeout_s,
+        )
+        warnings.extend(thermal_warnings)
+
     result.routability = feedback
 
     outcome = PowerCopperResult(
@@ -442,6 +495,127 @@ def emit_power_copper(
         warnings=warnings,
         promoted_nets=promoted_nets,
         zones_by_net=zones_by_net,
+        thermal_vias=thermal_dict,
     )
     logger.info("Power copper: %s", outcome.summary().replace("\n", " | "))
     return outcome
+
+
+def _apply_thermal_vias(
+    final_pcb: str,
+    workdir_abs: str,
+    result,
+    spec,
+    feedback,
+    pitch_mm: float | None,
+    edge_margin_mm: float,
+    krt_dir: str | None,
+    timeout_s: int,
+):
+    """Stamp the exposed-pad via array, keeping only a DRC-clean board.
+
+    Returns ``(board_path, feedback, thermal_dict, warnings)``. ``feedback`` is
+    re-graded only when vias were actually written; on the refusal path the
+    caller's existing grading stands and no KRT run is spent.
+
+    Bail-out 2 of the Phase-5 plan is implemented here: if the full array costs
+    a DRC violation the array is retried smaller, and if nothing is clean the
+    **pre-splice board is kept**. A mechanism that correctly declines is a
+    result; a board with a DRC violation is not.
+    """
+    from .copper_post import plan_thermal_vias, splice_vias
+
+    warnings: list[str] = []
+    stage_plan = getattr(result, "power_stage_plan", None)
+    stages = list(getattr(stage_plan, "stages", None) or [])
+    if not stages:
+        warnings.append(
+            "thermal_vias requested but no power stage was classified; "
+            "nothing to place an array under")
+        return final_pcb, feedback, None, warnings
+
+    stage = stages[0]
+    controller = getattr(stage, "controller_ref", None)
+    ground = getattr(stage, "ground_net", None)
+    if not controller or not ground:
+        warnings.append(
+            "thermal_vias requested but the power stage names no controller / "
+            "ground net; nothing to place an array under")
+        return final_pcb, feedback, None, warnings
+
+    plan = plan_thermal_vias(
+        final_pcb, controller, ground, spec,
+        pitch_mm=pitch_mm, edge_margin_mm=edge_margin_mm)
+    if not plan.positions:
+        # Refusal (the shipped oshpark-2l path) or "no pad" -- both are
+        # outcomes, not failures. Say so; never comply silently.
+        warnings.append(f"thermal vias not emitted: {plan.reason}")
+        return final_pcb, feedback, plan.to_dict(), warnings
+
+    baseline_drc = int(getattr(feedback, "drc_violation_count", 0) or 0)
+    cols, rows = plan.shape
+    attempts = _shrink_ladder(cols, rows)
+    for shape in attempts:
+        candidate_plan = plan if shape == (cols, rows) else plan_thermal_vias(
+            final_pcb, controller, ground, spec, pitch_mm=pitch_mm,
+            edge_margin_mm=edge_margin_mm, max_shape=shape)
+        if not candidate_plan.positions:
+            continue
+        candidate = os.path.join(workdir_abs, "power_copper_thermal.kicad_pcb")
+        splice_vias(final_pcb, candidate, candidate_plan)
+        _copy_sibling_project(final_pcb, candidate)
+        graded = krt.check_board(candidate, krt_dir=krt_dir, timeout_s=timeout_s)
+        graded_drc = int(getattr(graded, "drc_violation_count", 0) or 0)
+        worse_conn = (graded.unrouted_count > feedback.unrouted_count)
+        if graded_drc <= baseline_drc and not worse_conn:
+            if shape != (cols, rows):
+                warnings.append(
+                    f"thermal via array shrunk {cols}x{rows} -> "
+                    f"{shape[0]}x{shape[1]} to stay DRC-clean")
+            return candidate, graded, candidate_plan.to_dict(), warnings
+        warnings.append(
+            f"thermal via array {shape[0]}x{shape[1]} rejected: DRC "
+            f"{baseline_drc} -> {graded_drc}"
+            + (f", unrouted {feedback.unrouted_count} -> {graded.unrouted_count}"
+               if worse_conn else ""))
+
+    dropped = dict(plan.to_dict())
+    dropped.update(count=0, positions=[], shape=[0, 0],
+                   reason="every array size cost DRC or connectivity; dropped")
+    warnings.append(
+        "thermal vias dropped entirely: no array size was DRC-clean "
+        "(the pre-splice board ships unchanged)")
+    return final_pcb, feedback, dropped, warnings
+
+
+def _shrink_ladder(cols: int, rows: int) -> list:
+    """Array shapes to try, largest first, down to a single via."""
+    shapes = []
+    c, r = cols, rows
+    while c >= 1 and r >= 1:
+        shapes.append((c, r))
+        if c == 1 and r == 1:
+            break
+        # Shrink the longer axis first so the array stays as square as it can.
+        if c >= r:
+            c -= 1
+        else:
+            r -= 1
+    return shapes
+
+
+def _copy_sibling_project(src_pcb: str, dst_pcb: str) -> None:
+    """Carry a board's sibling ``.kicad_pro`` across a post-process copy.
+
+    KRT's own note: a bare board loses the DRC floor its copper was routed to,
+    and the next tool resolves stock (looser) netclasses instead -- which grades
+    correct sub-floor copper as phantom clearance violations.
+    """
+    import shutil
+
+    sibling = os.path.splitext(src_pcb)[0] + ".kicad_pro"
+    if os.path.isfile(sibling):
+        try:
+            shutil.copyfile(sibling, os.path.splitext(dst_pcb)[0] + ".kicad_pro")
+        except OSError:  # pragma: no cover - best effort
+            pass

@@ -36,12 +36,25 @@ from .fabspec import (
     resolve_fab_spec,
     write_krt_fab_overrides,
 )
+from .copper_fill import (
+    FilledBoard,
+    NetCopper,
+    fill_board,
+    find_kicad_python,
+    read_routed_copper,
+)
+from .copper_post import (
+    ThermalViaPlan,
+    find_exposed_pad,
+    plan_thermal_vias,
+)
 from .layout_quality import (
     ADVISORY_CODES,
     BLOCKING_CODES,
     LayoutQualityResult,
     QualityIssue,
     layout_quality,
+    routed_copper_issues,
 )
 from .context import LayoutContext
 from .engine import (

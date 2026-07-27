@@ -49,10 +49,12 @@ def patched(monkeypatch, tmp_path):
             fh.write('(net 0 "")\n')
 
     def fake_route(pcb_path, workdir, krt_dir=None, nets=None, timeout_s=900,
-                   power_net_widths=None, out_path=None, route_extra_args=None):
+                   power_net_widths=None, out_path=None, route_extra_args=None,
+                   **design_rules):
         cap["route_nets"] = nets
         cap["route_widths"] = power_net_widths
         cap["route_extra_args"] = route_extra_args
+        cap["route_design_rules"] = design_rules
         # emit a routed board with a wide VIN track for the honesty check
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write('(net 1 "VIN_12V")\n'
@@ -381,3 +383,153 @@ def test_plane_layer_for_promoted():
     # 4+ layers still honour the plan's own layer, promoted or not
     inner = _intent("VOUT", "plane", 0.3, "In2.Cu")
     assert _plane_layer_for(inner, 4, promoted=True) == "In2.Cu"
+
+
+# --------------------------------------------------------------------------
+# Thermal vias under the exposed pad (power-layout Phase 5, WS-3)
+# --------------------------------------------------------------------------
+
+import dataclasses  # noqa: E402
+
+from skidl_layout import OSHPARK_2L  # noqa: E402
+
+_VIA_IN_PAD = dataclasses.replace(OSHPARK_2L, via_in_pad=True, name="test-vip")
+
+
+@dataclass
+class _FakeStage:
+    controller_ref: str = "U1"
+    ground_net: str = "GND"
+
+
+@dataclass
+class _FakeStagePlan:
+    stages: list = field(default_factory=lambda: [_FakeStage()])
+
+
+def _thermal_result():
+    result = _FakeResult(_plan(_intent("GND", "pour", 0.3, "F.Cu")))
+    result.power_stage_plan = _FakeStagePlan()
+    return result
+
+
+def test_thermal_vias_default_off_leaves_the_board_alone(patched):
+    cap, tmp_path = patched
+    out = emit_power_copper(_thermal_result(), object(), [], str(tmp_path),
+                            board_layers=2, fab_spec=_VIA_IN_PAD)
+    assert out.thermal_vias is None
+    assert "thermal" not in out.summary().lower()
+    assert "thermal_vias" in out.to_dict()
+    assert out.to_dict()["thermal_vias"] is None
+
+
+def test_thermal_vias_refuse_on_the_shipped_spec(patched, monkeypatch):
+    cap, tmp_path = patched
+    calls = []
+    monkeypatch.setattr(
+        power_copper, "_apply_thermal_vias",
+        lambda *a, **k: calls.append(a) or (a[0], a[4], None, []))
+    emit_power_copper(_thermal_result(), object(), [], str(tmp_path),
+                      board_layers=2, fab_spec="oshpark-2l", thermal_vias=True)
+    # The spec the post-process is handed is the resolved one, so its
+    # via_in_pad=False is what drives the refusal.
+    assert calls and calls[0][3] is OSHPARK_2L
+
+
+def test_thermal_vias_refusal_is_recorded_not_silent(patched, monkeypatch):
+    cap, tmp_path = patched
+
+    def fake_plan(pcb, controller, ground, spec, **kw):
+        from skidl_layout.copper_post import ThermalViaPlan
+        return ThermalViaPlan(net=ground, refused=True,
+                              reason="spec 'oshpark-2l' declares via_in_pad=False")
+
+    monkeypatch.setattr("skidl_layout.copper_post.plan_thermal_vias", fake_plan)
+    out = emit_power_copper(_thermal_result(), object(), [], str(tmp_path),
+                            board_layers=2, fab_spec="oshpark-2l",
+                            thermal_vias=True)
+    assert out.thermal_vias["refused"] is True
+    assert out.thermal_vias["count"] == 0
+    assert any("thermal vias not emitted" in w for w in out.warnings)
+    assert "REFUSED" in out.summary()
+
+
+def test_thermal_vias_without_a_power_stage_warns(patched):
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(_intent("GND", "pour", 0.3, "F.Cu")))
+    result.power_stage_plan = None
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            fab_spec=_VIA_IN_PAD, thermal_vias=True)
+    assert out.thermal_vias is None
+    assert any("no power stage" in w for w in out.warnings)
+
+
+def test_thermal_vias_accepted_when_drc_does_not_worsen(patched, monkeypatch):
+    cap, tmp_path = patched
+    from skidl_layout.copper_post import ThermalViaPlan
+
+    plan = ThermalViaPlan(net="GND", shape=(2, 2), pitch_mm=0.85,
+                          positions=[(0, 0), (1, 0), (0, 1), (1, 1)],
+                          pad={"ref": "U1", "number": "11", "w": 1.68, "h": 1.88},
+                          reason="2x2 array")
+    monkeypatch.setattr("skidl_layout.copper_post.plan_thermal_vias",
+                        lambda *a, **k: plan)
+    spliced = {}
+
+    def fake_splice(src, dst, p):
+        spliced["dst"] = dst
+        with open(dst, "w", encoding="utf-8") as fh:
+            fh.write("(spliced)\n")
+        return len(p.positions)
+
+    monkeypatch.setattr("skidl_layout.copper_post.splice_vias", fake_splice)
+    out = emit_power_copper(_thermal_result(), object(), [], str(tmp_path),
+                            board_layers=2, fab_spec=_VIA_IN_PAD,
+                            thermal_vias=True)
+    assert out.thermal_vias["count"] == 4
+    # The board that ships is the spliced one -- and it is what got graded.
+    assert out.routed_pcb_path == spliced["dst"]
+    assert cap["checked"] == spliced["dst"]
+
+
+def test_thermal_vias_are_dropped_when_every_size_costs_drc(patched, monkeypatch):
+    cap, tmp_path = patched
+    from skidl_layout.copper_post import ThermalViaPlan
+
+    def fake_plan(pcb, controller, ground, spec, pitch_mm=None,
+                  edge_margin_mm=0.0, max_shape=None):
+        cols, rows = max_shape or (2, 2)
+        return ThermalViaPlan(net=ground, shape=(cols, rows), pitch_mm=0.85,
+                              positions=[(0, 0)] * (cols * rows), reason="a")
+
+    monkeypatch.setattr("skidl_layout.copper_post.plan_thermal_vias", fake_plan)
+    monkeypatch.setattr("skidl_layout.copper_post.splice_vias",
+                        lambda src, dst, p: open(dst, "w").write("(x)") and 0)
+
+    dirty = RoutabilityFeedback(total_nets=3, unrouted_count=0,
+                                drc_violation_count=7, source="krt")
+    clean = RoutabilityFeedback(total_nets=3, unrouted_count=0, source="krt")
+    seen = {"n": 0}
+
+    def fake_check(pcb_path, krt_dir=None, timeout_s=900):
+        seen["n"] += 1
+        cap["checked"] = pcb_path
+        return clean if seen["n"] == 1 else dirty
+
+    monkeypatch.setattr(power_copper.krt, "check_board", fake_check)
+    out = emit_power_copper(_thermal_result(), object(), [], str(tmp_path),
+                            board_layers=2, fab_spec=_VIA_IN_PAD,
+                            thermal_vias=True)
+    # A board with a DRC violation is never shipped in exchange for vias.
+    assert out.thermal_vias["count"] == 0
+    assert out.feedback.drc_violation_count == 0
+    assert any("dropped entirely" in w for w in out.warnings)
+    assert out.routed_pcb_path.endswith("power_copper.kicad_pcb")
+
+
+def test_shrink_ladder_walks_down_to_one_via():
+    ladder = power_copper._shrink_ladder(2, 2)
+    assert ladder[0] == (2, 2)
+    assert ladder[-1] == (1, 1)
+    assert all(c >= 1 and r >= 1 for c, r in ladder)
+    assert power_copper._shrink_ladder(1, 1) == [(1, 1)]

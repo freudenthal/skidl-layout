@@ -274,3 +274,91 @@ def test_never_raises_on_a_degenerate_result():
     bare = SimpleNamespace(validation=None, score=None,
                            placed_parts=[], outline=None)
     assert layout_quality(bare).issues == []
+
+
+# --------------------------------------------------------------------------
+# SW_NODE_COPPER_AREA -- the routed-board code (power-layout Phase 5, WS-2)
+# --------------------------------------------------------------------------
+
+from skidl_layout.copper_fill import NetCopper  # noqa: E402
+from skidl_layout.layout_quality import (  # noqa: E402
+    SW_NODE_COPPER_AREA_MM2_THRESHOLD,
+    routed_copper_issues,
+)
+
+_STAGE_PLAN = {"stages": [{"controller_ref": "U1", "switch_node_nets": ["SW"]}]}
+
+
+def _copper(area, net="SW"):
+    return {net: NetCopper(net=net, max_width_mm=0.3, segments=4,
+                           length_mm=area / 0.3, copper_area_mm2=area)}
+
+
+def test_sw_node_copper_area_fires_above_the_threshold():
+    result = routed_copper_issues("ignored", _STAGE_PLAN, copper=_copper(7.53))
+    codes = [i.code for i in result.issues]
+    assert codes == ["SW_NODE_COPPER_AREA"]
+    assert result.issues[0].evidence["copper_area_mm2"] == 7.53
+    assert result.issues[0].evidence["switch_node_net"] == "SW"
+    # Advisory only: a board with a fat switch node still ships.
+    assert result.ok
+
+
+def test_sw_node_copper_area_clears_the_hand_floorplan():
+    # The measured corpus, pinned: B 4.654 < A 5.754 < A' 7.530. The threshold
+    # must clear the known-good floorplan and fire on the worst control.
+    assert not routed_copper_issues("x", _STAGE_PLAN, copper=_copper(4.654)).issues
+    assert routed_copper_issues("x", _STAGE_PLAN, copper=_copper(7.530)).issues
+    assert 4.654 < SW_NODE_COPPER_AREA_MM2_THRESHOLD < 7.530
+
+
+def test_sw_node_copper_area_is_disabled_by_a_none_threshold():
+    result = routed_copper_issues("x", _STAGE_PLAN, copper=_copper(99.0),
+                                  sw_node_copper_threshold_mm2=None)
+    assert not result.issues
+
+
+def test_sw_node_copper_area_silent_without_a_stage():
+    assert not routed_copper_issues("x", {"stages": []},
+                                    copper=_copper(99.0)).issues
+    assert not routed_copper_issues("x", None, copper=_copper(99.0)).issues
+
+
+def test_sw_node_copper_area_silent_when_the_net_has_no_copper():
+    # Absent copper is not zero copper -- a poured switch node has no segments.
+    assert not routed_copper_issues("x", _STAGE_PLAN, copper={}).issues
+
+
+def test_sw_node_copper_area_accepts_a_plan_object():
+    class _Plan:
+        def to_dict(self):
+            return _STAGE_PLAN
+
+    assert routed_copper_issues("x", _Plan(), copper=_copper(9.0)).issues
+
+
+def test_sw_node_copper_area_is_registered_as_advisory():
+    from skidl_layout.layout_quality import ADVISORY_CODES, BLOCKING_CODES
+
+    assert "SW_NODE_COPPER_AREA" in ADVISORY_CODES
+    assert "SW_NODE_COPPER_AREA" not in BLOCKING_CODES
+
+
+def test_layout_quality_never_emits_the_routed_code():
+    # It cannot: placement has no copper. Guards against someone wiring it into
+    # the placement-time path where it would always be silent or always wrong.
+    import inspect
+    from importlib import import_module
+
+    # import_module, not `import skidl_layout.layout_quality as lq`: the package
+    # re-exports the *function* under that name, shadowing the module.
+    lq = import_module("skidl_layout.layout_quality")
+    assert "SW_NODE_COPPER_AREA" not in inspect.getsource(lq._power_issues)
+
+
+def test_sw_node_span_stays_disabled():
+    # Its replacement shipping is not a reason to re-enable the metric that was
+    # measured to rank the corpus backwards.
+    from skidl_layout.layout_quality import SW_NODE_SPAN_MM_THRESHOLD
+
+    assert SW_NODE_SPAN_MM_THRESHOLD is None

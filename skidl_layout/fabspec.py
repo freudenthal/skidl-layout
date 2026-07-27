@@ -419,6 +419,30 @@ def fab_check(
                 loc = f"via@({float(at[1]):.1f},{float(at[2]):.1f})" if at and len(at) > 2 else "via"
                 result.violations.append(FabViolation("blind_buried_via", loc, 1.0, 0.0))
 
+    # -- via-in-pad (Phase 5, WS-4) --------------------------------------
+    # A via whose centre lands inside an SMD pad is via-in-pad, which needs
+    # filled-and-capped plating the fab must actually offer. Round 1 checked
+    # only blind/buried here, so a thermal-via array under an exposed pad --
+    # exactly what emit_power_copper(thermal_vias=True) can now produce --
+    # would have been graded clean on a spec that forbids it.
+    if not spec.via_in_pad:
+        result.checked.append("via_in_pad")
+        pads = _smd_copper_pads(board)
+        if pads:
+            for via in board.search("via"):
+                at = _find_child(via, "at")
+                if at is None or len(at) < 3:
+                    continue
+                vx, vy = float(at[1]), float(at[2])
+                for pad in pads:
+                    if _point_in_pad(vx, vy, pad):
+                        result.violations.append(FabViolation(
+                            "via_in_pad",
+                            f"via@({vx:.2f},{vy:.2f}) inside pad "
+                            f"{pad['ref']}.{pad['number']}",
+                            1.0, 0.0))
+                        break
+
     # -- clearance DRC graded at the spec clearance ----------------------
     if run_drc:
         try:
@@ -509,3 +533,77 @@ def _copper_points(board, net_map):
         at = _find_child(via, "at")
         if at is not None and len(at) >= 3:
             yield float(at[1]), float(at[2]), f"via@({float(at[1]):.1f},{float(at[2]):.1f})"
+
+
+def _smd_copper_pads(board) -> list:
+    """Every SMD pad with copper, as board-space rectangles.
+
+    Returns dicts of ``{ref, number, x, y, w, h, angle}`` where ``x``/``y`` are
+    the pad centre in board coordinates and ``angle`` is the pad's absolute
+    rotation in degrees.
+
+    Two conventions matter and both were verified against a board this stack
+    emits: a pad's ``(at ...)`` **position** is in the footprint's *unrotated*
+    local frame, so it needs :func:`skidl_layout.geometry.transform_point` with
+    the footprint's rotation; a pad's ``(at ... angle)`` **angle** is already
+    absolute (KiCad bakes the footprint rotation into it -- a footprint at 90
+    degrees has pads at 90 degrees). Paste-only apertures are skipped: an
+    exposed pad's stencil openings are ``F.Paste`` rectangles with no copper,
+    and counting them would flag vias that sit in no copper pad at all.
+    """
+    from .geometry import transform_point
+    from .reader import _find_child, _find_children
+
+    pads: list = []
+    for fp in board.search("footprint"):
+        fp_at = _find_child(fp, "at")
+        if fp_at is None or len(fp_at) < 3:
+            continue
+        fx, fy = float(fp_at[1]), float(fp_at[2])
+        frot = float(fp_at[3]) if len(fp_at) > 3 else 0.0
+        ref = "?"
+        for prop in _find_children(fp, "property"):
+            if len(prop) > 2 and str(prop[1]).strip('"') == "Reference":
+                ref = str(prop[2]).strip('"')
+        for pad in _find_children(fp, "pad"):
+            if len(pad) < 3 or str(pad[2]).strip('"') != "smd":
+                continue
+            layers = _find_child(pad, "layers")
+            names = [str(v).strip('"') for v in layers[1:]] if layers else []
+            if not any(n.endswith(".Cu") or n == "*.Cu" for n in names):
+                continue
+            at = _find_child(pad, "at")
+            size = _find_child(pad, "size")
+            if at is None or len(at) < 3 or size is None or len(size) < 3:
+                continue
+            cx, cy = transform_point(fx, fy, frot, float(at[1]), float(at[2]))
+            pads.append({
+                "ref": ref,
+                "number": str(pad[1]).strip('"'),
+                "x": cx, "y": cy,
+                "w": float(size[1]), "h": float(size[2]),
+                "angle": float(at[3]) if len(at) > 3 else frot,
+                "layers": names,
+            })
+    return pads
+
+
+def _point_in_pad(px: float, py: float, pad: dict, margin: float = 0.0) -> bool:
+    """Is ``(px, py)`` inside ``pad``'s rectangle, the pad's rotation undone?
+
+    ``margin`` shrinks the rectangle on every side (a positive value demands the
+    point sit that far *inside* the pad edge). The rectangle is used for every
+    shape: a roundrect/oval pad's true outline is smaller at the corners, so
+    this over-reports rather than under-reports, which is the safe direction for
+    a manufacturability gate.
+    """
+    import math
+
+    dx, dy = px - pad["x"], py - pad["y"]
+    radians = math.radians(pad["angle"])
+    cos_a, sin_a = math.cos(radians), math.sin(radians)
+    # Inverse of geometry.transform_point's rotation.
+    local_x = dx * cos_a - dy * sin_a
+    local_y = dx * sin_a + dy * cos_a
+    return (abs(local_x) <= pad["w"] / 2.0 - margin
+            and abs(local_y) <= pad["h"] / 2.0 - margin)
