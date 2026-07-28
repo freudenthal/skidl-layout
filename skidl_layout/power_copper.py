@@ -104,6 +104,13 @@ class PowerCopperResult:
     #: a loop pass (the only ordering in which it is not Phase 13's arm C).
     #: Empty unless ``keepout_escape=True``.
     keepout: dict = field(default_factory=dict)
+    #: What the Phase-15 polygon-zone path did: the resolved
+    #: :class:`~skidl_layout.power_zones.ZonePlan` as a dict, how many zones were
+    #: spliced, which net form was used, and the board they went into. Empty
+    #: unless ``zone_plan=`` was given; ``{"requested": True, "spliced": 0,
+    #: "reason": …}`` when it was given and nothing resolved, so "asked for and
+    #: declined" can never read as "never asked for".
+    zone_plan: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = ["Power copper emitted:"]
@@ -197,6 +204,7 @@ class PowerCopperResult:
             "loop_first": dict(self.loop_first),
             "fanout": dict(self.fanout),
             "keepout": dict(self.keepout),
+            "zone_plan": dict(self.zone_plan),
         }
 
 
@@ -508,6 +516,98 @@ def _apply_escape_keepout(
     }
 
 
+def _resolve_zone_plan(zone_plan, result, circuit, fp_lib_dirs, *, spec,
+                       plane_nets, warnings) -> tuple:
+    """``(ZonePlan | None, record)`` from whatever the caller handed in.
+
+    Accepts a ready-made :class:`~skidl_layout.power_zones.ZonePlan`, a kwargs
+    dict forwarded to :func:`~skidl_layout.power_zones.plan_zone_regions`
+    (``{"sections": …, "escape_carve": True}``), or ``True`` meaning "derive one
+    with the defaults". ⛔ Never raises: a plan that cannot be built is a
+    recorded outcome the caller routes past, exactly like the fanout's decline.
+    """
+    from .power_zones import ZonePlan, plan_zone_regions
+
+    record: dict = {"requested": True, "spliced": 0}
+    try:
+        if isinstance(zone_plan, ZonePlan):
+            plan = zone_plan
+            record["source"] = "caller"
+        else:
+            kwargs = dict(zone_plan) if isinstance(zone_plan, dict) else {}
+            record["source"] = "derived" if not kwargs.get("sections") else "sections"
+            plan = plan_zone_regions(
+                result, circuit, fp_lib_dirs, fab_spec=spec,
+                plane_nets=list(plane_nets), **kwargs)
+    except Exception as exc:                            # noqa: BLE001
+        warnings.append(f"zone_plan could not be built: {type(exc).__name__}: {exc}")
+        return None, {"requested": True, "spliced": 0,
+                      "reason": f"{type(exc).__name__}: {exc}"}
+
+    warnings.extend(f"zone_plan: {w}" for w in plan.warnings)
+    record["plan"] = plan.to_dict()
+    if not plan.regions and not plan.carves:
+        # ⛔ Requested and empty is NOT the same as never requested; a gate that
+        # cannot tell the two apart reads a vacuous pass.
+        warnings.append(
+            "zone_plan requested but no region or carve resolved; the pour "
+            "falls through to route_planes unchanged")
+        record["reason"] = "no region or carve resolved"
+    return plan, record
+
+
+def _splice_zone_plan(plan, final_pcb, workdir_abs, plane_summary, *,
+                      zone_clearance, min_thickness, krt_dir, timeout_s,
+                      record, warnings) -> tuple:
+    """Splice ``plan``'s zones into ``final_pcb``; re-grade. ``(path, summary)``.
+
+    ⚠ The board is **re-graded after the splice**, with the same two KRT
+    checkers ``pour_planes`` runs, so the summary a caller reads always describes
+    the board that ships rather than the board before the zones went in.
+    """
+    from .power_zones import (
+        board_uses_name_nets, net_ids_from_board, splice_zones, zone_sexprs,
+    )
+
+    if not plan.regions and not plan.carves:
+        return final_pcb, plane_summary
+    try:
+        with open(final_pcb, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+        kicad10 = board_uses_name_nets(text)
+        sexprs = zone_sexprs(
+            plan, net_ids_from_board(text),
+            clearance=zone_clearance, min_thickness=min_thickness,
+            kicad10=kicad10)
+        # ⚠ zone_sexprs appends to plan.warnings when a region's net is not on
+        # the board, so the warning list is re-read AFTER the call.
+        warnings.extend(f"zone_plan: {w}" for w in plan.warnings
+                        if f"zone_plan: {w}" not in warnings)
+        if not sexprs:
+            record["reason"] = "no zone s-expression emitted"
+            return final_pcb, plane_summary
+        zoned = os.path.join(workdir_abs, "power_zones.kicad_pcb")
+        count = splice_zones(final_pcb, zoned, sexprs)
+    except Exception as exc:                            # noqa: BLE001
+        warnings.append(
+            f"zone_plan splice failed, board unchanged: "
+            f"{type(exc).__name__}: {exc}")
+        record["reason"] = f"{type(exc).__name__}: {exc}"
+        return final_pcb, plane_summary
+
+    record.update(spliced=count, board=zoned, kicad10_net_form=kicad10,
+                  regions=len(plan.regions), carves=len(plan.carves))
+    warnings.append(
+        f"zone_plan: spliced {count} zone(s) -- {len(plan.regions)} region "
+        f"pour(s) + {len(plan.carves)} pour-exclusion rule area(s) -- in the "
+        + ("KiCad 10" if kicad10 else "KiCad 9")
+        + " net form")
+    summary = krt.grade_pour(
+        zoned, krt_dir=krt_dir, timeout_s=timeout_s,
+        min_clearance_used=(plane_summary or {}).get("min_clearance_used"))
+    return zoned, summary
+
+
 def _pass_log_path(route_log_path: str | None, tag: str) -> str | None:
     """``<stem>.<tag><ext>`` beside ``route_log_path``, or ``None``.
 
@@ -621,6 +721,7 @@ def emit_power_copper(
     fanout_escape_method: str = "underpad",
     keepout_escape: bool = False,
     keepout_layer: str = "User.2",
+    zone_plan=None,
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -817,6 +918,27 @@ def emit_power_copper(
       escape -- Phase 13 measured that at **-32 routed nets across the corpus**
       (68/81 -> 36/81, DRC 0 throughout). Used alone it reproduces that arm and
       says so in ``warnings``.
+
+    **Phase-15 knob (default OFF -> byte-identical).** ``zone_plan`` pours
+    **polygons we choose** instead of accepting ``route_planes.py``'s Voronoi
+    partition. Accepts a :class:`~skidl_layout.power_zones.ZonePlan`, a kwargs
+    dict for :func:`~skidl_layout.power_zones.plan_zone_regions`
+    (``{"sections": {"power": ["U1", "L1"], "analog": [...]},
+    "escape_carve": True}``), or ``True`` for a derived plan.
+
+    - The nets a region covers are poured through KRT's ``kicad_writer``, called
+      **directly** -- it is pure Python and takes an arbitrary polygon.
+      **Every plane net no region covers still goes through ``pour_planes``
+      exactly as today**, so a mixed board works and this is adoptable
+      incrementally rather than as a flag day.
+    - ``escape_carve`` adds a pour-exclusion **rule area** over each controller's
+      escape annulus. ⛔⛔ **This is not ``keepout_escape``.** That flag blocks
+      *tracks* (refuted three times: -32, -22, and ±0-with-8-DRC). A rule area
+      blocks *copper pour only* -- tracks, vias and pads stay allowed, which is
+      precisely the asymmetry an escape via needs.
+    - The net header form (KiCad 9 ``(net id)`` + ``(net_name …)`` vs KiCad 10
+      ``(net "NAME")``) is **detected from the board being spliced**, the same
+      way ``route_planes.py`` decides it. Nothing here assumes a version.
     """
     from .writer import write_kicad_pcb
     from .fabspec import resolve_fab_spec
@@ -1156,11 +1278,42 @@ def emit_power_copper(
                 "(router necked down or floored)"
             )
 
+    # ⭐ Phase 15 / WS-15.1--15.3: resolve the polygon zone plan BEFORE the pour,
+    # because it decides which plane nets ``route_planes.py`` still handles.
+    # ⛔ ``zone_plan=None`` -> ``covered`` is empty -> the pour call below is the
+    # pre-Phase-15 call verbatim, same argv, same nets, same board.
+    zone_record: dict = {}
+    resolved_zone_plan = None
+    covered_nets: set = set()
+    if zone_plan is not None and zone_plan is not False:
+        resolved_zone_plan, zone_record = _resolve_zone_plan(
+            zone_plan, result, circuit, fp_lib_dirs, spec=spec,
+            plane_nets=plane_nets, warnings=warnings)
+        if resolved_zone_plan is not None:
+            covered_nets = {n for n in resolved_zone_plan.covered_nets
+                            if n in plane_nets}
+            uncovered_regions = [r.net for r in resolved_zone_plan.regions
+                                 if r.net not in plane_nets]
+            if uncovered_regions:
+                # A region may legitimately pour a net the plan never promoted --
+                # said out loud, because it means this board pours copper the
+                # baseline arm has none of, and an area comparison must know.
+                warnings.append(
+                    "zone_plan: region(s) pour net(s) the power plan did not "
+                    "promote: " + ", ".join(sorted(set(uncovered_regions))))
+
     # Pour the plane nets on the routed board, or fall through if none.
+    # Nets a zone region covers are poured by the writer path below instead;
+    # everything else still goes through route_planes exactly as before, so a
+    # MIXED board works and the change is adoptable incrementally.
     plane_summary: dict = {}
     zones_by_net: dict[str, int] = {}
     final_pcb = routed_pcb
-    if plane_nets:
+    pour_pairs = [(net, layer) for net, layer in zip(plane_nets, plane_layers)
+                  if net not in covered_nets]
+    pour_nets = [net for net, _layer in pour_pairs]
+    pour_layers = [layer for _net, layer in pour_pairs]
+    if pour_nets:
         final_pcb = os.path.join(workdir_abs, "power_copper.kicad_pcb")
         pour_kwargs = dict(_spec_pour_kwargs(spec))
         # None emits no flag at all, so a knobless pour keeps KRT's defaults and
@@ -1172,8 +1325,8 @@ def emit_power_copper(
         plane_summary = krt.pour_planes(
             routed_pcb,
             final_pcb,
-            nets=plane_nets,
-            plane_layers=plane_layers,
+            nets=pour_nets,
+            plane_layers=pour_layers,
             workdir=workdir_abs,
             krt_dir=krt_dir,
             timeout_s=timeout_s,
@@ -1181,6 +1334,16 @@ def emit_power_copper(
             gnd_via_distance=gnd_via_distance,
             **pour_kwargs,
         )
+
+    # ⭐ Phase 15 / WS-15.4: our own zones, spliced onto whatever KRT poured.
+    if resolved_zone_plan is not None:
+        final_pcb, plane_summary = _splice_zone_plan(
+            resolved_zone_plan, final_pcb, workdir_abs, plane_summary,
+            zone_clearance=zone_clearance, min_thickness=min_thickness,
+            krt_dir=krt_dir, timeout_s=timeout_s,
+            record=zone_record, warnings=warnings)
+
+    if plane_nets or zone_record.get("spliced"):
         # Read the zones back per net: a promotion that poured nothing must be
         # visible, not averaged into a board total.
         try:
@@ -1259,6 +1422,7 @@ def emit_power_copper(
         loop_first=loop_first_record,
         fanout=fanout_record,
         keepout=keepout_record,
+        zone_plan=zone_record,
     )
     logger.info("Power copper: %s", outcome.summary().replace("\n", " | "))
     return outcome

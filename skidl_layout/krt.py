@@ -205,6 +205,17 @@ def _parse_zone_summary(pcb_text: str) -> dict:
 
 
 _ZONE_NET_NAME_RE = re.compile(r'\(net_name\s+"?([^")\s]*)"?\s*\)')
+#: The KiCad-10 spelling of a zone's net header: ``(net "GND")``, with no
+#: ``net_name`` line at all. ⚠ Both forms must be read, because which one a zone
+#: carries is a property of the BOARD's ``(version …)`` and not of this stack --
+#: ``route_planes.py`` picks it per board, and Phase 15's own writer path does
+#: the same. Reading only ``net_name`` made every zone on a KiCad-10 board count
+#: under the empty name, which reads as "the pour wrote nothing".
+_ZONE_NET_NAME10_RE = re.compile(r'\(net\s+"((?:[^"\\]|\\.)*)"\s*\)')
+#: How far into a zone chunk the net header can be. A zone opens with its net on
+#: the very next line; 200 characters is generous for it and far short of the
+#: first pad of any footprint that follows the last zone in the file.
+_ZONE_HEADER_CHARS = 200
 
 
 def _zone_counts_by_net(pcb_text: str) -> dict[str, int]:
@@ -220,7 +231,13 @@ def _zone_counts_by_net(pcb_text: str) -> dict[str, int]:
     chunks = re.split(r"\(zone\b", pcb_text)
     for chunk in chunks[1:]:
         match = _ZONE_NET_NAME_RE.search(chunk)
-        name = match.group(1) if match else ""
+        if match is None:
+            # KiCad 10: the zone opens ``(net "GND")`` and has no net_name line.
+            # ⚠ Bounded to the zone HEADER, not the whole chunk: the final
+            # chunk runs to end-of-file, and an unbounded search there would
+            # happily read a pad's ``(net "…")`` out of a following footprint.
+            match = _ZONE_NET_NAME10_RE.search(chunk[:_ZONE_HEADER_CHARS])
+        name = match.group(1).replace('\\"', '"') if match else ""
         counts[name] = counts.get(name, 0) + 1
     return counts
 
@@ -523,6 +540,51 @@ def check_board(
     conn_proc = _run_krt(["check_connected.py", in_abs], resolved, timeout_s)
     drc_proc = _run_krt(["check_drc.py", in_abs], resolved, timeout_s)
     return _feedback_from_outputs(text, conn_proc.stdout, drc_proc.stdout)
+
+
+def grade_pour(
+    pcb_path: str,
+    krt_dir: str | None = None,
+    timeout_s: int = 900,
+    min_clearance_used=None,
+) -> dict:
+    """The :func:`pour_planes` summary shape, for a board poured by other means.
+
+    ⭐ **Phase 15.** When zones are authored by ``power_zones`` and spliced
+    directly, ``route_planes.py`` never runs -- so nothing produces the summary
+    every downstream gate reads (``zone_count``, ``connected_ok``,
+    ``unrouted_nets``, ``broken_nets``, ``drc_violation_count``). This runs the
+    *same two graders on the same final board* and assembles the *same dict*, so
+    a caller cannot tell which pour path produced the numbers. That is the point:
+    a driver comparing a Voronoi arm with a polygon arm must be comparing two
+    measurements, not two measurement methods.
+
+    ``min_clearance_used`` is carried through from a partial ``pour_planes`` run
+    when one happened (a mixed board pours some nets each way); it is not
+    re-derivable from the board text.
+    """
+    resolved = find_krt(krt_dir)
+    if resolved is None:
+        raise KrtNotFoundError(
+            "KiCadRoutingTools not found (set SKIDL_LAYOUT_KRT_DIR or place a "
+            "built checkout at the workspace sibling KiCadRoutingTools/)"
+        )
+    out_abs = os.path.abspath(pcb_path)
+    with open(out_abs, "r", encoding="utf-8", errors="replace") as handle:
+        poured_text = handle.read()
+    conn_proc = _run_krt(["check_connected.py", out_abs], resolved, timeout_s)
+    drc_proc = _run_krt(["check_drc.py", out_abs], resolved, timeout_s)
+    _routed_count, unrouted, broken = _parse_connected_output(conn_proc.stdout)
+    summary = _parse_zone_summary(poured_text)
+    summary.update(
+        min_clearance_used=min_clearance_used,
+        connected_ok=(not unrouted and not broken),
+        unrouted_nets=unrouted,
+        broken_nets=broken,
+        drc_violation_count=_parse_drc_output(drc_proc.stdout),
+        out_path=out_abs,
+    )
+    return summary
 
 
 def pour_planes(
