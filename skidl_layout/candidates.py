@@ -660,6 +660,8 @@ def generate_placement_candidates(
     requested: list[str] | None = None,
     circuit=None,
     power_stage_plan=None,
+    escape_stage_plan=None,
+    escape_room: bool | float = False,
 ) -> list[PlacementCandidate]:
     """Generate deterministic placement candidates from available intent.
 
@@ -675,6 +677,20 @@ def generate_placement_candidates(
     defaults to ``None`` -- so every existing caller emits the historical
     candidate set byte for byte -- and even when supplied it adds nothing on a
     board whose plan has no stages.
+
+    ``escape_room`` / ``escape_stage_plan`` (power-layout Phase 13) hold every
+    part one escape-via lane clear of the controller courtyard. **Off by default
+    -> byte-identical.** Unlike ``power_stage_plan`` this adds NO strategy: the
+    constraint is applied to **every** candidate's own constraints, because room
+    around a fine-pitch package is a property of the board rather than of one
+    placement strategy -- a lever that only bites when ``power_stage_first``
+    happens to win the selection is a lever that mostly does nothing.
+
+    ⛔ It is applied to each candidate's *copy* and never to the caller's
+    ``constraints``. ``engine._constraint_floorplan_refs`` feeds
+    ``protected_refs`` from the user set's ``far`` list, so an escape constraint
+    posing as user input would freeze every part on the board out of the
+    legalization passes -- the same trap ``_with_power_stage_plan`` documents.
     """
     seed_memo: list[tuple[LayoutConstraints, list[PlacedPart]]] = []
 
@@ -824,6 +840,42 @@ def generate_placement_candidates(
             )
         wanted = set(ordered)
 
+    # Phase 13, opt-in. Computed ONCE (it is position-free, so it is the same
+    # list for every candidate) and appended to each candidate's own constraint
+    # copy below. ``escape_stage_plan`` is deliberately a separate parameter
+    # from ``power_stage_plan``: passing the plan through the latter would also
+    # add the ``power_stage_first`` strategy, which is a different experiment.
+    escape_far: list = []
+    if escape_room and circuit is not None:
+        from .power_escape import declared_escape_refs, escape_far_constraints
+
+        plan = escape_stage_plan if escape_stage_plan is not None else power_stage_plan
+        # ⭐ Either source will do. A board that DECLARES its ICs
+        # (``mark_escape_room``) needs no switching stage at all -- an MCU has no
+        # converter and still has a fine-pitch package to escape from, which is
+        # exactly what the Phase-13 MCU cross-check found.
+        if declared_escape_refs(circuit) or (plan is not None
+                                             and getattr(plan, "stages", None)):
+            escape_far = escape_far_constraints(
+                plan,
+                _footprint_by_ref(circuit),
+                fp_geometries=fp_geometries,
+                fp_bboxes=fp_bboxes,
+                lane_mm=None if escape_room is True else float(escape_room),
+                circuit=circuit,
+            )
+
+    def _with_escape_room(built: LayoutConstraints) -> LayoutConstraints:
+        if not escape_far:
+            return built
+        existing = {(c.ref, c.target_ref) for c in built.far}
+        for constraint in escape_far:
+            key = (constraint.ref, constraint.target_ref)
+            if key not in existing:
+                built.far.append(constraint)
+                existing.add(key)
+        return built
+
     candidates: list[PlacementCandidate] = []
     for name, build_constraints, reasons in specs:
         # Request-only strategies never emit in the default (bare) call, so the
@@ -836,7 +888,7 @@ def generate_placement_candidates(
             candidates,
             name,
             groups,
-            build_constraints(),
+            _with_escape_room(build_constraints()),
             fp_bboxes,
             reasons,
             intent_plan,

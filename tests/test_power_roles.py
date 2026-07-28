@@ -509,6 +509,227 @@ def test_flyback_survives_ref_and_net_scrambling():
 
 
 # --------------------------------------------------------------------------- #
+# The step-down shape (power-layout Phase 7)
+#
+# A boost puts the inductor's far terminal on the INPUT and the rectifier's ANODE
+# on the switch node. A buck inverts both. Before Phase 7 the classifier knew
+# only the boost geometry and therefore read a buck backwards -- confidently, with
+# no warning -- so these are regression tests for a wrong ANSWER, not a crash.
+# --------------------------------------------------------------------------- #
+
+def _buck():
+    """LTC1624 Figure-1 step-down: high-side switch, catch diode, input-leg sense.
+
+    Deliberately keeps the datasheet's own divider designators -- ``R2`` is the
+    TOP leg and ``R1`` the bottom, the opposite of ``_boost()``'s convention --
+    so a rule that keyed on designator order would fail here.
+    """
+    from skidl import Circuit, Net, Part
+
+    ckt = Circuit(name="buck")
+    with ckt:
+        vin, vout, gnd = Net("VIN"), Net("VOUT"), Net("GND")
+        sense, sw, boost = Net("SENSE"), Net("SW"), Net("BOOST")
+        vfb, gate, ith = Net("VFB"), Net("GATE"), Net("ITH")
+
+        u1 = Part("Regulator_Controller", "LTC1624CS8", ref="U1")
+        u1["VIN"] += vin          # doubles as the SENSE+ side of RS
+        u1["GND"] += gnd
+        u1["ISENSE"] += sense
+        u1["TG"] += gate
+        u1["SW"] += sw
+        u1["BOOST"] += boost
+        u1["SET"] += vfb          # the datasheet calls this pin V_FB
+        u1["Ith/RUN"] += ith
+
+        cin = Part("Device", "C_Polarized", ref="CIN", value="22uF")
+        cin[1] += vin
+        cin[2] += gnd
+        cvin = Part("Device", "C", ref="CVIN", value="1000pF", footprint=C08)
+        cvin[1] += vin
+        cvin[2] += gnd
+
+        # ⚠ The sense resistor is in the INPUT leg, not the switch return.
+        rs = Part("Device", "R", ref="RS", value="0.05", footprint=R08)
+        rs[1] += vin
+        rs[2] += sense
+
+        m1 = Part("Transistor_FET", "Si7336ADP", ref="M1")
+        m1["D"] += sense
+        m1["G"] += gate
+        m1["S"] += sw
+        cb = Part("Device", "C", ref="CB", value="0.1uF", footprint=C08)
+        cb[1] += boost
+        cb[2] += sw
+
+        # ⚠ The catch diode's CATHODE is on the switch node -- this is the single
+        # library fact that makes the stage a step-down.
+        d1 = Part("Device", "D_Schottky", ref="D1", value="MBRS340")
+        d1["K"] += sw
+        d1["A"] += gnd
+
+        l1 = Part("Device", "L", ref="L1", value="10uH")
+        l1[1] += sw
+        l1[2] += vout             # ...and the inductor's far end is the OUTPUT
+        cout = Part("Device", "C_Polarized", ref="COUT", value="100uF")
+        cout[1] += vout
+        cout[2] += gnd
+
+        r2 = Part("Device", "R", ref="R2", value="35.7k", footprint=R08)
+        r2[1] += vout             # TOP leg, per the datasheet's designators
+        r2[2] += vfb
+        r1 = Part("Device", "R", ref="R1", value="20k", footprint=R08)
+        r1[1] += vfb
+        r1[2] += gnd
+        rc = Part("Device", "R", ref="RC", value="6.8k", footprint=R08)
+        rc[1] += ith
+        rc[2] += gnd
+    return ckt
+
+
+@requires_symbols
+def test_buck_rails_are_not_read_backwards():
+    """The Phase-7 headline: this used to say ``in=VOUT, out=None``."""
+    stage = classify_power_roles(_buck()).stages[0]
+    assert stage.topology == "buck"
+    assert stage.input_rail == "VIN"
+    assert stage.output_rail == "VOUT"
+
+
+@requires_symbols
+def test_buck_catch_diode_is_found_and_output_caps_are_typed_as_output():
+    """Both used to be wrong: ``D1`` absent entirely, ``COUT`` typed ``input_cap``."""
+    stage = classify_power_roles(_buck()).stages[0]
+    assert stage.device("D1") is not None and stage.device("D1").kind == "rectifier"
+    assert stage.device("COUT").kind == "output_cap"
+    assert stage.device("CIN").kind == "input_cap"
+
+
+@requires_symbols
+def test_buck_sense_resistor_may_bridge_the_input_rail():
+    """High-side sense: ``VIN -> RS -> the FET drain``, never touching ground."""
+    stage = classify_power_roles(_buck()).stages[0]
+    assert stage.sense_resistor_ref == "RS"
+    assert stage.sense_net == "SENSE"
+    assert stage.device("RS").kind == "sense_resistor"
+
+
+@requires_symbols
+def test_buck_commutation_loop_is_input_side_and_in_conduction_order():
+    """The old answer was ``COUT -> L1 -> M1`` -- a loop with no switching edge.
+
+    The inductor conducts continuously on a buck and is deliberately not a
+    member; the sense resistor sits between the capacitor and the switch rather
+    than after it, so member order is the conduction order.
+    """
+    loop = classify_power_roles(_buck()).stages[0].loops[0]
+    assert loop.member_refs == ["CVIN", "RS", "M1", "D1"]
+    assert loop.returns_through == "GND"
+    assert "L1" not in loop.member_refs
+
+
+@requires_symbols
+def test_buck_divider_is_found_by_connectivity_not_designator_order():
+    """``R2`` is the TOP leg here -- the opposite of the boost canary."""
+    stage = classify_power_roles(_buck()).stages[0]
+    assert stage.feedback_divider == ("R2", "R1")
+    assert stage.feedback_net == "VFB"
+    assert stage.device("R2").kind == "fb_divider_top"
+    assert stage.device("R1").kind == "fb_divider_bottom"
+
+
+@requires_symbols
+def test_buck_survives_ref_and_net_scrambling():
+    _assert_scramble_invariant(_buck())
+
+
+@requires_symbols
+def test_boost_is_unaffected_by_the_step_down_branch():
+    """The step-down test must not fire on a boost: no diode cathode on SW."""
+    stage = classify_power_roles(_boost()).stages[0]
+    assert stage.topology == "boost"
+    assert stage.loops[0].member_refs == ["COUT3", "D1", "M1", "RS"]
+
+
+@requires_symbols
+def test_the_stage_anchor_walks_through_a_series_gate_resistor():
+    """Phase 9, WS-3 -- and this test used to assert the opposite.
+
+    Until Phase 9 the stage anchor required the controller's drive pin and the
+    switch's gate to share a net, so a gate resistor -- ubiquitous in real
+    supplies, and on the LT3724 datasheet's own front page -- took the classifier
+    from a full stage to none. Phase 7 measured that deliberately rather than
+    patching the anchor, because ``DRIVE_PIN_NAMES`` is what *creates* stages and
+    loosening it is the G3 false-positive failure mode; the limitation was pinned
+    here so it could not regress silently, with a note saying that a phase which
+    fixed it should update this test. This is that update.
+
+    The stage must come back **whole** -- not merely non-empty. A hop that finds
+    an anchor but mis-describes what it found would be worse than the silence.
+    """
+    from skidl import Net, Part
+
+    ckt = _buck()
+    gate = next(n for n in ckt.get_nets() if n.name == "GATE")
+    u1 = next(p for p in ckt.parts if p.ref == "U1")
+    with ckt:
+        drv = Net("GATE_DRV")
+        rg = Part("Device", "R", ref="RG", value="5.1", footprint=R08)
+    u1["TG"].disconnect()
+    u1["TG"] += drv
+    rg[1] += drv
+    rg[2] += gate
+
+    plan = classify_power_roles(ckt)
+    assert len(plan.stages) == 1
+    stage = plan.stages[0]
+    assert stage.topology == "buck"
+    assert stage.input_rail == "VIN"
+    assert stage.output_rail == "VOUT"
+    assert stage.sense_resistor_ref == "RS"
+    assert {d.ref: d.kind for d in stage.devices}["RG"] == "gate_resistor"
+    assert any("through the series RG" in r for r in stage.reasons)
+
+
+@requires_symbols
+def test_the_gate_resistor_hop_is_one_element_deep_and_resistor_only():
+    """The hop's two guards, which are what keep gate G3 clean.
+
+    A capacitor between a drive pin and a gate is a different circuit, and two
+    hops would start walking arbitrary networks onto the anchor. Both are
+    measured here rather than trusted, because this walk runs at the *anchor*:
+    a false positive does not mis-describe a stage, it invents one.
+    """
+    from skidl import Net, Part
+
+    def _spliced(*values):
+        """The buck with ``len(values)`` series parts between TG and the gate."""
+        ckt = _buck()
+        gate = next(n for n in ckt.get_nets() if n.name == "GATE")
+        u1 = next(p for p in ckt.parts if p.ref == "U1")
+        u1["TG"].disconnect()
+        node = Net("GATE_DRV0", circuit=ckt)
+        u1["TG"] += node
+        for index, (lib, sym) in enumerate(values):
+            with ckt:
+                part = Part("Device", sym, ref=f"RG{index}", value="5.1",
+                            footprint=R08)
+            part[1] += node
+            node = (gate if index == len(values) - 1
+                    else Net(f"GATE_DRV{index + 1}", circuit=ckt))
+            part[2] += node
+        return ckt
+
+    # One resistor: anchored.
+    assert len(classify_power_roles(_spliced(("Device", "R"))).stages) == 1
+    # Two resistors: NOT anchored -- the hop is deliberately one deep.
+    assert classify_power_roles(_spliced(("Device", "R"),
+                                         ("Device", "R"))).stages == []
+    # One capacitor: NOT anchored -- DRIVE_SERIES_HOP_KINDS is resistors only.
+    assert classify_power_roles(_spliced(("Device", "C"))).stages == []
+
+
+# --------------------------------------------------------------------------- #
 # Plan gate G3 -- no false positives
 # --------------------------------------------------------------------------- #
 
@@ -612,3 +833,285 @@ def test_plan_layout_stays_silent_on_a_non_power_board():
     assert result.power_stage_plan.stages == []
     assert "power_stage_plan" not in result.to_dict()
     assert "Power stage plan" not in result.summary()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 9 -- the classifier phase
+# --------------------------------------------------------------------------- #
+
+def test_loop_capacitor_empty_candidate_path_returns_three_values():
+    """WS-1. The bug was a 2-tuple where every caller unpacks 3.
+
+    Reached whenever the commutation loop's far rail has no capacitor to the net
+    the classifier picked as ground -- which is exactly what a split ground
+    produces. It raised ``ValueError: not enough values to unpack (expected 3,
+    got 2)`` at the one moment the classifier was about to give up quietly, so
+    the failure mode was a crash rather than a silence.
+    """
+    from skidl_layout.power_roles import _View, _loop_capacitor
+
+    class _Empty:
+        parts = []
+
+        @staticmethod
+        def get_nets():
+            return []
+
+    chosen, bulk, by_value = _loop_capacitor(_View(_Empty()), {}, [])
+    assert chosen is None
+    assert bulk == []
+    assert by_value is False
+
+
+def test_gnd_net_re_knows_the_signal_power_split_and_still_refuses_substrings():
+    """WS-2a. Two named alternatives, not a general ``.*GND.*``."""
+    from skidl_layout.roles import GND_NET_RE
+
+    for name in ("GND", "VSS", "AGND", "DGND", "GNDA", "GNDD", "SGND", "PGND",
+                 "sgnd", "pgnd"):
+        assert GND_NET_RE.match(name), name
+    # ⚠ Kelvin MEASUREMENT nodes are not grounds, and a substring rule would
+    # swallow every one of them.
+    for name in ("GND_SENSE", "GND_KELVIN", "PGND_RTN", "SGND1", "AGNDX"):
+        assert not GND_NET_RE.match(name), name
+
+
+def test_caps_to_accepts_a_set_of_grounds():
+    """WS-2a's classifier half: a rail's capacitor may return to EITHER ground."""
+    from skidl_layout.power_roles import _View, _caps_to
+    from skidl import Circuit, Net, Part
+
+    ckt = Circuit(name="two_grounds")
+    with ckt:
+        vin, sgnd, pgnd = Net("VIN"), Net("SGND"), Net("PGND")
+        cin = Part("Device", "C", ref="CIN", value="10uF", footprint=C08)
+        cin[1] += vin
+        cin[2] += pgnd            # returns to the POWER ground...
+    view = _View(ckt)
+    kinds = classify_devices(ckt)
+
+    assert _caps_to(view, kinds, "VIN", "SGND") == []           # ...not this one
+    assert _caps_to(view, kinds, "VIN", "PGND") == ["CIN"]
+    assert _caps_to(view, kinds, "VIN", {"SGND", "PGND"}) == ["CIN"]
+    # A single-ground board is the original test exactly, which is why the
+    # widening cannot move an answer that already worked.
+    assert _caps_to(view, kinds, "VIN", {"PGND"}) == ["CIN"]
+
+
+@requires_symbols
+def test_out_is_only_a_drive_pin_on_a_part_that_also_has_fb_and_cs():
+    """WS-4. ``OUT`` is a real UC384x pin AND the most generic name in any library.
+
+    The conjunction is the whole safety: an op-amp, a comparator, a regulator and
+    a logic gate all have an ``OUT``, and a stage invented on one of those poisons
+    every phase downstream.
+    """
+    from skidl_layout.power_roles import _View, _drive_pin_names
+    from skidl import Circuit, Net, Part
+
+    ckt = Circuit(name="out_rule")
+    with ckt:
+        u1 = Part("Regulator_Controller", "UC3844_DIP8", ref="U1")
+        for pin, net in (("OUT", "GATE"), ("FB", "FB"), ("CS", "CS"),
+                         ("GND", "GND"), ("VCC", "VCC")):
+            u1[pin] += Net(net)
+        # A part with OUT and nothing else -- the case the rule must refuse.
+        u2 = Part("Amplifier_Operational", "LM358", ref="U2")
+    view = _View(ckt)
+
+    assert "OUT" in _drive_pin_names(view, "U1")
+    assert "OUT" not in _drive_pin_names(view, "U2")
+
+
+@requires_symbols
+def test_topology_separates_a_coupled_sepic_from_a_flyback():
+    """WS-5. Both are "one magnetic, two windings" -- the count cannot tell them apart.
+
+    What can is the **coupling capacitor**: a SEPIC bridges its switch node to the
+    node carrying the second winding, and a flyback does not. Built here on a
+    coupled ``L_Coupled`` so winding count says ``flyback`` for both.
+    """
+    from skidl import Circuit, Net, Part
+
+    def _sepic():
+        ckt = Circuit(name="sepic")
+        with ckt:
+            vin, vout, gnd = Net("VIN"), Net("VOUT"), Net("GND")
+            sw, mid, isns = Net("SW"), Net("SEPIC_MID"), Net("ISNS")
+            fbx, gate = Net("FBX"), Net("GATE")
+
+            u1 = Part("Regulator_Switching", "LT3757AEMSE", ref="U1")
+            u1["VIN"] += vin
+            u1["GND"] += gnd
+            u1["GATE"] += gate
+            u1["SENSE"] += isns
+            u1["FBX"] += fbx
+
+            cin = Part("Device", "C", ref="CIN", value="4.7uF", footprint=C08)
+            cin[1] += vin
+            cin[2] += gnd
+            # ONE magnetic, TWO windings: pins 1-2 and 3-4.
+            l1 = Part("Device", "L_Coupled", ref="L1", value="4.7uH")
+            l1[1] += vin
+            l1[2] += sw
+            l1[3] += mid
+            l1[4] += gnd          # ⚠ the second winding returns to GROUND
+            m1 = Part("Transistor_FET", "Si7336ADP", ref="M1")
+            m1["D"] += sw
+            m1["G"] += gate
+            m1["S"] += isns
+            rs = Part("Device", "R", ref="RS", value="0.01", footprint=R08)
+            rs[1] += isns
+            rs[2] += gnd
+            cdc = Part("Device", "C", ref="CDC", value="4.7uF", footprint=C08)
+            cdc[1] += sw          # ⚠ THE coupling capacitor
+            cdc[2] += mid
+            d1 = Part("Device", "D_Schottky", ref="D1", value="MBRS360")
+            d1["A"] += mid        # ⚠ ...and the rectifier faces a POSITIVE rail
+            d1["K"] += vout
+            cout = Part("Device", "C", ref="COUT", value="10uF", footprint=C08)
+            cout[1] += vout
+            cout[2] += gnd
+            rfb1 = Part("Device", "R", ref="RFB1", value="105k", footprint=R08)
+            rfb1[1] += vout
+            rfb1[2] += fbx
+            rfb2 = Part("Device", "R", ref="RFB2", value="15.8k", footprint=R08)
+            rfb2[1] += fbx
+            rfb2[2] += gnd
+        return ckt
+
+    stage = classify_power_roles(_sepic()).stages[0]
+    assert stage.topology == "sepic"
+    assert stage.input_rail == "VIN"
+    assert stage.output_rail == "VOUT"
+    assert {d.ref: d.kind for d in stage.devices}["CDC"] == "coupling_cap"
+
+    # The negative control: the SAME two-winding magnetic with NO coupling
+    # capacitor is still a flyback, so the count survives as the fallback.
+    assert classify_power_roles(_flyback()).stages[0].topology == "flyback"
+
+
+@requires_symbols
+def test_a_bootstrap_capacitor_is_not_mistaken_for_a_coupling_capacitor():
+    """WS-5's safety. ``_buck()``'s ``CB`` bridges BOOST and the switch node too.
+
+    What rejects it is that ``BOOST`` carries no winding -- a structural test, not
+    a name. Pinned because every high-side driver in existence has this capacitor.
+    """
+    stage = classify_power_roles(_buck()).stages[0]
+    assert stage.topology == "buck"
+    assert "coupling_cap" not in {d.kind for d in stage.devices}
+
+
+# --------------------------------------------------------------------------- #
+# Phase 10, WS-4 -- the two classifier leftovers
+# --------------------------------------------------------------------------- #
+
+@requires_symbols
+def test_a_leading_edge_cs_filter_no_longer_hides_the_sense_resistor():
+    """The near-universal RC on a current-mode controller's ``CS`` pin.
+
+    A series resistor from the shunt to ``CS`` (with a small cap to ground)
+    suppresses the turn-on current spike -- and moves the sense pin one resistor
+    away from the shunt, which the positional sense test required them to share a
+    net for. The A/B is the whole point: **the same board with and without the
+    filter must name the same sense resistor.**
+    """
+    from skidl import Circuit, Net, Part
+
+    def _boost_with(cs_filter):
+        ckt = Circuit(name=f"cs_filter_{cs_filter}")
+        with ckt:
+            vin, vout, gnd = Net("VIN"), Net("VOUT"), Net("GND")
+            sw, isns, fbx, gate = Net("SW"), Net("ISNS"), Net("FBX"), Net("GATE")
+            # With the filter the controller's sense pin sits on its OWN node.
+            cs = Net("CS") if cs_filter else isns
+
+            u1 = Part("Regulator_Switching", "LT3757AEMSE", ref="U1")
+            u1["VIN"] += vin
+            u1["GND"] += gnd
+            u1["GATE"] += gate
+            u1["SENSE"] += cs
+            u1["FBX"] += fbx
+
+            cin = Part("Device", "C", ref="CIN", value="10uF", footprint=C08)
+            cin[1] += vin
+            cin[2] += gnd
+            l1 = Part("Device", "L", ref="L1", value="10uH")
+            l1[1] += vin
+            l1[2] += sw
+            m1 = Part("Transistor_FET", "Si7336ADP", ref="M1")
+            m1["D"] += sw
+            m1["G"] += gate
+            m1["S"] += isns
+            rs = Part("Device", "R", ref="RS", value="0.01", footprint=R08)
+            rs[1] += isns
+            rs[2] += gnd
+            if cs_filter:
+                rcs = Part("Device", "R", ref="RCS", value="1k", footprint=R08)
+                rcs[1] += isns
+                rcs[2] += cs
+                ccs = Part("Device", "C", ref="CCS", value="470pF", footprint=C08)
+                ccs[1] += cs
+                ccs[2] += gnd
+            d1 = Part("Device", "D_Schottky", ref="D1", value="B360")
+            d1["A"] += sw
+            d1["K"] += vout
+            cout = Part("Device", "C", ref="COUT", value="10uF", footprint=C08)
+            cout[1] += vout
+            cout[2] += gnd
+            rfb1 = Part("Device", "R", ref="RFB1", value="105k", footprint=R08)
+            rfb1[1] += vout
+            rfb1[2] += fbx
+            rfb2 = Part("Device", "R", ref="RFB2", value="15.8k", footprint=R08)
+            rfb2[1] += fbx
+            rfb2[2] += gnd
+        return ckt
+
+    filtered = classify_power_roles(_boost_with(True)).stages[0]
+    direct = classify_power_roles(_boost_with(False)).stages[0]
+    assert direct.sense_resistor_ref == "RS"
+    assert filtered.sense_resistor_ref == "RS"
+    # The hop lands on the switch return itself, not on the filter's own node.
+    assert filtered.sense_net == direct.sense_net == "ISNS"
+    # ⚠ It must be the RESISTOR that is walked through, never the filter cap.
+    assert "RCS" not in {d.ref for d in filtered.devices
+                         if d.kind == "sense_resistor"}
+
+
+@requires_symbols
+def test_the_sense_hop_runs_only_after_the_direct_test_and_only_through_a_resistor():
+    """Two guards, both structural.
+
+    The direct test runs first, so a board that already anchors its sense pin on
+    the switch return cannot change its answer; and the hop is resistors-only, so
+    a capacitor in the series position leaves the classifier exactly as blind as
+    it was. Disabling the hop entirely must restore the pre-Phase-10 behaviour.
+    """
+    from skidl_layout import power_roles
+
+    # Guard 1: the shipped boost anchors directly and is untouched by the hop.
+    assert classify_power_roles(_boost()).stages[0].sense_net == "SW_SENSE"
+
+    # Guard 2: the table is the off switch, and turning it off is the old answer.
+    saved = power_roles.SENSE_SERIES_HOP_KINDS
+    try:
+        power_roles.SENSE_SERIES_HOP_KINDS = frozenset()
+        assert classify_power_roles(_boost()).stages[0].sense_resistor_ref == "RS"
+    finally:
+        power_roles.SENSE_SERIES_HOP_KINDS = saved
+    assert "capacitor" not in saved
+
+
+def test_ground_nets_is_added_never_renamed():
+    """A stage reports one ``ground_net`` AND every ground it returns through.
+
+    On a single-ground board the list has exactly one member and it is that
+    value -- which is why nothing downstream can read a change that did not
+    happen.
+    """
+    stage = classify_power_roles(_boost()).stages[0]
+    assert stage.ground_net == "GND"
+    assert stage.ground_nets == ["GND"]
+    assert stage.to_dict()["ground_net"] == "GND"
+    assert stage.to_dict()["ground_nets"] == ["GND"]

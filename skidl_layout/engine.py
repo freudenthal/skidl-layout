@@ -41,6 +41,7 @@ from .placer import (
     _footprint_name,
 )
 from .power import PowerRoutePlan, infer_power_topology, plan_power_routes
+from .power_escape import ESCAPE_LANE_MM
 from .power_metrics import PowerMetrics, measure_power_layout
 from .power_roles import PowerStagePlan, classify_power_roles
 from .reader import read_board_outline
@@ -91,6 +92,12 @@ class LayoutResult:
     #: and computed after the placement is final. ``None`` when the measurement
     #: was not run; an empty result when there was no power stage to measure.
     power_metrics: PowerMetrics | None = None
+    #: What the Phase-13 escape-room pass did to the selected placement: the
+    #: lane it enforced, the controller it enforced it around, which parts moved
+    #: and which had nowhere legal to go, and the nearest-neighbour gap before
+    #: and after. ``None`` when the opt-in knob was off -- so an absent value
+    #: means "not asked for", never "no room needed".
+    escape_room: dict | None = None
 
     @property
     def ok(self) -> bool:
@@ -1678,6 +1685,41 @@ def _resolve_power_constraints(power_constraints: bool | None) -> bool:
     if env is None:
         return False
     return env.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _resolve_escape_room(
+    power_escape_room, env: str = "SKIDL_LAYOUT_POWER_ESCAPE_ROOM"
+) -> bool | float:
+    """Explicit kwarg > the named env var > default OFF.
+
+    Power-layout Phase 13's knob. ``False``/``None`` -> off (byte-identical),
+    ``True`` -> the default escape lane, a number -> that lane in millimetres.
+    The env form accepts a float too, so the lane can be swept without a code
+    change -- which is how the phase's arm C was priced.
+
+    ⛔ Deliberately does NOT imply ``power_constraints``. Phase 12 already
+    measured ``power_constraints=True`` on these boards; folding the two knobs
+    together would make Phase 13's arm differ from its baseline by two changes
+    and attribute neither.
+    """
+    if power_escape_room is not None and power_escape_room is not False:
+        if power_escape_room is True:
+            return True
+        return float(power_escape_room)
+    if power_escape_room is False:
+        return False
+    value = os.environ.get(env)
+    if value is None:
+        return False
+    value = value.strip()
+    if value.lower() in ("", "0", "false", "no", "off"):
+        return False
+    if value.lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return float(value)
+    except ValueError:
+        return False
 
 
 def _apply_panel_mechanical_outline_score(
@@ -4239,6 +4281,9 @@ def plan_layout(
     strip_sim_only: bool = False,
     power_score: bool | None = None,
     power_constraints: bool | None = None,
+    power_escape_room: bool | float | None = None,
+    power_escape_constraints: bool | float | None = None,
+    power_escape_partial: bool = False,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
 
@@ -4282,6 +4327,46 @@ def plan_layout(
     ``SKIDL_LAYOUT_POWER_CONSTRAINTS`` is the env default; an explicit kwarg
     wins. A board whose plan finds no switching stage emits the historical
     candidate set unchanged in either flag state.
+
+    ``power_escape_room`` (power-layout Phase 13) holds every part at least one
+    **escape via lane** clear of each power stage's controller courtyard, so a
+    fine-pitch package has somewhere to put the via its housekeeping nets have
+    to leave the top layer through. ``True`` uses
+    :data:`~skidl_layout.power_escape.ESCAPE_LANE_MM` (0.9048 mm: a 0.6 mm via
+    plus 0.1524 mm of clearance on each side); pass a float to name the lane, or
+    let ``skidl_eda.plan_pcb`` derive it from a ``FabSpec``.
+    ``SKIDL_LAYOUT_POWER_ESCAPE_ROOM`` is the env default. **Default OFF, and
+    off it is a true no-op** -- the netlist is not classified and the candidate
+    constraints are byte-identical.
+
+    ⚠⚠ Unlike every copper lever since Phase 6 this one touches **placement**,
+    which the three Phase-0 boost digests gate. It is enforced on the
+    **selected** placement -- after refinement, legalization and scoring -- and
+    it accepts a move only when the moved part still sits inside the outline and
+    still clears every other part by the validator's own rule. So it cannot
+    introduce an overlap or an outline violation, and a part with nowhere legal
+    to go is *reported* rather than shoved. What it did lands on the result's
+    ``escape_room`` field, and when it moves anything the validation and the
+    score are re-derived, so the numbers always describe the placement shipped.
+
+    ⭐⭐ The pass is **all-or-nothing**: if even one neighbour has nowhere legal
+    to go, the annulus is still breached, the controller still cannot put a via
+    down, and the whole pass reverts. Measured — on ``lt8710_inverting`` keeping
+    the partial moves bought no escape and cost a broken ``GND``, a lost pour
+    zone and ``IMON`` necked 0.300 -> 0.1524 mm, while the two boards that
+    cleared fully cost nothing and gained ``lt3724_buck`` **two routed nets**.
+    ``power_escape_partial=True`` keeps whatever moved and is how that table is
+    re-derived; it is not the recommended setting.
+
+    ``power_escape_constraints`` is the **measured negative**, kept reachable so
+    it can be re-derived rather than quoted. It expresses the same lane as
+    ``Far`` constraints on every placement candidate -- which is where the rest
+    of this arc puts its generated constraints, and it is the wrong seam here.
+    ⛔ ``LayoutConstraints.far`` is read by the seed push inside
+    ``placer.place_parts`` and by nothing downstream, so refinement simply closes
+    the gap again: measured on ``lt3757_sepic``, it raised the baseline
+    candidate's *seed* escape gap 1.163 -> 2.055 mm and dropped the *final*
+    placement's gap 0.540 -> 0.050 mm. Ships OFF (power-layout Phase 13, E3b).
 
     ``parallel_workers`` controls refining the unique candidates' pass-1 trio
     (orientation/decap/placement) and their post-anchor finalize concurrently in
@@ -4379,6 +4464,19 @@ def plan_layout(
     candidate_power_plan = (
         classify_power_roles(circuit) if resolved_power_constraints else None
     )
+    # Phase 13, opt-in. Classified separately from ``candidate_power_plan``
+    # because that one ALSO adds the ``power_stage_first`` strategy; the escape
+    # room must be able to move on its own or its arm attributes nothing. Paid
+    # for only when the flag is on, so the default path is untouched.
+    resolved_escape_room = _resolve_escape_room(power_escape_room)
+    resolved_escape_constraints = _resolve_escape_room(
+        power_escape_constraints, env="SKIDL_LAYOUT_POWER_ESCAPE_CONSTRAINTS")
+    escape_stage_plan = None
+    if resolved_escape_room or resolved_escape_constraints:
+        escape_stage_plan = (
+            candidate_power_plan if candidate_power_plan is not None
+            else classify_power_roles(circuit)
+        )
     resolved_candidate_names = _resolve_candidate_names(candidate_names)
     candidates = generate_placement_candidates(
         groups,
@@ -4390,6 +4488,8 @@ def plan_layout(
         requested=resolved_candidate_names,
         circuit=circuit,
         power_stage_plan=candidate_power_plan,
+        escape_stage_plan=escape_stage_plan,
+        escape_room=resolved_escape_constraints,
     )
 
     ctx = LayoutContext.from_circuit(circuit)
@@ -4759,6 +4859,123 @@ def plan_layout(
         f"selected '{selected_candidate.name}' "
         f"(ok={score.ok}, penalty={score.penalty:.1f}, hpwl={score.total_hpwl_mm:.0f}mm)"
     )
+
+    # ------------------------------------------------------------------ #
+    # Power-layout Phase 13: enforce the escape lane on the SELECTED
+    # placement. Opt-in; with the flag off not a line of this runs and the
+    # result is byte-identical.
+    #
+    # ⭐ Why here and not at the constraint seam, which is where every other
+    # generated constraint in this arc lives. MEASURED: ``constraints.far`` is
+    # read by ``placer.py``'s seed push and by ``_constraint_floorplan_refs``,
+    # and by NOTHING downstream -- so refinement is free to close the gap the
+    # constraint opened, and on a crowded board it does. On ``lt3757_sepic``
+    # the constraint raised the baseline candidate's SEED escape gap
+    # 1.163 -> 2.055 mm and the FINAL placement's gap FELL 0.540 -> 0.050 mm.
+    # A lever that moves its own judge backwards does not ship; this is the
+    # seam that holds, because nothing runs after it.
+    #
+    # ⛔ It cannot make the placement worse: ``apply_escape_room`` accepts a
+    # move only when the moved part stays inside the outline and clears every
+    # other part by the validator's own rule. And when it does move something,
+    # validation and score are RE-DERIVED below -- shipping a
+    # ``LayoutResult`` whose numbers describe a placement it no longer carries
+    # would be the worst possible failure mode for a gate-driven arc.
+    escape_info = None
+    if resolved_escape_room:
+        from .power_escape import apply_escape_room
+
+        lane = (ESCAPE_LANE_MM if resolved_escape_room is True
+                else float(resolved_escape_room))
+        moved_parts, escape_info = apply_escape_room(
+            placed_parts,
+            lane_mm=lane,
+            fp_geometries=fp_geometries,
+            fp_bboxes=resolved_bboxes,
+            outline=resolved_outline,
+            clearance_mm=clearance_mm,
+            power_stage_plan=escape_stage_plan,
+            partial=bool(power_escape_partial),
+            # ⭐ So ``mark_escape_room`` declarations are read. A producer's
+            # explicit mark outranks the classifier and the pad-count guess --
+            # and it names as many ICs as the board actually has.
+            circuit=circuit,
+        )
+        _emit(
+            f"escape room ({lane:.4f}mm lane around "
+            f"{escape_info.get('controller')}): "
+            f"{len(escape_info.get('moved') or {})} part(s) moved, "
+            f"{len(escape_info.get('blocked') or [])} blocked, gap "
+            f"{escape_info.get('gap_before_mm')} -> {escape_info.get('gap_after_mm')}mm"
+        )
+        if escape_info.get("moved"):
+            placed_parts = moved_parts
+            selected_keepouts = _effective_keepouts(
+                selected_constraints,
+                placed_parts,
+                intent_plan,
+                resolved_bboxes,
+                fp_geometries,
+                resolved_outline,
+            )
+            validation = validate(
+                placed_parts,
+                circuit,
+                resolved_bboxes,
+                clearance_mm=clearance_mm,
+                outline=resolved_outline,
+                keepouts=selected_keepouts,
+                cutouts=getattr(selected_constraints, "cutouts", None),
+                fp_geometries=fp_geometries,
+                ctx=ctx,
+            )
+            score = _apply_power_loop_score(
+                _apply_panel_mechanical_outline_score(
+                    _apply_edge_intent_score(
+                        score_placement(
+                            placed_parts,
+                            circuit,
+                            resolved_bboxes,
+                            outline=resolved_outline,
+                            keepouts=selected_keepouts,
+                            cutouts=getattr(selected_constraints, "cutouts", None),
+                            fp_geometries=fp_geometries,
+                            clearance_mm=clearance_mm,
+                            board_layers=board_layers,
+                            ctx=ctx,
+                        ),
+                        placed_parts,
+                        resolved_bboxes,
+                        resolved_outline,
+                        intent_plan,
+                        constraints=selected_constraints,
+                        fp_geometries=fp_geometries,
+                    ),
+                    placed_parts,
+                    resolved_bboxes,
+                    resolved_outline,
+                    intent_plan,
+                    fp_geometries=fp_geometries,
+                ),
+                placed_parts,
+                circuit,
+                ctx,
+                fp_geometries,
+                resolved_power_score,
+            )
+            selected_candidate.placed_parts = placed_parts
+            selected_candidate.score = score.score
+            selected_candidate.reasons.append(
+                f"escape room: {len(escape_info['moved'])} part(s) held one "
+                f"{lane:.4f}mm via lane clear of {escape_info['controller']}"
+            )
+            for ref in escape_info["moved"]:
+                selected_candidate.ref_reasons.setdefault(ref, []).append(
+                    f"pushed clear of {escape_info['controller']}'s escape lane"
+                )
+            candidate_validations[selected_candidate.name] = validation
+            candidate_scores[selected_candidate.name] = score
+
     power_plan = plan_power_routes(
         circuit,
         placed_parts,
@@ -4805,4 +5022,5 @@ def plan_layout(
         cutouts=list(getattr(selected_constraints, "cutouts", []) or []),
         power_stage_plan=power_stage_plan,
         power_metrics=power_metrics,
+        escape_room=escape_info,
     )

@@ -34,6 +34,7 @@ from .fabspec import (
     OSHPARK_2L,
     fab_check,
     resolve_fab_spec,
+    resolve_spacing_column,
     write_krt_fab_overrides,
 )
 from .copper_fill import (
@@ -51,6 +52,10 @@ from .copper_post import (
 from .current_widths import (
     ipc2221_width_mm,
     widths_from_currents,
+)
+from .power_clearance import (
+    net_clearance_map,
+    plan_net_clearances,
 )
 from .layout_quality import (
     ADVISORY_CODES,
@@ -103,6 +108,22 @@ from .power_constraints import (
     PowerConstraintSet,
     generate_power_constraints,
 )
+from .power_escape import (
+    ESCAPE_LANE_MM,
+    ESCAPE_ROOM_FIELD,
+    EscapeRoom,
+    annulus_polygon,
+    declared_escape_refs,
+    escape_constraints,
+    escape_far_constraints,
+    lane_from_fab,
+    mark_escape_room,
+    measure_escape_room,
+    measure_escape_rooms,
+    resolve_escape_targets,
+    resolve_lane_mm,
+    write_keepout_polygons,
+)
 from .power_metrics import (
     LoopGeometry,
     PowerMetrics,
@@ -141,7 +162,12 @@ from .krt import (
     pour_planes,
     route_and_check,
 )
-from .power_copper import PowerCopperResult, emit_power_copper
+from .power_copper import (
+    PowerCopperResult,
+    emit_power_copper,
+    plan_loop_first_nets,
+    plan_pinned_power_widths,
+)
 from .scoring import LayoutScore, score_placement, score_placement_quick
 from .spatial import SpatialGrid
 from .validator import ValidationResult, find_kicad_cli, run_kicad_drc, validate

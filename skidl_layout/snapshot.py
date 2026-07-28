@@ -80,6 +80,7 @@ class SnapshotPart:
         "pins",
         "_pin_len",
         "decouples",
+        "fields",
     )
 
     def __init__(
@@ -93,6 +94,7 @@ class SnapshotPart:
         hierarchy,
         pin_len: int,
         decouples=None,
+        fields=None,
     ):
         self.ref = ref
         self.name = name
@@ -107,6 +109,12 @@ class SnapshotPart:
         # Threaded so the parallel-worker path matches the sequential one
         # (workers rebuild context from snapshots -- an untracked attr is lost).
         self.decouples = decouples
+        # ⚠ Threaded for the SAME reason ``decouples`` is: a worker rebuilds its
+        # context from a snapshot, and an untracked attribute is silently lost.
+        # ``power_escape.mark_escape_room`` writes into ``Part.fields``, so a
+        # declared IC would stop being declared inside a parallel worker without
+        # this. Only the keys the layout engine reads are carried.
+        self.fields = dict(fields or {})
 
     def __len__(self) -> int:
         # context._part_pin_count / roles._pin_count / congestion._pin_count try
@@ -147,6 +155,24 @@ def _decouples_target(part):
         return None
 
 
+#: The ``Part.fields`` keys the layout engine reads. Kept to a named allowlist
+#: so a board with a hundred BOM fields does not bloat every pickled snapshot.
+_SNAPSHOT_FIELDS = ("escape_room",)
+
+
+def _layout_fields(part):
+    """The subset of ``part.fields`` the layout engine actually consumes."""
+    out = {}
+    for holder in ("fields", "_extra_fields"):
+        store = getattr(part, holder, None)
+        if not isinstance(store, dict):
+            continue
+        for key in _SNAPSHOT_FIELDS:
+            if key in store:
+                out.setdefault(key, store[key])
+    return out
+
+
 def snapshot_circuit(circuit) -> SnapshotCircuit:
     """Build a picklable :class:`SnapshotCircuit` from a live skidl circuit.
 
@@ -174,6 +200,7 @@ def snapshot_circuit(circuit) -> SnapshotCircuit:
             hierarchy=getattr(part, "hierarchy", ""),
             pin_len=_pin_len(part),
             decouples=_decouples_target(part),
+            fields=_layout_fields(part),
         )
         for pin in getattr(part, "pins", []) or []:
             live_func = getattr(pin, "func", None)

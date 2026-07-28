@@ -7,6 +7,7 @@ discoverable, and route the real cap_chain fixture end to end.
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -331,6 +332,90 @@ def test_route_and_check_builds_power_net_args(monkeypatch, tmp_path):
     pw = args.index("--power-nets-widths")
     assert args[pn + 1:pn + 3] == ["VIN_12V", "V5"]
     assert args[pw + 1:pw + 3] == ["0.8", "0.5"]
+    # Phase 10: no map given -> no flag at all, so the argv is byte-identical to
+    # every call made before the parameter existed.
+    assert "--net-clearances" not in args
+
+
+def _capture_route_argv(monkeypatch, tmp_path, **kwargs):
+    """Run ``route_and_check`` against a stubbed KRT and return route.py's argv."""
+    fake = _make_usable_krt(tmp_path / "krt")
+    captured = {}
+
+    def fake_run(args, krt_dir, timeout_s):
+        captured.setdefault("args", args)
+
+        class P:
+            stdout = 'JSON_SUMMARY: {"successful": 1, "failed": 0}'
+            stderr = ""
+            returncode = 0
+        if args[0] == "route.py":
+            with open(args[2], "w", encoding="utf-8") as fh:
+                fh.write('(net 1 "V5")\n(segment (width 0.8) (net 1))\n')
+        return P()
+
+    monkeypatch.setattr(krt, "_run_krt", fake_run)
+    route_and_check(
+        str(tmp_path / "in.kicad_pcb"), str(tmp_path / "work"),
+        krt_dir=str(fake), **kwargs)
+    return captured["args"]
+
+
+def test_net_clearances_are_written_as_json_and_passed_to_route(monkeypatch, tmp_path):
+    """Phase 10's lever reaches KRT as ``--net-clearances <json>``.
+
+    ⚠⚠ It is passed **alongside** ``--clearance``, and that combination is the
+    whole question the phase had to settle by measurement: KRT documents
+    ``--clearance`` as a pure CEILING over every net class, but the clamp applies
+    only to the map it auto-reads from a sibling ``.kicad_pro`` -- an explicit
+    map is used as-is (``route.py`` ~2732-2748). Measured on ``lt3758_flyback``:
+    ``SW``<->``VIN`` went 0.1984 mm -> 0.552 mm with the ceiling still 0.25.
+    """
+    args = _capture_route_argv(
+        monkeypatch, tmp_path, clearance=0.25,
+        net_clearances={"VIN": 0.6, "SW": 0.6})
+    assert "--clearance" in args and args[args.index("--clearance") + 1] == "0.25"
+    assert "--net-clearances" in args
+    path = args[args.index("--net-clearances") + 1]
+    with open(path, encoding="utf-8") as handle:
+        assert json.load(handle) == {"SW": 0.6, "VIN": 0.6}
+
+
+def test_an_empty_net_clearance_map_emits_no_flag(monkeypatch, tmp_path):
+    """⛔ ``{}`` must mean "pass nothing", never "every net has no class".
+
+    An explicit ``--net-clearances`` REPLACES KRT's auto-read net-class map
+    rather than adding to it, so emitting the flag with an empty file would
+    throw away whatever classes the board carried.
+    """
+    for empty in ({}, None):
+        args = _capture_route_argv(
+            monkeypatch, tmp_path / str(empty), net_clearances=empty)
+        assert "--net-clearances" not in args
+
+
+def test_route_log_is_kept_when_asked_and_the_argv_is_unchanged(monkeypatch, tmp_path):
+    """Phase 11: KRT's fine-pitch **rescue ladder** announces itself on
+    ``route.py``'s stdout and nowhere else, and a rescue is what necks a net
+    below the per-net clearance the spacing lever asked for. Keeping the log is
+    how that mechanism gets re-derived instead of quoted.
+
+    ⛔ The route itself must not change -- no new flag, same argv.
+    """
+    log = tmp_path / "logs" / "route_log.txt"
+    args = _capture_route_argv(monkeypatch, tmp_path, route_log_path=str(log))
+
+    assert log.is_file()
+    assert "rescued a gap" not in log.read_text()      # the stub rescues nothing
+    assert not any(str(a).startswith("--route-log") for a in args)
+    assert "--net-clearances" not in args
+
+
+def test_no_route_log_path_writes_nothing(monkeypatch, tmp_path):
+    """Default OFF -> byte-identical to every call made before it existed."""
+    _capture_route_argv(monkeypatch, tmp_path)
+
+    assert not list((tmp_path / "work").glob("route_log*"))
 
 
 # --------------------------------------------------------------------------

@@ -12,7 +12,31 @@ POWER_NET_RE = re.compile(
     r")$",
     re.IGNORECASE,
 )
-GND_NET_RE = re.compile(r"^(GND|VSS|DGND|AGND|GNDA|GNDD)$", re.IGNORECASE)
+#: Ground nets, as **named alternatives** -- never a general ``.*GND.*``.
+#:
+#: ⚠⚠ ``SGND`` and ``PGND`` were added by Phase 9 (WS-2a). The set previously
+#: carried the *digital/analog* split (``AGND``/``DGND``/``GNDA``/``GNDD``) and
+#: not the *signal/power* one that every switching-controller datasheet demands,
+#: so a board built to that rule lost its ground plane entirely: on
+#: ``lt3724_buck`` neither ground was recognised, ``power.py`` promoted ``VIN``
+#: and ``VOUT`` instead, and the board shipped with 71 routed ground segments and
+#: **0 ground zones**.
+#:
+#: ⛔ Deliberately NOT a substring rule. ``GND_SENSE``, ``GND_KELVIN`` and friends
+#: are Kelvin *measurement* nodes, not grounds, and ``power.py``'s suffix
+#: alternatives (line ~28) contain no ground bases on purpose so that a
+#: ``GND_*`` name can never become a supply either. Two named additions, both
+#: real pin names on parts already in the corpus.
+#:
+#: ⚠ This regex reaches ``classify_parts`` and eight call sites in ``power.py``,
+#: and ``plan_power_routes`` runs inside ``score_placement`` -- so a widening can
+#: in principle move a placement digest. It does not here, and the reason is
+#: structural rather than lucky: adding two *named* alternatives can only change
+#: behaviour on a board that actually carries a net spelled ``SGND`` or ``PGND``,
+#: and no Phase-0 board and no MCU canary does.
+GND_NET_RE = re.compile(
+    r"^(GND|VSS|DGND|AGND|GNDA|GNDD|SGND|PGND)$", re.IGNORECASE
+)
 DECAP_VALUE_RE = re.compile(r"^(100n|0\.1u)", re.IGNORECASE)
 AUDIO_JACK_RE = re.compile(
     r"(audio.?jack|audio.?plug|3\.5\s*mm|3\.5mm|mono.?jack|"

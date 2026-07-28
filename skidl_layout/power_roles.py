@@ -116,21 +116,109 @@ CONTROLLER_PIN_NAMES = frozenset({
     # gate drive
     "GATE", "DRV", "DRIVE", "DRVH", "DRVL", "HO", "LO", "TG", "BG", "GH", "GL",
     # switch node / bootstrap brought out of an integrated switcher
-    "SW", "LX", "PH", "BOOT", "BST",
+    "SW", "LX", "PH", "BOOT", "BST", "BOOST",
     # housekeeping unique to switchers
     "INTVCC", "RT", "FREQ", "FSW", "SS",
 })
 
 #: The controller pins that drive an external switch's gate or base.
+#:
+#: ⚠⚠ This table is what *anchors a stage* -- a part with one of these names and
+#: a MOSFET on the far end becomes a power stage, and a false stage poisons every
+#: phase downstream. Widen it only with a name that appears on a real shipping
+#: part, and never with a generic one. ``OUT`` is the standing example of what
+#: must stay out: it is a genuine UC384x pin name and also the most common pin
+#: name in any symbol library, so it needs a compound rule (``OUT`` on a part
+#: that *also* has ``FB`` and ``CS``) gated on its own (Phase-7 bail-out 3).
 DRIVE_PIN_NAMES = frozenset({
     "GATE", "DRV", "DRIVE", "DRVH", "DRVL", "HO", "LO", "TG", "BG", "GH", "GL",
+    "DR",             # LM3478 / LM3488 -- the whole gate-drive pin name
 })
 
-#: The controller's current-sense input.
-SENSE_PIN_NAMES = frozenset({"SENSE", "ISENSE", "VSENSE", "CS", "CSENSE"})
+#: Drive-pin names admitted **only under a compound condition** (Phase 9, WS-4).
+#:
+#: ``OUT`` is a genuine UC384x gate-drive pin name and simultaneously the most
+#: generic pin name in any symbol library, so it cannot join
+#: :data:`DRIVE_PIN_NAMES` on its own: an op-amp, a comparator, a regulator and a
+#: logic gate all have an ``OUT``, and a stage invented on one of those poisons
+#: every phase downstream. It counts only on a part that *also* carries a
+#: feedback pin **and** a current-sense pin -- ``OUT`` and ``FB`` and ``CS``
+#: together are a switching controller's signature, not a coincidence.
+#: ``Regulator_Controller:UC3844_DIP8`` ships ``COMP FB CS RC GND OUT VCC VREF``,
+#: which is exactly that conjunction (verified against the shipped symbol, not
+#: against a datasheet -- see ``FEEDBACK_PIN_NAMES``' note on ``SET``).
+#:
+#: Set this to ``frozenset()`` to measure the pre-WS-4 behaviour; that is what
+#: ``drive_phase9.py`` does to keep "classifies silent *before* the rule"
+#: permanently re-measurable rather than a recorded number.
+COMPOUND_DRIVE_PIN_NAMES = frozenset({"OUT"})
 
-#: The controller's feedback input.
-FEEDBACK_PIN_NAMES = frozenset({"FB", "FBX", "VFB", "FEEDBACK"})
+#: What else the same part must carry before a :data:`COMPOUND_DRIVE_PIN_NAMES`
+#: pin counts as gate drive. **Every** group must be present.
+COMPOUND_DRIVE_REQUIRES: tuple[frozenset[str], ...] = ()   # bound below
+
+#: Device kinds a stage anchor may walk **through**, one hop, between the
+#: controller's drive pin and the switch's gate (Phase 9, WS-3).
+#:
+#: A series gate resistor is ubiquitous -- the LT3724's own front-page circuit
+#: puts 10 ohm between ``TG`` and the MOSFET gate -- and before this hop existed
+#: any such board classified as **0 stages** with "gate-drive pin reaches no
+#: external switch device". It is the same one-hop walk ``_series_reachable``
+#: already does for the rail code.
+#:
+#: ⚠⚠ Restricted to ``resistor`` on purpose, and this is the risky table in the
+#: module. This hop runs at the **anchor**, so a false positive does not
+#: mis-*describe* a stage, it **invents** one. A capacitor between a drive pin
+#: and a gate is a different circuit (AC coupling, a snubber), and admitting any
+#: 2-pin part is how a false anchor gets built. Set to ``frozenset()`` to
+#: disable the hop entirely.
+DRIVE_SERIES_HOP_KINDS = frozenset({"resistor"})
+
+#: The controller's current-sense input. Unlike :data:`DRIVE_PIN_NAMES` this set
+#: only *refines* a stage that has already been anchored, so widening it cannot
+#: create a false positive.
+#: ⚠ ``ISP``/``ISN`` are deliberately ABSENT. On the LT8710 they are a second,
+#: differential sense pair that measures **output** current for its current-control
+#: loop -- a different quantity from the cycle-by-cycle switch current this table
+#: is looking for. Admitting them would let the classifier pick the output shunt
+#: as "the sense resistor" on any part that has both.
+SENSE_PIN_NAMES = frozenset({
+    "SENSE", "ISENSE", "VSENSE", "CS", "CSENSE",
+    "SENSE+", "SENSE-",   # LT3724, LT3844 (differential Kelvin sense pair)
+    "CSP", "CSN",         # LT8710 (switch-current sense pair)
+})
+
+#: Device kinds the **sense node** may walk through, one hop, between the
+#: controller's sense pin and the switch's return terminal (Phase 10, WS-4).
+#:
+#: A UC384x's leading-edge blanking filter is near-universal: a series resistor
+#: from the shunt to ``CS`` with a small capacitor to ground, suppressing the
+#: turn-on current spike. It puts the ``CS`` pin one resistor away from the
+#: shunt, and the positional sense test requires the two to share a net -- so
+#: ``uc3844_flyback`` reported ``sense_resistor=None`` while its
+#: ``cs_filter=False`` twin reported ``RS``. Structurally the same defect
+#: :data:`DRIVE_SERIES_HOP_KINDS` fixed at the anchor, one refinement step later.
+#:
+#: ⚠ This hop is **strictly safer than the anchor's**, and the reason is the one
+#: in :data:`SENSE_PIN_NAMES`'s own docstring: the sense table only *refines* a
+#: stage that is already anchored, so a false positive here cannot invent a
+#: stage -- at worst it mis-names one part of a stage that exists either way.
+#: Restricted to ``resistor`` regardless, for the same reason the anchor is: the
+#: *capacitor* in an RC filter goes to ground, and a capacitor in the series
+#: position is a different circuit. Set to ``frozenset()`` to disable the hop.
+SENSE_SERIES_HOP_KINDS = frozenset({"resistor"})
+
+#: The controller's feedback input. Also a refinement set, not an anchor.
+#:
+#: ⚠ ``SET`` is here because KiCad's own ``Regulator_Controller:LTC1624CS8``
+#: spells the feedback pin that way. The **LTC1624 datasheet does not** -- p.2
+#: gives ``V_FB``, which this table already accepted. So the classifier was
+#: right and the shipped library symbol is wrong; ``SET`` is admitted because it
+#: is what a user of this stack actually binds, not because a datasheet says so.
+FEEDBACK_PIN_NAMES = frozenset({
+    "FB", "FBX", "VFB", "FEEDBACK",
+    "SET",            # Regulator_Controller:LTC1624CS8 (library spelling; see above)
+})
 
 #: The controller's genuinely **high-impedance** pins -- feedback, loop
 #: compensation, oscillator timing, soft start. The network hanging off these is
@@ -138,8 +226,13 @@ FEEDBACK_PIN_NAMES = frozenset({"FB", "FBX", "VFB", "FEEDBACK"})
 #: node", and it is exactly this set (not every non-power pin) that defines it:
 #: ``INTVCC`` is a bypassed regulator output and ``UVLO`` a stiff divider off the
 #: input rail, so neither belongs here.
+#: ``ITH`` is the same thing ``VC``/``COMP`` are -- the error amplifier's output,
+#: the highest-impedance node on the part -- under Linear Technology's naming
+#: (``LTC1624`` pin ``I_TH/RUN``, ``LTC1871`` pin ``ITH``). It is deliberately
+#: **not** added to :data:`CONTROLLER_PIN_NAMES`: this set refines a stage that
+#: already exists, while that one helps decide a part *is* a controller.
 SMALL_SIGNAL_PIN_NAMES = FEEDBACK_PIN_NAMES | frozenset({
-    "VC", "VCOMP", "COMP", "RT", "FREQ", "FSW", "SS",
+    "VC", "VCOMP", "COMP", "RT", "FREQ", "FSW", "SS", "ITH",
 })
 
 #: The controller's supply input.
@@ -150,6 +243,12 @@ SUPPLY_PIN_NAMES = frozenset({"VIN", "VCC", "VDD", "VS", "VBIAS", "VIN+"})
 GROUND_PIN_NAMES = frozenset({
     "GND", "VSS", "AGND", "DGND", "PGND", "SGND", "GNDA", "GNDD", "VEE",
 })
+
+# ``COMPOUND_DRIVE_REQUIRES`` is declared next to ``COMPOUND_DRIVE_PIN_NAMES``
+# above, where it is documented, and bound here because it names two tables that
+# are defined further down. A switching controller closes a voltage loop and a
+# current loop; a part with a generic ``OUT`` that does neither is not one.
+COMPOUND_DRIVE_REQUIRES = (FEEDBACK_PIN_NAMES, SENSE_PIN_NAMES)
 
 
 # --------------------------------------------------------------------------- #
@@ -407,6 +506,19 @@ class _View:
                 seen.append(net)
         return seen
 
+    def pin_tokens(self, ref: str) -> frozenset[str]:
+        """Every normalised pin-name token this part carries.
+
+        What a *part* is, from its pin table alone -- the same library fact
+        ``_device_kind`` reads, hoisted so the compound drive-pin rule
+        (:data:`COMPOUND_DRIVE_PIN_NAMES`) can ask "does this part also have FB
+        and CS" without re-walking the symbol.
+        """
+        out: set[str] = set()
+        for tokens, _net in self.part_pins.get(ref, ()):
+            out |= tokens
+        return frozenset(out)
+
     def sorted_refs(self, refs) -> list[str]:
         """Refs in circuit-part order -- never alphabetical (that is naming)."""
         return sorted(set(refs), key=lambda r: self.order.get(r, 1 << 30))
@@ -464,6 +576,18 @@ class PowerStage:
     #: Parts hanging off the controller's high-impedance pins. These are the ones
     #: a datasheet wants kept away from the switch node.
     small_signal_refs: list[str] = field(default_factory=list)
+    #: **Every** ground this stage returns through, sorted (Phase 10, WS-4).
+    #:
+    #: ``ground_net`` above reports ONE, which is the right shape for a caller
+    #: that wants "the" ground and wrong for a board that has two. On
+    #: ``lt3724_buck`` the reported one is ``SGND`` while the hot loop physically
+    #: returns through ``PGND``; Phase 9 shipped a ``split ground:`` warning
+    #: naming both, which is honest but is prose. This is the field.
+    #:
+    #: ⛔ **Added, never renamed.** ``ground_net`` keeps its meaning and its
+    #: value; on a single-ground board this list has exactly one member and it is
+    #: that value, so nothing downstream can read a change that did not happen.
+    ground_nets: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
 
     def device(self, ref: str) -> PowerDevice | None:
@@ -483,6 +607,7 @@ class PowerStage:
             "input_rail": self.input_rail,
             "output_rail": self.output_rail,
             "ground_net": self.ground_net,
+            "ground_nets": list(self.ground_nets),
             "devices": [dev.to_dict() for dev in self.devices],
             "loops": [loop.to_dict() for loop in self.loops],
             "feedback_divider": (
@@ -530,6 +655,10 @@ class PowerStagePlan:
                 f"in={stage.input_rail} out={stage.output_rail} "
                 f"sw={', '.join(stage.switch_node_nets) or 'n/a'} "
                 f"gnd={stage.ground_net}"
+                # Only when there is more than one: a single-ground board must
+                # print exactly what it printed before this field existed.
+                + (f" (grounds: {', '.join(stage.ground_nets)})"
+                   if len(stage.ground_nets) > 1 else "")
             )
             for loop in stage.loops:
                 lines.append(
@@ -577,14 +706,62 @@ def _find_ground(view: _View, kinds: dict[str, PowerDevice]) -> str | None:
     )
 
 
-def _caps_to(view: _View, kinds, net: str, other: str) -> list[str]:
-    """Capacitors bridging ``net`` and ``other`` (normally a rail and ground)."""
+def _find_grounds(view: _View, kinds: dict[str, PowerDevice], ground) -> frozenset[str]:
+    """**Every** net a controller calls ground -- not just the primary one.
+
+    ⚠⚠ Phase 9. ``_find_ground`` answers "which net do I report as *the* ground",
+    which a stage still needs (a commutation loop returns through one net). But
+    every *test* in this module -- does this rail have a capacitor to ground, does
+    this rectifier freewheel from ground, is this the divider's bottom leg -- is
+    asking a different question, and on a split-ground board the answer is "any
+    of them".
+
+    ``lt3724_buck`` is the board that proves it. Its LT3724 brings out ``SGND``
+    and ``PGND`` as separate pins and no pin named ``GND`` at all, exactly as the
+    datasheet's PCB Layout Checklist demands, and the two are tied at one point
+    by a 0 ohm link. ``_find_ground`` picks ``SGND`` (10 pins beats 6) -- and then
+    ``CIN`` returns to ``PGND``, ``D1``'s anode is on ``PGND``, and the classifier
+    concluded there was no input rail, no output rail, no catch rectifier and no
+    topology. It was not confused about the circuit; it was asking about one net
+    on a board that has two.
+
+    On every single-ground board this returns ``{ground}``, so nothing that
+    already worked can move -- the same structural argument ``roles.GND_NET_RE``'s
+    two named additions rest on.
+    """
+    found: list[str] = []
+    for ref, dev in kinds.items():
+        if dev.kind != "controller":
+            continue
+        for net in view.nets_of_pins(ref, GROUND_PIN_NAMES):
+            if net not in found:
+                found.append(net)
+    if ground is not None and ground not in found:
+        found.append(ground)
+    return frozenset(found)
+
+
+def _caps_to(view: _View, kinds, net: str, other) -> list[str]:
+    """Capacitors bridging ``net`` and ``other`` (normally a rail and ground).
+
+    ``other`` is a net name **or a set of them**. A split-ground board has more
+    than one ground, and "does this rail have a capacitor to ground" has to be
+    true when the capacitor returns to *either* of them: on ``lt3724_buck`` the
+    input capacitor returns to ``PGND`` while the classifier's primary ground is
+    ``SGND``, and asking about one net alone answered no to every rail on the
+    board. With a single ground the set has one member and this is the original
+    test exactly -- which is why the change cannot move a single-ground result.
+    """
+    targets = {other} if isinstance(other, str) else set(other or ())
+    targets.discard(net)
+    if not targets:
+        return []
     found = []
     for ref in view.refs_on(net):
         dev = kinds.get(ref)
         if dev is None or dev.kind != "capacitor":
             continue
-        if other in view.nets_of(ref) and other != net:
+        if targets.intersection(view.nets_of(ref)):
             found.append(ref)
     return view.sorted_refs(found)
 
@@ -592,6 +769,43 @@ def _caps_to(view: _View, kinds, net: str, other: str) -> list[str]:
 def _two_terminal_other_net(view: _View, ref: str, net: str) -> str | None:
     others = [n for n in view.nets_of(ref) if n != net]
     return others[0] if len(others) == 1 else None
+
+
+def _series_reachable(view: _View, kinds, starts, ground) -> list[tuple[str, str | None]]:
+    """``(net, through_ref)`` for each start net and each net one resistor away.
+
+    A step-down's input rail is not something the magnetics can point at -- the
+    inductor is on the *output* side -- so it has to be found from the switch's
+    other power terminal instead. That terminal is either the input rail itself
+    or one **high-side sense resistor** away from it (``LTC1624``: ``VIN -> RS ->
+    the FET drain``), which is exactly the one extra hop this walk allows.
+    ``through_ref`` is ``None`` for the start nets themselves, and the resistor's
+    reference for the nets reached through one.
+
+    Deliberately one hop deep: two would start walking feedback dividers and
+    UVLO strings onto the power path.
+    """
+    grounds = {ground} if isinstance(ground, str) else set(ground or ())
+    seen: set[str] = set()
+    out: list[tuple[str, str | None]] = []
+    for net in starts:
+        if net is None or net in grounds or net in seen:
+            continue
+        seen.add(net)
+        out.append((net, None))
+    for net in starts:
+        if net is None or net in grounds:
+            continue
+        for ref in view.refs_on(net):
+            dev = kinds.get(ref)
+            if dev is None or dev.kind != "resistor":
+                continue
+            other = _two_terminal_other_net(view, ref, net)
+            if other is None or other in grounds or other in seen:
+                continue
+            seen.add(other)
+            out.append((other, ref))
+    return out
 
 
 def _winding_partner_net(view: _View, part, ref: str, net: str) -> str | None:
@@ -618,6 +832,83 @@ def _winding_partner_net(view: _View, part, ref: str, net: str) -> str | None:
     return None
 
 
+def _sepic_family(view: _View, kinds, part_by_ref, switch_node, grounds,
+                  magnetics_ref):
+    """Is this a SEPIC or a Cuk, and if so what carries the output? (Phase 9, WS-5.)
+
+    Both topologies have the same skeleton and differ in exactly one place, which
+    is why they are decided together: a **coupling capacitor** bridges the switch
+    node and a second node, and that second node carries a **second magnetic**.
+    What the second magnetic's far terminal is then separates them:
+
+    * far terminal on **ground** -> the output leaves through a rectifier on the
+      coupling node, cathode on a positive rail: a **SEPIC**;
+    * far terminal on **a rail with capacitors to ground** -> that winding *is*
+      the output leg and the rectifier faces ground: a **Cuk** (the dual-inductor
+      inverting converter, whose output is negative).
+
+    ⚠⚠ Both of these were called ``flyback`` before this function existed, because
+    ``topology`` keyed on **winding count alone** -- so every coupled-inductor
+    SEPIC / Cuk / inverting converter in existence was mislabelled, and a
+    *discrete*-inductor one got no topology at all. The coupling capacitor is what
+    a winding count cannot see.
+
+    ⛔ The "second node carries a magnetic" test is the safety, not a detail. A
+    bootstrap capacitor also bridges the switch node and another node
+    (``BOOST``/``SW`` on any high-side driver, ``lt3724_buck``'s ``CB``), and that
+    node carries no winding -- so it is rejected here rather than by a name.
+
+    Returns ``(family, coupling_cap_ref, second_magnetics_ref, mid_node,
+    output_rail, output_rectifier)``; ``family`` is ``None`` when this is neither.
+    """
+    blank = (None, None, None, None, None, None)
+    if switch_node is None or not grounds or magnetics_ref is None:
+        return blank
+
+    for cap_ref in view.refs_on(switch_node):
+        dev = kinds.get(cap_ref)
+        if dev is None or dev.kind != "capacitor":
+            continue
+        mid = _two_terminal_other_net(view, cap_ref, switch_node)
+        if mid is None or mid in grounds or mid == switch_node:
+            continue
+
+        # The second magnetic: the same coupled part's other winding, or a
+        # genuinely separate inductor. Both are real builds of both topologies
+        # (the LT3757's SEPIC couples them, the LT8710's Cuk does not).
+        second = next((r for r in view.refs_on(mid)
+                       if kinds.get(r) and kinds[r].kind == "magnetics"), None)
+        if second is None:
+            continue
+        partner = _winding_partner_net(view, part_by_ref.get(second), second, mid)
+        if partner == switch_node:
+            continue
+
+        if partner in grounds:
+            # SEPIC: the second winding returns to ground and the rectifier on
+            # the coupling node delivers a POSITIVE rail.
+            for ref in view.refs_on(mid):
+                rect = kinds.get(ref)
+                if rect is None or rect.kind != "rectifier":
+                    continue
+                if mid not in view.nets_of_pins(ref, frozenset({"A"})):
+                    continue
+                cathode = next(iter(view.nets_of_pins(ref, frozenset({"K"}))), None)
+                if cathode is None or cathode in grounds or not _caps_to(
+                        view, kinds, cathode, grounds):
+                    continue
+                return "sepic", cap_ref, second, mid, cathode, ref
+            continue
+
+        if partner is not None and _caps_to(view, kinds, partner, grounds):
+            # Cuk / dual-inductor inverting: the second winding IS the output
+            # leg. This is Phase-1 limitation L-3's board -- the output sits
+            # beyond a SECOND magnetic, which the rail walk never reaches.
+            return "cuk", cap_ref, second, mid, partner, None
+
+    return blank
+
+
 def _small_signal_refs(view: _View, controller_ref: str, ground) -> list[str]:
     """Parts on the controller's high-impedance pins, plus private continuations.
 
@@ -627,10 +918,11 @@ def _small_signal_refs(view: _View, controller_ref: str, ground) -> list[str]:
     without escaping onto the output rail through the feedback divider's top
     resistor, whose far net is shared with half the board.
     """
+    grounds = {ground} if isinstance(ground, str) else set(ground or ())
     found: list[str] = []
     frontier: list[str] = []
     for net in view.nets_of_pins(controller_ref, SMALL_SIGNAL_PIN_NAMES):
-        if net == ground:
+        if net in grounds:
             continue
         for ref in view.refs_on(net):
             if ref != controller_ref and ref not in found:
@@ -638,7 +930,7 @@ def _small_signal_refs(view: _View, controller_ref: str, ground) -> list[str]:
                 frontier.append(ref)
     for ref in frontier:
         for net in view.nets_of(ref):
-            if net == ground or view.pin_count(net) != 2:
+            if net in grounds or view.pin_count(net) != 2:
                 continue
             for neighbour in view.refs_on(net):
                 if neighbour != ref and neighbour != controller_ref \
@@ -677,7 +969,14 @@ def _loop_capacitor(view: _View, part_by_ref, candidates: list[str]):
 
     ordered = sorted(candidates, key=key)
     if not ordered:
-        return None, []
+        # ⚠ Three values, not two. Every caller unpacks three, and this path is
+        # reached whenever the loop's far rail has no capacitor to the net the
+        # classifier picked as ground -- which is exactly what a SPLIT GROUND
+        # produces (``lt3724_buck``: ``CIN`` returns to ``PGND`` while the
+        # classifier chose ``SGND``). Returning a 2-tuple here raised
+        # ``ValueError: not enough values to unpack (expected 3, got 2)`` at the
+        # one moment the classifier was about to give up quietly.
+        return None, [], False
     # Say so when the answer rested on the value, not on the symbol: a rail
     # shared with another consumer (an LDO's input cap sitting on the same node)
     # can hand the loop a capacitor that belongs to something else, and the
@@ -690,34 +989,111 @@ def _loop_capacitor(view: _View, part_by_ref, candidates: list[str]):
 # Stage assembly
 # --------------------------------------------------------------------------- #
 
-def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
+def _drive_pin_names(view: _View, controller_ref: str) -> frozenset[str]:
+    """The drive-pin table ``controller_ref`` earns, compound rule included.
+
+    :data:`DRIVE_PIN_NAMES` always; a :data:`COMPOUND_DRIVE_PIN_NAMES` entry only
+    when the same part carries every group in :data:`COMPOUND_DRIVE_REQUIRES`.
+    """
+    if not COMPOUND_DRIVE_PIN_NAMES:
+        return DRIVE_PIN_NAMES
+    tokens = view.pin_tokens(controller_ref)
+    earned = tokens & COMPOUND_DRIVE_PIN_NAMES
+    if not earned:
+        return DRIVE_PIN_NAMES
+    if not all(tokens & required for required in COMPOUND_DRIVE_REQUIRES):
+        return DRIVE_PIN_NAMES
+    return DRIVE_PIN_NAMES | earned
+
+
+def _switches_on(view: _View, kinds, nets) -> list[str]:
+    """Switch devices whose gate/base sits on one of ``nets``."""
+    found: list[str] = []
+    for net in nets:
+        for ref in view.refs_on(net):
+            dev = kinds.get(ref)
+            if dev is None or dev.kind != "switch" or ref in found:
+                continue
+            if net in view.nets_of_pins(ref, SWITCH_CONTROL_PINS):
+                found.append(ref)
+    return found
+
+
+def _gate_series_hops(view: _View, kinds, drive_nets) -> list[tuple[str, str]]:
+    """``(net, through_ref)`` one permitted series element out of each drive net.
+
+    The gate-resistor hop (:data:`DRIVE_SERIES_HOP_KINDS`). Deliberately one hop
+    and deliberately kind-restricted; see that constant for why. The element must
+    be a genuine two-terminal part -- ``_two_terminal_other_net`` returns ``None``
+    for anything with a third net, so a resistor network cannot smuggle the walk
+    somewhere else.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for net in drive_nets:
+        for ref in view.refs_on(net):
+            dev = kinds.get(ref)
+            if dev is None or dev.kind not in DRIVE_SERIES_HOP_KINDS:
+                continue
+            other = _two_terminal_other_net(view, ref, net)
+            if other is None or other in seen or other in drive_nets:
+                continue
+            seen.add(other)
+            out.append((other, ref))
+    return out
+
+
+def _build_stage(view: _View, kinds, ground, controller_ref, warnings,
+                 grounds=None):
     """Assemble the stage driven by ``controller_ref``, or ``None``.
 
     The stage is **anchored on the controller-to-switch gate connection**: the
     controller's ``GATE``/``DRV`` pin and a switch device's gate or base must
-    share a net. That is a deliberately strict entry condition -- it is what keeps
-    an MCU board with a reset transistor, or an avalanche pulser's discharge
-    transistor, from being reported as a converter (plan gate G3).
+    share a net, **or be one series resistor apart** (Phase 9, WS-3 -- see
+    :data:`DRIVE_SERIES_HOP_KINDS`). That is still a deliberately strict entry
+    condition -- it is what keeps an MCU board with a reset transistor, or an
+    avalanche pulser's discharge transistor, from being reported as a converter
+    (plan gate G3).
+
+    ``ground`` is the one net the stage *reports* returning through; ``grounds``
+    is every net the controller calls ground (:func:`_find_grounds`). Every test
+    below asks the second question, because a split-ground board answers "does
+    this return to ground" with "yes, to one of them". They are the same set on
+    every single-ground board.
     """
+    grounds = frozenset(grounds if grounds is not None
+                        else ([ground] if ground is not None else []))
     reasons: list[str] = []
-    drive_nets = view.nets_of_pins(controller_ref, DRIVE_PIN_NAMES)
+    drive_nets = view.nets_of_pins(controller_ref,
+                                   _drive_pin_names(view, controller_ref))
     if not drive_nets:
         return None, "no gate-drive pin (integrated-switch topologies are not classified in Phase 1)"
 
-    switches = []
-    for net in drive_nets:
-        for ref in view.refs_on(net):
-            dev = kinds.get(ref)
-            if dev is None or dev.kind != "switch" or ref in switches:
-                continue
-            if net in view.nets_of_pins(ref, SWITCH_CONTROL_PINS):
-                switches.append(ref)
+    switches = _switches_on(view, kinds, drive_nets)
+    gate_series_ref = None
+    if switches:
+        reasons.append(
+            "controller drive pin shares a net with the gate/base of "
+            + ", ".join(view.sorted_refs(switches))
+        )
+    elif DRIVE_SERIES_HOP_KINDS:
+        # ⚠ Only after the direct test has failed. A board that anchors directly
+        # must never change its answer because a resistor happens to hang off the
+        # same drive net.
+        for net, through in _gate_series_hops(view, kinds, drive_nets):
+            hop = _switches_on(view, kinds, [net])
+            if hop:
+                switches = hop
+                gate_series_ref = through
+                reasons.append(
+                    f"controller drive pin reaches the gate/base of "
+                    f"{', '.join(view.sorted_refs(hop))} through the series "
+                    f"{through}"
+                )
+                break
     if not switches:
         return None, "gate-drive pin reaches no external switch device"
     switches = view.sorted_refs(switches)
-    reasons.append(
-        f"controller drive pin shares a net with the gate/base of {', '.join(switches)}"
-    )
 
     # -- the switch node: a switch power terminal that also touches magnetics --
     switch_ref = switches[0]
@@ -737,57 +1113,227 @@ def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
 
     return_nets = [n for n in power_nets if n != switch_node]
 
-    # -- the sense node and its resistor ------------------------------------
+    # -- step-down or not: the catch rectifier decides -----------------------
+    # A boost or flyback puts the rectifier's ANODE on the switch node and takes
+    # the output off its cathode. A step-down inverts that -- the freewheel diode
+    # conducts *from ground into the switch node*, so its CATHODE is the terminal
+    # that sits there -- and the inductor's far terminal, not the diode, is the
+    # output rail.
+    #
+    # Everything below hangs off this one test. Before Phase 7 the classifier had
+    # only the boost shape, so on an ``LTC1624`` buck it reported ``input_rail =
+    # VOUT``, ``output_rail = None``, no sense resistor, no divider, the output
+    # cap typed ``input_cap`` and the diode not found -- confidently, with no
+    # warning, and every downstream phase consumed it.
+    catch_rectifier = None
+    if grounds:
+        for ref in view.refs_on(switch_node):
+            dev = kinds.get(ref)
+            if dev is None or dev.kind != "rectifier":
+                continue
+            # ⚠ ANY ground: on a split-ground buck the catch diode's anode is on
+            # the POWER ground by the datasheet's own instruction, while the
+            # classifier's primary ground is the signal one.
+            if switch_node in view.nets_of_pins(ref, frozenset({"K"})) and \
+                    grounds.intersection(view.nets_of_pins(ref, frozenset({"A"}))):
+                catch_rectifier = ref
+                break
+    step_down = catch_rectifier is not None
+    if step_down:
+        reasons.append(
+            "a rectifier freewheels from ground into the switch node -- step-down"
+        )
+
+    # -- the sense node ------------------------------------------------------
     sense_nets = view.nets_of_pins(controller_ref, SENSE_PIN_NAMES)
     sense_node = next((n for n in return_nets if n in sense_nets), None)
+    if sense_node is None and SENSE_SERIES_HOP_KINDS:
+        # The CS-filter hop (Phase 10). The direct test above runs FIRST, so a
+        # board whose sense pin already sits on the switch return can never
+        # change its answer -- the same ordering guard the gate-resistor hop
+        # uses. One hop, resistors only, and the far end must be a return net
+        # the switch actually drives, so an arbitrary resistor to the sense pin
+        # cannot pull the sense node somewhere the switch does not reach.
+        for net in sense_nets:
+            for ref in view.sorted_refs(view.refs_on(net)):
+                dev = kinds.get(ref)
+                if dev is None or dev.kind not in SENSE_SERIES_HOP_KINDS:
+                    continue
+                bridged = [n for n in view.nets_of(ref) if n != net]
+                far = next((n for n in bridged if n in return_nets), None)
+                if far is not None:
+                    sense_node = far
+                    reasons.append(
+                        f"the sense pin reaches the switch return through the "
+                        f"series {ref} -- leading-edge CS filter"
+                    )
+                    break
+            if sense_node is not None:
+                break
+
+    # -- rails ---------------------------------------------------------------
+    magnetics_part = view.part_by_ref.get(magnetics_ref)
+    winding_partner = _winding_partner_net(view, magnetics_part, magnetics_ref, switch_node)
+    supply_nets = [n for n in view.nets_of_pins(controller_ref, SUPPLY_PIN_NAMES)
+                   if n not in grounds]
+
+    input_rail = None
+    output_rail = None
+    output_rectifier = None
+    output_through = None          # the series element between L and the rail
+
+    if step_down:
+        # The inductor is on the output side, so it cannot point at the input the
+        # way a boost's does. Walk out of the switch's other power terminal
+        # instead, allowing one high-side sense resistor in the way. A net the
+        # controller calls a supply wins outright; otherwise a net with a
+        # capacitor to ground will do.
+        reachable = _series_reachable(view, kinds, return_nets, grounds)
+        for net, _through in reachable:
+            if net in supply_nets:
+                input_rail = net
+                break
+        if input_rail is None:
+            for net, _through in reachable:
+                if _caps_to(view, kinds, net, grounds):
+                    input_rail = net
+                    break
+        # The output rail is the inductor's far terminal -- **or one series
+        # resistor beyond it**. That extra hop is not a convenience: an
+        # output-leg sense resistor is a standard step-down build (the LT3724
+        # puts ``SENSE+`` on the inductor side of ``R_SENSE`` and ``SENSE-`` on
+        # the ``V_OUT`` side, p.6), and it is the exact mirror of the hop the
+        # input side already allows for a high-side sense resistor. Without it
+        # the classifier reported no output rail, no divider and no topology on
+        # a textbook buck.
+        if winding_partner is not None and winding_partner not in grounds:
+            for net, through in _series_reachable(view, kinds, [winding_partner],
+                                                  grounds):
+                if net == input_rail:
+                    continue
+                if _caps_to(view, kinds, net, grounds):
+                    output_rail = net
+                    output_through = through
+                    if through is not None:
+                        reasons.append(
+                            f"output rail {net} sits one series {through} beyond "
+                            f"the inductor -- output-leg sense"
+                        )
+                    break
+    else:
+        for net in supply_nets:
+            if magnetics_ref in view.refs_on(net) and _caps_to(view, kinds, net,
+                                                               grounds):
+                input_rail = net
+                break
+        if input_rail is None and winding_partner is not None \
+                and winding_partner not in grounds:
+            if _caps_to(view, kinds, winding_partner, grounds):
+                input_rail = winding_partner
+
+        # A rectifier fed from the switch node (non-isolated) or from a winding
+        # terminal (isolated secondary) delivers the output rail on its cathode.
+        magnet_nets = [n for n in view.nets_of(magnetics_ref) if n not in grounds]
+        for net in [switch_node] + [n for n in magnet_nets if n != switch_node]:
+            for ref in view.refs_on(net):
+                dev = kinds.get(ref)
+                if dev is None or dev.kind != "rectifier":
+                    continue
+                if net not in view.nets_of_pins(ref, frozenset({"A"})):
+                    continue      # the anode must face the stage, not the load
+                cathode = next(iter(view.nets_of_pins(ref, frozenset({"K"}))), None)
+                if cathode is None or cathode in grounds or cathode == input_rail:
+                    continue
+                if not _caps_to(view, kinds, cathode, grounds):
+                    continue
+                output_rail, output_rectifier = cathode, ref
+                break
+            if output_rail:
+                break
+
+    # -- the SEPIC / Cuk family (Phase 9, WS-5) ------------------------------
+    # Run before the sense resistor, the divider and the loop, because on a Cuk
+    # it is what finds the output rail at all -- Phase-1 limitation L-3, whose
+    # whole content is that the output sits beyond a SECOND magnetic the rail
+    # walk never reaches. A step-down is excluded outright: its bootstrap
+    # capacitor bridges the switch node too, and a buck is already decidable.
+    sepic_family = coupling_cap_ref = second_magnetics_ref = coupling_node = None
+    if not step_down:
+        (sepic_family, coupling_cap_ref, second_magnetics_ref, coupling_node,
+         family_rail, family_rectifier) = _sepic_family(
+            view, kinds, view.part_by_ref, switch_node, grounds, magnetics_ref)
+        if sepic_family:
+            reasons.append(
+                f"{coupling_cap_ref} couples the switch node to "
+                f"{coupling_node}, which carries the second winding of "
+                f"{second_magnetics_ref} -- {sepic_family}"
+            )
+            # Never overwrite a rail the rail walk already resolved: on the
+            # SEPIC it gets the answer right on its own, and this branch exists
+            # for the Cuk, where it gets nothing.
+            if output_rail is None and family_rail is not None:
+                output_rail = family_rail
+                reasons.append(
+                    f"output rail {family_rail} found beyond the second "
+                    f"magnetic (Phase-1 limitation L-3)"
+                )
+            if output_rectifier is None and family_rectifier is not None:
+                output_rectifier = family_rectifier
+
+    # -- the sense resistor --------------------------------------------------
+    # Low-side sense returns the switch current to ground; high-side sense sits
+    # in the input leg instead (``LTC1624``: ``VIN -> RS -> the FET drain``, with
+    # the controller's own ``VIN`` pin as the ``SENSE+`` side). Both are a
+    # resistor bridging the sense node and a rail -- which rail is the topology's
+    # business, so the input-leg case can only be tested once the rails are known.
     sense_resistor = None
     if sense_node is not None:
         for ref in view.refs_on(sense_node):
             dev = kinds.get(ref)
             if dev is None or dev.kind != "resistor":
                 continue
-            if ground is not None and ground in view.nets_of(ref):
+            bridged = view.nets_of(ref)
+            if grounds.intersection(bridged):
                 sense_resistor = ref
+                reasons.append("sense resistor bridges the switch return and ground")
                 break
-        if sense_resistor:
-            reasons.append("sense resistor bridges the switch return and ground")
+            if input_rail is not None and input_rail in bridged:
+                sense_resistor = ref
+                reasons.append(
+                    "sense resistor bridges the switch return and the input rail"
+                )
+                break
 
-    # -- rails ---------------------------------------------------------------
-    magnetics_part = view.part_by_ref.get(magnetics_ref)
-    winding_partner = _winding_partner_net(view, magnetics_part, magnetics_ref, switch_node)
-
-    input_rail = None
-    for net in view.nets_of_pins(controller_ref, SUPPLY_PIN_NAMES):
-        if net == ground:
-            continue
-        if magnetics_ref in view.refs_on(net) and _caps_to(view, kinds, net, ground):
-            input_rail = net
-            break
-    if input_rail is None and winding_partner not in (None, ground):
-        if _caps_to(view, kinds, winding_partner, ground):
-            input_rail = winding_partner
-
-    # A rectifier fed from the switch node (non-isolated) or from a winding
-    # terminal (isolated secondary) delivers the output rail on its cathode.
-    magnet_nets = [n for n in view.nets_of(magnetics_ref) if n != ground]
-    output_rail = None
-    output_rectifier = None
-    for net in [switch_node] + [n for n in magnet_nets if n != switch_node]:
-        for ref in view.refs_on(net):
+    if sense_resistor is None and len(sense_nets) >= 2:
+        # ⚠ Output-leg sense (Phase 9). The two cases above both assume the sense
+        # resistor sits in the *switch's* return, which is where a boost and a
+        # high-side-sense buck put it. The LT3724 does not: ``R_SENSE`` is in the
+        # output leg, ``SENSE+`` on the inductor side and ``SENSE-`` on the
+        # ``V_OUT`` side (p.6), so no net the switch touches is a sense net at
+        # all and the search above finds nothing.
+        #
+        # The rule is structural rather than positional: a resistor **straddled
+        # by two of the controller's own sense pins** is a Kelvin-sensed shunt,
+        # wherever in the circuit it sits. It needs a differential pair to fire,
+        # so a part with one SENSE pin can never reach it -- which is why it runs
+        # only after the two positional tests have failed, and cannot move a
+        # board that already had an answer.
+        wanted = set(sense_nets)
+        for ref in view.sorted_refs(r for n in sense_nets for r in view.refs_on(n)):
             dev = kinds.get(ref)
-            if dev is None or dev.kind != "rectifier":
+            if dev is None or dev.kind != "resistor":
                 continue
-            if net not in view.nets_of_pins(ref, frozenset({"A"})):
-                continue          # the anode must face the stage, not the load
-            cathode = next(iter(view.nets_of_pins(ref, frozenset({"K"}))), None)
-            if cathode in (None, ground) or cathode == input_rail:
-                continue
-            if not _caps_to(view, kinds, cathode, ground):
-                continue
-            output_rail, output_rectifier = cathode, ref
-            break
-        if output_rail:
-            break
+            bridged = set(view.nets_of(ref))
+            if len(bridged) == 2 and bridged <= wanted:
+                sense_resistor = ref
+                sense_node = next((n for n in sense_nets
+                                   if n in bridged and n != output_rail),
+                                  sorted(bridged)[0])
+                reasons.append(
+                    "sense resistor is straddled by the controller's own "
+                    "differential SENSE pair -- Kelvin-sensed shunt"
+                )
+                break
 
     # -- the feedback divider ------------------------------------------------
     feedback_nets = view.nets_of_pins(controller_ref, FEEDBACK_PIN_NAMES)
@@ -802,7 +1348,7 @@ def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
             other = _two_terminal_other_net(view, ref, feedback_node)
             if other is None:
                 continue
-            if other == ground and bottom is None:
+            if other in grounds and bottom is None:
                 bottom = ref
             elif output_rail is not None and other == output_rail and top is None:
                 top = ref
@@ -817,12 +1363,25 @@ def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
     loop_reasons: list[str] = []
     partner_ref = None
     far_net = None
-    if output_rectifier is not None and switch_node in view.nets_of(output_rectifier):
+    if step_down:
+        # ⚠ A step-down's high-di/dt loop is on the INPUT side, not the output.
+        # The input capacitor sources the pulse, the switch chops it and the
+        # catch diode carries it when the switch opens; the inductor conducts
+        # continuously and is deliberately NOT a member. That is the mirror image
+        # of the boost, whose loop is ``COUT -> D -> M`` on the output side, and
+        # getting it backwards is what made the shipped classifier report
+        # ``COUT -> L1 -> M1`` here -- a loop containing no switching edge at all.
+        far_net = input_rail
+        partner_ref = catch_rectifier
+        loop_reasons.append(
+            "catch diode freewheels into the switch node -- input-side loop"
+        )
+    elif output_rectifier is not None and switch_node in view.nets_of(output_rectifier):
         # Non-isolated: current alternates between the switch and the rectifier
         # that shares its node, and the loop closes on the output capacitor.
         partner_ref, far_net = output_rectifier, output_rail
         loop_reasons.append("rectifier shares the switch node -- output-side loop")
-    elif winding_partner not in (None, ground):
+    elif winding_partner is not None and winding_partner not in grounds:
         # Isolated / transformer primary: nothing else sits on the switch node,
         # so the loop closes on the capacitor at the other end of the winding.
         partner_ref, far_net = magnetics_ref, winding_partner
@@ -830,8 +1389,8 @@ def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
             "no rectifier on the switch node -- loop closes through the winding"
         )
 
-    if partner_ref is not None and far_net is not None and ground is not None:
-        cap_refs = _caps_to(view, kinds, far_net, ground)
+    if partner_ref is not None and far_net is not None and grounds:
+        cap_refs = _caps_to(view, kinds, far_net, grounds)
         cap_ref, bulk, by_value = _loop_capacitor(view, view.part_by_ref, cap_refs)
         if by_value:
             loop_reasons.append(
@@ -839,11 +1398,32 @@ def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
                 "the rail may be shared with another consumer"
             )
         if cap_ref is not None:
-            members = [cap_ref, partner_ref, switch_ref]
-            nets = [far_net, switch_node]
-            if sense_resistor is not None:
-                members.append(sense_resistor)
-                nets.append(sense_node)
+            if step_down:
+                # Walk the loop in conduction order from the capacitor:
+                # ``CIN -> (RS) -> M1 -> D1`` and back through ground. The sense
+                # resistor sits between the cap and the switch here, not after
+                # the switch as it does on a low-side-sense boost, so it cannot
+                # simply be appended.
+                members = [cap_ref]
+                nets = [far_net]
+                # ⚠ Only when the sense resistor is genuinely IN this loop --
+                # i.e. it bridges the input rail the capacitor sits on. An
+                # output-leg sense resistor (the LT3724's) is downstream of the
+                # inductor and carries no switching edge at all, so appending it
+                # would put a part in the hot loop that is not in it, which is
+                # exactly the error Phase 7 fixed on the other side.
+                if sense_resistor is not None and far_net in view.nets_of(
+                        sense_resistor):
+                    members.append(sense_resistor)
+                    nets.append(sense_node)
+                members.extend([switch_ref, partner_ref])
+                nets.append(switch_node)
+            else:
+                members = [cap_ref, partner_ref, switch_ref]
+                nets = [far_net, switch_node]
+                if sense_resistor is not None:
+                    members.append(sense_resistor)
+                    nets.append(sense_node)
             loops.append(CommutationLoop(
                 member_refs=members,
                 net_names=nets,
@@ -854,9 +1434,29 @@ def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
             ))
 
     # -- topology (a stretch goal; "unknown" is an acceptable answer) --------
+    #
+    # ⚠⚠ The connectivity test comes FIRST, and that ordering is the Phase-9 fix.
+    # Winding count alone cannot tell a coupled-inductor SEPIC from a flyback --
+    # both are "one magnetic, two windings" -- so keying on it named every
+    # coupled SEPIC / Cuk / inverting converter ``flyback``. What separates them
+    # is the coupling capacitor, which is connectivity, not a count. A flyback
+    # has no capacitor bridging its switch node to its second winding; that is
+    # the whole difference, and it is why the count survives as the fallback
+    # rather than being deleted.
     topology = "unknown"
-    if len(_winding_groups(magnetics_part)) >= 2:
+    if sepic_family:
+        topology = sepic_family
+    elif len(_winding_groups(magnetics_part)) >= 2:
         topology = "flyback"
+    elif step_down:
+        # Phase-1 limitation L-3 said the name resolves "when the inductor's far
+        # terminal is the output rail" -- on a step-down that is exactly the
+        # test, and the catch rectifier is what makes it decidable.
+        # ⚠ ``output_through`` widens "is" to "is, or is one series resistor
+        # away from" -- an output-leg sense resistor, not a different topology.
+        if winding_partner is not None and output_rail is not None and (
+                winding_partner == output_rail or output_through is not None):
+            topology = "buck"
     elif output_rectifier is not None and switch_node in view.nets_of(output_rectifier):
         if winding_partner is not None and winding_partner == input_rail:
             topology = "boost"
@@ -881,20 +1481,34 @@ def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
     add(controller_ref)
     for ref in switches:
         add(ref)
+    if gate_series_ref:
+        add(gate_series_ref, "gate_resistor",
+            "sits in series between the controller's drive pin and the switch "
+            "gate -- the stage is anchored THROUGH it")
     add(magnetics_ref)
+    if second_magnetics_ref and second_magnetics_ref != magnetics_ref:
+        add(second_magnetics_ref)
+    if coupling_cap_ref:
+        add(coupling_cap_ref, "coupling_cap",
+            f"bridges the switch node and {coupling_node} -- the element that "
+            f"makes this a {sepic_family} rather than a flyback")
     if output_rectifier:
         add(output_rectifier)
+    if catch_rectifier:
+        add(catch_rectifier)
     if sense_resistor:
         add(sense_resistor, "sense_resistor",
-            "one terminal on the switch return / controller SENSE pin, the other on ground")
+            "one terminal on the switch return / controller SENSE pin, the other on "
+            + ("the input rail" if step_down and not grounds.intersection(
+                view.nets_of(sense_resistor)) else "ground"))
     if divider:
         add(divider[0], "fb_divider_top", "feedback node to the output rail")
         add(divider[1], "fb_divider_bottom", "feedback node to ground")
     if input_rail:
-        for ref in _caps_to(view, kinds, input_rail, ground):
+        for ref in _caps_to(view, kinds, input_rail, grounds):
             add(ref, "input_cap", "bridges the input rail and ground")
     if output_rail:
-        for ref in _caps_to(view, kinds, output_rail, ground):
+        for ref in _caps_to(view, kinds, output_rail, grounds):
             add(ref, "output_cap", "bridges the output rail and ground")
 
     stage = PowerStage(
@@ -904,13 +1518,16 @@ def _build_stage(view: _View, kinds, ground, controller_ref, warnings):
         input_rail=input_rail,
         output_rail=output_rail,
         ground_net=ground,
+        # ⛔ Sorted so the field is deterministic, and it always CONTAINS
+        # ``ground`` -- on a single-ground board it is exactly ``[ground]``.
+        ground_nets=sorted(grounds),
         devices=devices,
         loops=loops,
         feedback_divider=divider,
         sense_resistor_ref=sense_resistor,
         feedback_net=feedback_node,
         sense_net=sense_node,
-        small_signal_refs=_small_signal_refs(view, controller_ref, ground),
+        small_signal_refs=_small_signal_refs(view, controller_ref, grounds),
         reasons=reasons,
     )
     if len(switches) > 1:
@@ -943,14 +1560,25 @@ def classify_power_roles(circuit, ctx=None) -> PowerStagePlan:
     view = _View(circuit)
     kinds = classify_devices(circuit)
     ground = _find_ground(view, kinds)
+    grounds = _find_grounds(view, kinds, ground)
 
     warnings: list[str] = []
+    if len(grounds) > 1:
+        # Not a defect -- a datasheet-mandated split. Said out loud because a
+        # stage reports ONE ``ground_net`` and a reader deserves to know the
+        # board has more than one, and which one the loop is quoted against.
+        warnings.append(
+            f"split ground: the controller(s) name "
+            f"{', '.join(sorted(grounds))} as ground; the reported ground_net is "
+            f"{ground} and every return test accepts any of them"
+        )
     has_magnetics = any(dev.kind == "magnetics" for dev in kinds.values())
     stages: list[PowerStage] = []
     for ref in view.sorted_refs(
         r for r, dev in kinds.items() if dev.kind == "controller"
     ):
-        stage, why_not = _build_stage(view, kinds, ground, ref, warnings)
+        stage, why_not = _build_stage(view, kinds, ground, ref, warnings,
+                                      grounds=grounds)
         if stage is not None:
             stages.append(stage)
         elif has_magnetics:

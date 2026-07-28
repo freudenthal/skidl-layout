@@ -55,16 +55,35 @@ def test_run_payloads_batching_more_jobs_than_workers():
         assert _sig(pickle.loads(raw[i])) == _sig(expect)
 
 
-def test_run_payloads_failure_raises():
+def test_run_payloads_failure_raises(monkeypatch):
     """A garbage payload makes the worker exit 1 -> RuntimeError, and the private
-    temp dir is cleaned up in the finally."""
+    temp dir is cleaned up in the finally.
+
+    Phase-8 WS-G: the leak check watches ONLY the dirs this call created. It used
+    to scan the whole system temp root for ``skidl_layout_par_*``, which made the
+    test fail whenever anything else on the machine ran parallel placement
+    concurrently -- a cross-talk hazard that forced every suite run to be
+    sequential. ``mkdtemp`` is wrapped so we know the exact path to check.
+    """
     import tempfile
+
+    import skidl_layout.parallel as par
+
+    created: list = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _spy(*a, **kw):
+        path = real_mkdtemp(*a, **kw)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(par.tempfile, "mkdtemp", _spy)
 
     with pytest.raises(RuntimeError):
         run_payloads("refine", {0: b"not a pickle"}, workers=1)
-    # No skidl_layout_par_* temp dir should survive the RuntimeError.
-    tmproot = tempfile.gettempdir()
-    leftover = [n for n in os.listdir(tmproot) if n.startswith("skidl_layout_par_")]
+
+    assert created, "run_payloads did not create a private temp dir"
+    leftover = [p for p in created if os.path.exists(p)]
     assert leftover == [], f"temp dirs leaked: {leftover}"
 
 

@@ -319,6 +319,8 @@ def route_and_check(
     via_size: float | None = None,
     via_drill: float | None = None,
     board_edge_clearance: float | None = None,
+    net_clearances: dict[str, float] | None = None,
+    route_log_path: str | None = None,
 ) -> RoutabilityFeedback:
     """Route ``pcb_path`` with KRT, verify connectivity + DRC, return feedback.
 
@@ -337,6 +339,37 @@ def route_and_check(
     the file should pass ``out_path`` explicitly. ``route_extra_args`` are extra
     route.py flags appended verbatim (e.g. ``["--max-ripup", "10",
     "--max-iterations", "1000000"]`` for a congested 2-layer board).
+
+    ``net_clearances`` maps net name -> copper clearance (mm), written to a JSON
+    file in ``workdir`` and passed as route.py ``--net-clearances``. ⚠⚠ Three
+    things about it, all measured rather than read off the CLI docs (Phase 10,
+    WS-2):
+
+    - An explicit map is used **as-is**. ``--clearance`` is a ceiling over the
+      net-class map KRT *auto-reads* from a sibling ``.kicad_pro``, not over this
+      one, so a per-net value above ``clearance`` genuinely widens the net
+      (``SW``<->``VIN`` on ``lt3758_flyback``: 0.1984 mm -> 0.552 mm with the
+      ceiling still at 0.25).
+    - An explicit map **replaces** the auto-read one rather than adding to it,
+      which is why an empty/``None`` map must emit no flag at all -- passing
+      ``{}`` would discard whatever net classes the board carried.
+    - ⛔ **The widening binds BOARD-WIDE, not pairwise.** This docstring said
+      "pairwise between nets the map names" until Phase 12; Phase 11 measured it
+      false and the line survived the retraction. KRT's
+      ``RoutingConfig.set_net_clearances`` derives
+      ``net_clearance_floor = max(clearance, max over the ROUTED nets in the
+      map)`` and ``obstacle_clearance()`` returns ``max(floor, ...)`` for
+      **every** obstacle. Measured on ``uc3844_flyback``: the map named 5 nets
+      and **all 17 on the board widened**. The corollary is the cost -- on a
+      routing-limited board the map does not *add* clearance, it
+      **redistributes** it (``lt3724_buck`` moved 12 of 16 nets and 7 got
+      *tighter*).
+    - ⚠ KRT's fine-pitch rescue ladder still necks a rescued net below the
+      requested value, so this raises what the router **aims for**; it is not a
+      floor. Phase 12 derived the ladder exactly: a rescued net is shipped at one
+      of ``0.1524 / 0.1768 / 0.2012 / 0.2256 / 0.25`` mm on this stack's fab
+      numbers, whatever the map asked for. See
+      ``workingdocs/design_considerations/krt-upstream-rescue-ladder-report.md``.
     """
     resolved = find_krt(krt_dir)
     if resolved is None:
@@ -362,6 +395,16 @@ def route_and_check(
     # call with no spec is byte-identical argv to before this change.
     route_args.extend(_design_rule_flags(
         track_width, clearance, via_size, via_drill, board_edge_clearance))
+    if net_clearances:
+        # Empty dict deliberately falls through to no flag: an explicit map
+        # REPLACES KRT's auto-read net-class map, so passing "{}" would throw
+        # away the board's own classes rather than mean "no opinion".
+        nc_path = os.path.join(
+            os.path.abspath(workdir), f"net_clearances_{uuid.uuid4().hex[:8]}.json")
+        with open(nc_path, "w", encoding="utf-8") as handle:
+            json.dump({str(k): float(v) for k, v in net_clearances.items()},
+                      handle, indent=2, sort_keys=True)
+        route_args += ["--net-clearances", nc_path]
     if route_extra_args:
         # verbatim route.py flags (e.g. ["--max-ripup", "10", "--max-iterations",
         # "1000000"] for a difficult 2-layer board, per plan-pcb-routing SKILL).
@@ -378,6 +421,19 @@ def route_and_check(
         route_proc = _run_krt(route_args, resolved, timeout_s)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"route.py timed out after {timeout_s}s") from exc
+
+    # Phase 11: route.py's own log is the ONLY place its fine-pitch rescue
+    # ladder is visible ("rescued a gap: grid ..., clearance ..., track ..."),
+    # and a rescue is what necks a net below the per-net clearance the caller
+    # asked for. Opt-in and argv-neutral: nothing about the route changes, the
+    # log is simply kept instead of discarded, so the evidence can be re-derived
+    # rather than quoted from a past run.
+    if route_log_path:
+        os.makedirs(os.path.dirname(os.path.abspath(route_log_path)) or ".",
+                    exist_ok=True)
+        with open(route_log_path, "w", encoding="utf-8", errors="replace") as handle:
+            handle.write(route_proc.stdout or "")
+            handle.write(route_proc.stderr or "")
 
     try:
         summary_ok = True

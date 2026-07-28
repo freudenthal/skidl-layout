@@ -73,6 +73,37 @@ class PowerCopperResult:
     #: recorded with ``applied=False``: measured, deliberately not widened.
     #: Empty on the default path.
     current_widths: dict = field(default_factory=dict)
+    #: The via-in-pad relocation outcome (Phase 8), or ``None`` when
+    #: ``relocate_via_in_pad=False``. Carries every flagged via with its
+    #: verdict -- relocated, unresolved, or a foreign-net via left alone.
+    via_relocation: dict | None = None
+    #: Per-net spacing record (Phase 10), one row per net a voltage was given
+    #: for -- ``{net: {volts, required_mm, applied_mm, applied, reason}}``.
+    #: A net Table 6-1 does not ask to widen is recorded with ``applied=False``
+    #: and its reason: graded, deliberately not moved. Empty unless
+    #: ``voltage_spacing=True``.
+    net_clearances: dict = field(default_factory=dict)
+    #: Nets the Phase-14 pinning pass ADDED to ``width_map`` because the plan
+    #: named them as power-carrying but gave them no wide-trace intent --
+    #: ``{net: {width_mm, source, kind, from_plan_width}}``. The switch node is
+    #: the case this exists for. Empty unless ``pin_power_widths=True``, and an
+    #: empty dict with the flag on means every such net was already pinned.
+    pinned_widths: dict = field(default_factory=dict)
+    #: What the Phase-14 two-pass route did: the pass-1 net set and where it
+    #: came from, both boards, both logs, and pass 2's argv. Empty unless
+    #: ``loop_first`` was requested; ``{"requested": True, "ran": False, ...}``
+    #: when it was requested and no commutation loop was classified, so "asked
+    #: for and declined" can never read as "never asked for".
+    loop_first: dict = field(default_factory=dict)
+    #: What the Phase-14 fanout pre-pass did, per resolved controller: vias
+    #: placed, vias dropped, and the nets it could **not** escape. Empty unless
+    #: ``fanout_controller=True``.
+    fanout: dict = field(default_factory=dict)
+    #: What the Phase-14 escape keepout wrote: how many annulus polygons, on
+    #: which layer, around which controllers, and whether it was applied after
+    #: a loop pass (the only ordering in which it is not Phase 13's arm C).
+    #: Empty unless ``keepout_escape=True``.
+    keepout: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = ["Power copper emitted:"]
@@ -81,7 +112,14 @@ class PowerCopperResult:
             planned = self.width_map[net]
             emitted = self.emitted_widths.get(net)
             emitted_str = f"{emitted:.2f}mm" if emitted is not None else "no trace"
-            lines.append(f"  wide {net}: planned {planned:.2f}mm -> {emitted_str}")
+            # A pinned net is flagged so a reader can tell a width the PLAN
+            # asked for from one this pass added to stop a global --track-width
+            # narrowing it. Same line, one extra word -- and absent entirely on
+            # the default path, so existing output is unchanged.
+            pin = self.pinned_widths.get(net)
+            tag = f" [pinned {pin['source']}]" if pin else ""
+            lines.append(
+                f"  wide {net}: planned {planned:.2f}mm -> {emitted_str}{tag}")
         # measured current -> the width the physics asks for (Phase 6)
         for net in sorted(self.current_widths):
             row = self.current_widths[net]
@@ -102,6 +140,24 @@ class PowerCopperResult:
                     f"  thermal vias: {thermal.get('count', 0)} on "
                     f"{thermal.get('net')} ({thermal.get('reason')})"
                 )
+        for net in sorted(self.net_clearances):
+            row = self.net_clearances[net]
+            required = row.get("required_mm")
+            lines.append(
+                f"  spacing {net}: {row['volts']:.0f}V -> Table 6-1 "
+                + (f"{required:.2f}mm" if required is not None else "not stated")
+                + (f", routed at {row['applied_mm']:.2f}mm" if row.get("applied")
+                   else " (not widened)")
+            )
+        relocation = self.via_relocation or {}
+        if relocation:
+            lines.append(
+                f"  via-in-pad: {relocation.get('relocated', 0)} of "
+                f"{relocation.get('in_pad_before', 0)} relocated, "
+                f"{relocation.get('in_pad_after', 0)} left in pads"
+                + (f" ({relocation.get('outcome')})" if relocation.get("outcome")
+                   else "")
+            )
         for net, layer in zip(self.plane_nets, self.plane_layers):
             total = self.plane_summary.get("zone_count", 0)
             # Per-net when we could read it back, so a promotion that poured
@@ -134,7 +190,336 @@ class PowerCopperResult:
             "zones_by_net": dict(self.zones_by_net),
             "thermal_vias": dict(self.thermal_vias) if self.thermal_vias else None,
             "current_widths": {k: dict(v) for k, v in self.current_widths.items()},
+            "via_relocation": (dict(self.via_relocation)
+                               if self.via_relocation else None),
+            "net_clearances": {k: dict(v) for k, v in self.net_clearances.items()},
+            "pinned_widths": {k: dict(v) for k, v in self.pinned_widths.items()},
+            "loop_first": dict(self.loop_first),
+            "fanout": dict(self.fanout),
+            "keepout": dict(self.keepout),
         }
+
+
+def plan_pinned_power_widths(
+    power_plan,
+    stage_plan,
+    *,
+    spec=None,
+    width_map: dict[str, float] | None = None,
+    plane_nets=(),
+    routed_plane_nets=(),
+) -> dict[str, dict]:
+    """Which power-carrying nets the width map is *missing*, and at what width.
+
+    ⭐ **Power-layout Phase 14, WS-14.0 -- open defect 3.** ``width_map`` gains a
+    net only when its route intent is a wide strategy, or when a promoted plane
+    net keeps its trunk. A switch node whose intent is ``fanout_only`` is
+    therefore **absent**, so it is never passed to ``route.py --power-nets``, so
+    a global ``--track-width`` applies to it. Measured consequence: ``SW`` on
+    ``lt3757_sepic`` went **0.300 -> 0.1524 mm with DRC still 0**, because DRC
+    does not check current. That single leak is what made Phase 12's arm D
+    unadoptable.
+
+    Returns ``{net: record}`` for the nets that should be pinned and are not,
+    where each record carries ``width_mm``, ``source`` and ``kind`` -- so a
+    caller can *say* what it pinned and why rather than silently widening argv.
+    Pure logic: no board, no router, no I/O. That is deliberate, so the
+    partition is unit-testable without spending a route.
+
+    **Where each width comes from**, in order:
+
+    1. the plan's own ``suggested_width_mm`` for that net, when the plan named it;
+    2. otherwise the fab spec's ``track_width_mm`` -- which is *exactly the width
+       the net gets today*. ⛔ The point of this pass is to make that width
+       immune to a global ``--track-width``, **not** to change it. A net with no
+       plan width and no spec is skipped rather than guessed at.
+
+    Both are then floored to ``spec.min_track_mm``: a fab never draws below its
+    own published limit.
+
+    **What is deliberately skipped:**
+
+    - a net already in ``width_map`` -- the plan, the simulated current and the
+      human override all rank above this pass, which only ever *adds*;
+    - a plane net that is poured rather than routed. Pinning it would pass
+      ``--power-nets`` for a net that gets no tracks at all, and the emitted-width
+      honesty check would then warn "planned ... but no track emitted" on every
+      poured net. ``routed_plane_nets`` names the promoted ones that do keep a
+      trunk, and those *are* pinned.
+    """
+    width_map = width_map or {}
+    plane_nets = set(plane_nets or ())
+    routed_plane_nets = set(routed_plane_nets or ())
+
+    by_name = {n.name: n for n in (getattr(power_plan, "nets", None) or [])}
+
+    # (net, kind, source) in a deterministic order: the plan's own net order
+    # first, then the classifier's stages in the order it found them.
+    wanted: list[tuple[str, str, str]] = []
+
+    def _want(net, kind, source):
+        if not net:
+            return
+        net = str(net)
+        if any(net == existing for existing, _, _ in wanted):
+            return
+        wanted.append((net, kind, source))
+
+    for net in (getattr(power_plan, "nets", None) or []):
+        if net.kind in ("supply", "ground"):
+            _want(net.name, net.kind, f"power_plan:{net.kind}")
+
+    # ⭐ The switch node is the whole reason this exists: it is a *node*, not a
+    # rail, so no name-based rule classifies it and the plan gives it no width
+    # intent -- yet it carries the full switch current.
+    for stage in (getattr(stage_plan, "stages", None) or []):
+        for net in (getattr(stage, "switch_node_nets", None) or []):
+            _want(net, "switch_node", "stage:switch_node")
+        _want(getattr(stage, "input_rail", None), "supply", "stage:input_rail")
+        _want(getattr(stage, "output_rail", None), "supply", "stage:output_rail")
+        for net in (getattr(stage, "ground_nets", None) or []):
+            _want(net, "ground", "stage:ground")
+        # ⭐ And the commutation loop, which is power-carrying **by the
+        # classifier's own definition** -- it is the path whose current stops
+        # when the switch opens. This catches the current-sense node (``ISNS``,
+        # ``CS1``) that sits in the loop between the switch and ground and
+        # carries the full switch current while matching no name-based rule.
+        # ⛔ Deliberately the same net set WS-14.1 routes first, read from the
+        # same field, so the width lever and the ordering lever cannot drift
+        # apart into two different opinions about what "the loop" is.
+        for loop in (getattr(stage, "loops", None) or []):
+            for net in (getattr(loop, "net_names", None) or []):
+                _want(net, "loop", "stage:commutation_loop")
+
+    pinned: dict[str, dict] = {}
+    for net, kind, source in wanted:
+        if net in width_map:
+            continue                       # the plan/sim/override already owns it
+        if net in plane_nets and net not in routed_plane_nets:
+            continue                       # poured, not routed -- nothing to pin
+        planned = getattr(by_name.get(net), "suggested_width_mm", None)
+        width = planned
+        if width is None:
+            width = getattr(spec, "track_width_mm", None)
+        if width is None:
+            # No plan width and no fab spec: KRT's own default applies and we
+            # cannot name it. Skipped rather than guessed -- an invented width
+            # is exactly the failure mode this pass exists to remove.
+            continue
+        floor = getattr(spec, "min_track_mm", None)
+        if floor is not None:
+            width = max(width, floor)
+        pinned[net] = {
+            "width_mm": float(width),
+            "source": source,
+            "kind": kind,
+            "from_plan_width": planned is not None,
+        }
+    return pinned
+
+
+def plan_loop_first_nets(
+    stage_plan,
+    *,
+    explicit=None,
+    plane_nets=(),
+    routed_plane_nets=(),
+) -> tuple[list[str], str]:
+    """``(pass_1_nets, source)`` -- the commutation-loop copper to commit first.
+
+    ⭐ **Power-layout Phase 14, WS-14.1.** The router's own diagnosis of the four
+    failing boards is that the pads are *"boxed in by static obstacles
+    (neighboring pads + clearance), not by congestion"*, and Phase 12 measured
+    rip-up gaining **+0 nets across 15 routes** -- rip-up moves tracks and the
+    obstruction is pads. What *can* move is the **order copper is committed in**,
+    and ``route.py``'s ``--ordering`` offers only four heuristics, none of which
+    takes a caller-supplied list. Two passes are the only exact control, and they
+    need nothing new from KRT.
+
+    ⛔ **No new heuristic here.** The arc already names the loop:
+    :class:`~skidl_layout.power_roles.CommutationLoop` carries ``net_names``, the
+    nets spanning the parts whose current stops when the switch opens. This
+    takes those, plus each stage's switch nodes and rails, and subtracts the nets
+    that are **poured rather than routed** -- pass 1 cannot commit copper for a
+    net the router is not routing.
+
+    ``explicit`` (a list) overrides the derivation entirely and is returned
+    verbatim minus the poured nets, so a caller can test a partition without
+    editing the classifier. The returned ``source`` says which happened, because
+    a derived set and a dictated one deserve different amounts of trust.
+
+    Returns an **empty list** when there is no classified loop -- the caller must
+    then fall back to a single pass rather than route "nothing" first.
+    """
+    plane_nets = set(plane_nets or ())
+    routed_plane_nets = set(routed_plane_nets or ())
+    poured = plane_nets - routed_plane_nets
+
+    ordered: list[str] = []
+
+    def _add(net):
+        if net and str(net) not in ordered and str(net) not in poured:
+            ordered.append(str(net))
+
+    if explicit is not None and explicit is not True:
+        for net in explicit:
+            _add(net)
+        return ordered, "explicit"
+
+    for stage in (getattr(stage_plan, "stages", None) or []):
+        # Loop first, in the loop's own order -- it is the high-di/dt path and
+        # the arc's primary objective, so it gets the short channels.
+        for loop in (getattr(stage, "loops", None) or []):
+            for net in (getattr(loop, "net_names", None) or []):
+                _add(net)
+        for net in (getattr(stage, "switch_node_nets", None) or []):
+            _add(net)
+        _add(getattr(stage, "input_rail", None))
+        _add(getattr(stage, "output_rail", None))
+    return ordered, "power_stage_plan"
+
+
+def _run_fanout_prepass(
+    in_pcb, workdir_abs, result, circuit, fp_lib_dirs, *, spec, krt_dir,
+    timeout_s, escape_method, plane_nets, width_map, warnings,
+) -> dict:
+    """Fan out every resolved controller, chaining board to board.
+
+    A board may declare more than one IC (Phase 13's ``mark_escape_room``), so
+    each is fanned in turn and each writes a fresh board -- the next one reads
+    the previous one's output, so two ICs on the same board cannot overwrite
+    each other's escape copper.
+
+    ⛔ **Net scope.** Only the housekeeping nets are fanned: the poured nets and
+    the trunked power nets are excluded. Stubs on a poured net are wasted copper
+    and can fence the pour into islands, which is the measured Phase-4 reason
+    ``route_promoted`` defaults ``True``.
+    """
+    from .power_escape import fanout_controller as _fanout
+    from .power_escape import resolve_escape_targets
+
+    placed = {str(p.ref): p for p in (getattr(result, "placed_parts", None) or [])}
+    targets, source = resolve_escape_targets(
+        placed_refs=placed,
+        circuit=circuit,
+        power_stage_plan=getattr(result, "power_stage_plan", None),
+    )
+    if not targets:
+        warnings.append(
+            "fanout_controller requested but no controller resolved "
+            "(no declaration, no classified stage); no fanout run")
+        return {"requested": True, "ran": False, "source": source,
+                "reason": "no controller resolved"}
+
+    # ``!NAME`` exclusions, the same shape route.py takes.
+    excluded = sorted(set(plane_nets) | set(width_map))
+    nets = ["*"] + [f"!{n}" for n in excluded]
+
+    board = in_pcb
+    rows: list[dict] = []
+    for index, (ref, _lane) in enumerate(targets):
+        out_pcb = os.path.join(workdir_abs, f"fanout_{index}_{ref}.kicad_pcb")
+        row = _fanout(
+            board, out_pcb, ref,
+            krt_dir=krt_dir, nets=nets, escape_method=escape_method,
+            track_width=(spec.min_track_mm if spec is not None else None),
+            # ⛔⛔ ``clearance_mm``, NOT ``min_clearance_mm`` -- and this cost a
+            # DRC violation before it was found. ``qfn_fanout``'s ``--clearance``
+            # is the margin its escape copper keeps from foreign pads/tracks, so
+            # it must be the clearance the board is actually ROUTED and GRADED
+            # at, not the fab's published floor. Handed the floor (0.1524 mm on
+            # oshpark-2l) the pre-pass legally placed an escape via that the
+            # board's own 0.25 mm rule then flagged: measured on
+            # ``lt3757_sepic`` as ``Via:UVLO <-> Seg:INTVCC, overlap 0.036 mm``.
+            # ⚠ The fab FLOOR is still the right bound for ``track_width`` -- a
+            # thin escape stub is legal; copper too CLOSE to its neighbour is not.
+            clearance=(spec.clearance_mm if spec is not None else None),
+            via_size=(spec.via_size_mm if spec is not None else None),
+            via_drill=(spec.via_drill_mm if spec is not None else None),
+            board_edge_clearance=(spec.board_edge_keepout_mm
+                                  if spec is not None else None),
+            timeout_s=timeout_s,
+        )
+        rows.append(row)
+        if row.get("ran"):
+            board = out_pcb
+            warnings.append(
+                f"fanout {ref}: {row.get('vias_placed')} via(s) placed, "
+                f"{row.get('vias_dropped')} dropped, "
+                f"{len(row.get('failed_nets') or [])} net(s) not escaped "
+                f"({escape_method})")
+        else:
+            # ⛔ Declining is an outcome, not a failure -- but a silent decline
+            # reads as a pre-pass that worked.
+            warnings.append(f"fanout {ref}: NOT run -- {row.get('reason')}")
+    ran = [r for r in rows if r.get("ran")]
+    return {
+        "requested": True, "ran": bool(ran), "source": source,
+        "escape_method": escape_method,
+        "controllers": [ref for ref, _ in targets],
+        "nets": list(nets),
+        "rows": rows,
+        # ``None`` when nothing ran, so the caller keeps its original input.
+        "board": board if ran else None,
+        "vias_placed": sum(int(r.get("vias_placed") or 0) for r in ran),
+        "vias_dropped": sum(int(r.get("vias_dropped") or 0) for r in ran),
+        "failed_nets": sorted({n for r in ran
+                               for n in (r.get("failed_nets") or [])}),
+    }
+
+
+def _apply_escape_keepout(
+    board_pcb, result, fp_lib_dirs, *, spec, layer, loop_ran, warnings,
+) -> dict:
+    """Draw each controller's escape annulus into ``board_pcb``, in place.
+
+    Reuses Phase 13's measured geometry (``EscapeRoom.annulus``) and its writer
+    (``write_keepout_polygons``, round-tripped through KRT's own parser) rather
+    than re-deriving either.
+    """
+    from .power_escape import measure_escape_rooms, write_keepout_polygons
+
+    if not loop_ran:
+        # ⛔ Said out loud rather than refused. Reproducing Phase 13's arm C is
+        # a legitimate thing to ask for -- the arc re-derives its negatives
+        # instead of quoting them -- but nobody should reach it by accident.
+        warnings.append(
+            "keepout_escape without loop_first reproduces Phase 13's arm C, "
+            "which measured -32 routed nets across the corpus: KRT's keepout is "
+            "not net-scoped, so the annulus blocks the controller's own escape")
+
+    rooms = measure_escape_rooms(result, fp_lib_dirs, fab_spec=spec)
+    polygons = [poly for room in rooms for poly in (room.annulus or [])]
+    if not polygons:
+        warnings.append(
+            "keepout_escape requested but no escape annulus could be measured; "
+            "no polygon written and no --keepout flag emitted")
+        return {"requested": True, "written": 0,
+                "reason": "no annulus measured"}
+    written = write_keepout_polygons(board_pcb, polygons, layer=layer)
+    warnings.append(
+        f"keepout_escape: {written} annulus polygon(s) drawn on {layer} around "
+        + ", ".join(r.controller_ref for r in rooms))
+    return {
+        "requested": True, "written": written, "layer": layer,
+        "board": board_pcb, "applied_after_loop_pass": bool(loop_ran),
+        "controllers": [r.controller_ref for r in rooms],
+        "lane_mm": [round(r.lane_mm, 4) for r in rooms],
+    }
+
+
+def _pass_log_path(route_log_path: str | None, tag: str) -> str | None:
+    """``<stem>.<tag><ext>`` beside ``route_log_path``, or ``None``.
+
+    The caller's own path stays the FINAL pass's log, so every existing parser
+    (the rescue-line counter, the keepout-line check) keeps reading the file it
+    always read. The extra pass gets a sibling, which is what lets a gate assert
+    that two passes genuinely happened rather than infer it from argv.
+    """
+    if not route_log_path:
+        return None
+    stem, ext = os.path.splitext(route_log_path)
+    return f"{stem}.{tag}{ext or '.txt'}"
 
 
 def _spec_route_kwargs(spec) -> dict:
@@ -226,6 +611,16 @@ def emit_power_copper(
     current_delta_t_c: float = 10.0,
     current_max_width_mm: float | None = None,
     net_voltages: dict[str, float] | None = None,
+    voltage_spacing: bool = False,
+    spacing_column: str = "B2",
+    relocate_via_in_pad: bool = False,
+    route_log_path: str | None = None,
+    pin_power_widths: bool = False,
+    loop_first: bool | list | None = False,
+    fanout_controller: bool = False,
+    fanout_escape_method: str = "underpad",
+    keepout_escape: bool = False,
+    keepout_layer: str = "User.2",
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -330,12 +725,98 @@ def emit_power_copper(
       alone. Widening the SW node collides head-on with
       ``SW_NODE_COPPER_AREA``, a trade no gate can referee yet.
 
+    **Phase-8 knob (default OFF -> byte-identical).** ``relocate_via_in_pad``
+    moves KRT's plane-stitching vias **out of** the SMD pads they land in and
+    ties each pad back to its via with a short stub track on the pad's own layer
+    (:mod:`skidl_layout.via_relocate`). Every poured board this stack has
+    produced is via-in-pad -- 11 on the Phase-4 boost, 12 on the Phase-6 board,
+    37 on avalanche -- and ``oshpark-2l`` declares ``via_in_pad=False``.
+
+    ⚠ These are **stitching** vias, not additive thermal ones: a via at a ground
+    pad IS that pad's only path to the plane. So nothing is ever dropped. A via
+    with no legal ring position **stays where it is** and is counted as
+    unresolved, and the whole change is reverted rather than shipped if DRC or
+    connectivity gets worse -- an honest "9 of 11 relocated" is a good result
+    and an orphaned ground pad is not. Runs after the pour and after any thermal
+    array, so the graded board is the shipped board.
+
     ``current_delta_t_c`` (default 10 C) is the allowed temperature rise;
     ``current_max_width_mm`` caps the result and **warns with both numbers**
     when it bites, because a silent clamp is a lie with units. ``net_voltages``
     (``{net: v_peak}``) drives one report-only warning: a poured or
     current-widened net above :data:`CREEPAGE_WARN_VOLTS` says that creepage
     and clearance are not modeled here. It never changes behavior.
+
+    **Phase-10 knob (default OFF -> byte-identical).** ``voltage_spacing=True``
+    turns the same ``net_voltages`` into the *lever* Phase 8's judge was missing:
+    each net's peak voltage is sized through IPC-2221B Table 6-1
+    (:mod:`skidl_layout.power_clearance`, ``spacing_column`` selects the column,
+    default **B2** = external uncoated, which is every board this stack ships)
+    and any net the table asks *more* of than the FabSpec's design clearance is
+    routed at that wider clearance via KRT's ``--net-clearances``.
+
+    Three deliberate properties, mirroring the current-width merge above:
+
+    - **Spacing can only widen.** A net Table 6-1 is happy with at the board's
+      own clearance is *recorded* in ``result.net_clearances`` with
+      ``applied=False`` and left alone -- a per-net entry below the board
+      clearance would quietly *relax* a net that was already fine.
+    - **The lever and the judge read the same table**, so ``fab_check``'s
+      spacing rows and this cannot drift apart.
+    - **It is not a hard floor and does not claim to be.** KRT's fine-pitch
+      rescue ladder can still neck a rescued net below the requested value. What
+      a board actually achieved stays a question for
+      :func:`fabspec.measure_voltage_spacing`, measured off the routed copper.
+
+    ⛔⛔ **Phase-11 retraction: the map binds board-WIDE, not pairwise.** This
+    docstring used to say the widening bound "pairwise only between nets the map
+    names". It does not -- KRT derives a routing-side *floor* from the map and
+    applies it to every obstacle, so naming one 150 V net widens the whole
+    board. Measured on ``uc3844_flyback``: 5 nets named, **17 nets widened**.
+    The consequence worth planning for is that on a congested board the lever
+    **redistributes** clearance rather than adding it. Full mechanism and
+    numbers: :mod:`skidl_layout.power_clearance`'s module docstring.
+
+    ⚠ Spacing is **not** added to ``fab_must_pass``: the judge stays report-only
+    for this phase, per the arc's rule that a rule promoted in the same phase
+    that first moved it is a rule measured wrong.
+
+    **Phase-11 knob (default OFF -> byte-identical).** ``route_log_path`` keeps
+    ``route.py``'s own stdout instead of discarding it. Nothing about the route
+    changes -- the argv is untouched -- but KRT's fine-pitch **rescue ladder**
+    announces itself only there (``rescued a gap: grid ..., clearance ...``),
+    and a rescue is precisely what necks a net below the per-net clearance
+    ``voltage_spacing`` asked for. Without the log that mechanism can only be
+    quoted from a past run; with it, any driver re-derives it.
+
+    **Phase-14 knobs (all default OFF -> byte-identical).** Four levers aimed at
+    one diagnosis: the failing pads are *"boxed in by static obstacles
+    (neighboring pads + clearance), not by congestion"* -- KRT's own words -- and
+    Phase 12 measured rip-up gaining **+0 nets across 15 routes**, because
+    rip-up moves tracks and cannot move a pad.
+
+    - ``pin_power_widths`` closes a measured leak. ``width_map`` gains a net only
+      from a *wide-trace intent*, so a switch node (intent ``fanout_only``) was
+      never passed to ``--power-nets`` and a global ``--track-width`` narrowed
+      ``SW`` **0.300 -> 0.1524 mm on lt3757_sepic with DRC still 0** -- DRC does
+      not check current. The pinned width is the plan's own, or the fab's
+      ``track_width_mm``, i.e. *exactly what the net already gets*: the pass
+      makes a width immune to narrowing, it does not change it. See
+      :func:`plan_pinned_power_widths`.
+    - ``loop_first`` routes the commutation loop in its own pass, then routes
+      the rest from that board with ``--keep-input-copper``. ⭐ Two passes are
+      the ONLY exact ordering control -- ``--ordering`` offers four heuristics
+      and none takes a caller-supplied list. ⚠ Pass 2 has *less* room, not more
+      (the loop copper is now a static obstacle), so grade completion per board
+      in both directions. See :func:`plan_loop_first_nets`.
+    - ``fanout_controller`` authors the controller's escape copper before any
+      route pass, via KRT's ``qfn_fanout.py``. Housekeeping nets only.
+    - ``keepout_escape`` draws the escape annulus and passes ``--keepout`` to the
+      **final** pass. ⛔⛔ Meaningful only *with* ``loop_first``: KRT's keepout is
+      not net-scoped, so applied to a single pass it blocks the controller's own
+      escape -- Phase 13 measured that at **-32 routed nets across the corpus**
+      (68/81 -> 36/81, DRC 0 throughout). Used alone it reproduces that arm and
+      says so in ``warnings``.
     """
     from .writer import write_kicad_pcb
     from .fabspec import resolve_fab_spec
@@ -418,6 +899,41 @@ def emit_power_copper(
                 width = max(width, spec.min_track_mm)
             width_map[intent.net_name] = width
 
+    # ⭐ Phase 14 / WS-14.0: pin every power-carrying net the plan names, not
+    # only the ones that earned a wide-trace intent. Opt-in and default OFF, so
+    # with the flag off ``width_map`` -- and therefore the emitted
+    # ``--power-nets`` argv -- is byte-identical.
+    #
+    # Placed BEFORE the current merge on purpose: ``_merge_current_widths``
+    # touches only nets the map already carries, so pinning first is what lets a
+    # caller who supplies ``net_currents`` have the physics reach the switch
+    # node too (Phase 6 measured ``SW`` at 4.1386 A). Placed BEFORE the override
+    # block for the same reason it always was -- the human veto wins.
+    pinned_widths: dict[str, dict] = {}
+    if pin_power_widths:
+        # A promoted plane net that keeps its trunk is routed, so it may be
+        # pinned; a poured one may not (see the helper's docstring).
+        routed_planes = (
+            {n for n in promoted_nets if n in width_map} if route_promoted else set()
+        )
+        pinned_widths = plan_pinned_power_widths(
+            power_plan,
+            getattr(result, "power_stage_plan", None),
+            spec=spec,
+            width_map=width_map,
+            plane_nets=plane_nets,
+            routed_plane_nets=routed_planes,
+        )
+        for net, row in sorted(pinned_widths.items()):
+            width_map[net] = row["width_mm"]
+            warnings.append(
+                f"{net}: pinned at {row['width_mm']:g}mm ({row['source']}) -- "
+                "a global --track-width can no longer narrow it")
+        if not pinned_widths:
+            warnings.append(
+                "pin_power_widths requested but every power-carrying net the "
+                "plan names is already in the width map; no net was added")
+
     # Measured currents (Phase 6): the physics widens what the ladder guessed.
     # Runs BEFORE the override veto so a human demote still beats the sim, and
     # touches only nets the plan already carries -- see the docstring.
@@ -435,6 +951,33 @@ def emit_power_copper(
         widened=[n for n, r in current_records.items() if r["applied"]],
         warnings=warnings,
     )
+
+    # The spacing lever (Phase 10). Opt-in and default OFF, so every existing
+    # caller's argv is byte-identical: with ``voltage_spacing=False`` no map is
+    # built and no ``--net-clearances`` flag is emitted. Sized purely from the
+    # net's voltage through IPC-2221B Table 6-1 -- the same table Phase 8's
+    # ``measure_voltage_spacing`` judges against, so lever and judge cannot drift.
+    clearance_records: dict = {}
+    clearance_map: dict = {}
+    if voltage_spacing and net_voltages:
+        from .power_clearance import net_clearance_map, plan_net_clearances
+
+        clearance_records = plan_net_clearances(
+            net_voltages,
+            base_clearance_mm=(spec.clearance_mm if spec is not None else None),
+            column=spacing_column,
+        )
+        clearance_map = net_clearance_map(clearance_records)
+        for net, row in sorted(clearance_records.items()):
+            if row["applied"]:
+                warnings.append(
+                    f"{net}: routing at {row['applied_mm']:g}mm clearance -- "
+                    f"{row['reason']}")
+        if not clearance_map:
+            warnings.append(
+                "voltage_spacing requested but no net needs widening: "
+                "every voltage given is inside the band the board already routes "
+                "at, so no --net-clearances flag was passed")
 
     # Human vetoes: an override for any net wins (and can force a width on a net
     # the plan left at signal width). Overriding a plane net to a width demotes
@@ -477,15 +1020,125 @@ def emit_power_copper(
     ]
     routed_pcb = os.path.join(workdir_abs, "routed_power.kicad_pcb")
     dr = _spec_route_kwargs(spec)
+
+    # ⭐ Phase 14 / WS-14.1: commit the commutation loop's copper BEFORE anything
+    # else competes for the channels. Opt-in and default OFF -- with
+    # ``loop_first=False`` the single call below is the pre-Phase-14 call
+    # verbatim, same argv, same input board.
+    loop_first_record: dict = {}
+    fanout_record: dict = {}
+    keepout_record: dict = {}
+    route_input = placed_pcb
+    pass2_extra = route_extra_args
+
+    # ⭐ Phase 14 / WS-14.3: the fanout pre-pass runs BEFORE pass 1, so the
+    # router routes from a pad that has already left the package. Opt-in and
+    # default OFF.
+    if fanout_controller:
+        fanout_record = _run_fanout_prepass(
+            route_input, workdir_abs, result, circuit, fp_lib_dirs,
+            spec=spec, krt_dir=krt_dir, timeout_s=timeout_s,
+            escape_method=fanout_escape_method,
+            plane_nets=plane_nets, width_map=width_map, warnings=warnings)
+        if fanout_record.get("board"):
+            route_input = fanout_record["board"]
+    if loop_first is not False and loop_first is not None:
+        loop_nets, loop_source = plan_loop_first_nets(
+            getattr(result, "power_stage_plan", None),
+            explicit=(loop_first if loop_first is not True else None),
+            plane_nets=plane_nets,
+            routed_plane_nets=routed_promoted,
+        )
+        if not loop_nets:
+            # ⛔ No classified loop -> fall back to ONE pass and say so. Routing
+            # "nothing" first and then everything is not a null experiment: it
+            # is a second route from a different input board.
+            warnings.append(
+                "loop_first requested but no commutation loop was classified; "
+                "routed in a single pass (the default path)")
+            loop_first_record = {"requested": True, "ran": False,
+                                 "reason": "no commutation loop classified"}
+        else:
+            loop_pcb = os.path.join(workdir_abs, "routed_loop.kicad_pcb")
+            pass1_log = _pass_log_path(route_log_path, "pass1")
+            pass1_input = route_input        # the fanned board when WS-14.3 ran
+            krt.route_and_check(
+                pass1_input,
+                workdir_abs,
+                krt_dir=krt_dir,
+                nets=list(loop_nets),
+                timeout_s=timeout_s,
+                power_net_widths=width_map or None,
+                out_path=loop_pcb,
+                route_extra_args=route_extra_args,
+                net_clearances=clearance_map or None,
+                route_log_path=pass1_log,
+                **dr,
+            )
+            # ⚠ The sibling ``.kicad_pro`` carries the DRC floor pass 1 routed
+            # to. Pass 2's input is pass 1's OUTPUT, so stranding it here would
+            # make pass 2 resolve stock netclasses and manufacture phantom
+            # clearance violations -- the gotcha that has cost this arc a run
+            # more than once.
+            _copy_sibling_project(pass1_input, loop_pcb)
+            route_input = loop_pcb
+            # ⛔ APPENDED, never substituted. ``write_krt_fab_overrides``
+            # *returns* the ``["--fab-overrides", <file>]`` fragment, and
+            # dropping it lets KRT's rescue ladder neck below the fab's
+            # published minimum -- a different and worse experiment.
+            pass2_extra = list(route_extra_args or []) + ["--keep-input-copper"]
+            # Pass 1's copper is foreign to every pass-2 net, so it is already
+            # an obstacle; ``--keep-input-copper`` is what stops the post-route
+            # CLEANUP passes rewriting it.
+            net_selection = (["*"]
+                             + [f"!{n}" for n in loop_nets]
+                             + [f"!{n}" for n in plane_nets
+                                if n not in routed_promoted])
+            loop_first_record = {
+                "requested": True, "ran": True, "source": loop_source,
+                "pass1_nets": list(loop_nets),
+                "pass1_board": loop_pcb, "pass1_log": pass1_log,
+                "pass2_nets": list(net_selection),
+                "pass2_extra_args": list(pass2_extra),
+            }
+            warnings.append(
+                "loop_first: pass 1 committed "
+                + ", ".join(loop_nets)
+                + f" ({loop_source}); pass 2 routes the rest with "
+                  "--keep-input-copper")
+
+    # ⭐ Phase 14 / WS-14.5: the escape annulus, applied to the board the FINAL
+    # pass reads. Opt-in and default OFF.
+    #
+    # ⛔ Why this is only meaningful after ordering: KRT's keepout is **not
+    # net-scoped** (``obstacle_map.add_user_keepout_obstacles`` blocks all copper
+    # layers for every net being routed), so an annulus drawn before a
+    # single-pass route blocks the controller's own escape. Phase 13 measured
+    # exactly that -- **-32 nets across the corpus** (68/81 -> 36/81, DRC 0
+    # throughout), with the control board losing precisely its three controller
+    # housekeeping nets. With the escapes already committed by pass 1, the same
+    # polygons protect the remaining via sites instead of destroying them.
+    if keepout_escape:
+        keepout_record = _apply_escape_keepout(
+            route_input, result, fp_lib_dirs, spec=spec, layer=keepout_layer,
+            loop_ran=bool(loop_first_record.get("ran")), warnings=warnings)
+        if keepout_record.get("written"):
+            pass2_extra = list(pass2_extra or []) + [
+                "--keepout", "--keepout-layer", keepout_layer]
+            if loop_first_record:
+                loop_first_record["pass2_extra_args"] = list(pass2_extra)
+
     krt.route_and_check(
-        placed_pcb,
+        route_input,
         workdir_abs,
         krt_dir=krt_dir,
         nets=net_selection,
         timeout_s=timeout_s,
         power_net_widths=width_map or None,
         out_path=routed_pcb,
-        route_extra_args=route_extra_args,
+        route_extra_args=pass2_extra,
+        net_clearances=clearance_map or None,
+        route_log_path=route_log_path,
         **dr,
     )
 
@@ -572,6 +1225,19 @@ def emit_power_copper(
         )
         warnings.extend(thermal_warnings)
 
+    # -- via-in-pad relocation (Phase 8, WS-B) -------------------------------
+    # Last, so it sees the final copper -- the pour's stitching vias and the
+    # thermal array both -- and so the board it grades is the board that ships.
+    relocation_dict = None
+    if relocate_via_in_pad:
+        final_pcb, feedback, relocation_dict, relocation_warnings = (
+            _relocate_vias_in_pads(
+                final_pcb, workdir_abs, spec, feedback,
+                krt_dir=krt_dir, timeout_s=timeout_s,
+            )
+        )
+        warnings.extend(relocation_warnings)
+
     result.routability = feedback
 
     outcome = PowerCopperResult(
@@ -587,6 +1253,12 @@ def emit_power_copper(
         zones_by_net=zones_by_net,
         thermal_vias=thermal_dict,
         current_widths=current_records,
+        via_relocation=relocation_dict,
+        net_clearances=clearance_records,
+        pinned_widths=pinned_widths,
+        loop_first=loop_first_record,
+        fanout=fanout_record,
+        keepout=keepout_record,
     )
     logger.info("Power copper: %s", outcome.summary().replace("\n", " | "))
     return outcome
@@ -766,6 +1438,137 @@ def _apply_thermal_vias(
         "thermal vias dropped entirely: no array size was DRC-clean "
         "(the pre-splice board ships unchanged)")
     return final_pcb, feedback, dropped, warnings
+
+
+def _relocate_vias_in_pads(
+    final_pcb: str,
+    workdir_abs: str,
+    spec,
+    feedback,
+    krt_dir: str | None,
+    timeout_s: int,
+):
+    """Move plane-stitching vias out of SMD pads. Returns
+    ``(board_path, feedback, relocation_dict, warnings)``.
+
+    **The ladder, in the order Phase-8 plan section 6 bail-out 2 fixes:**
+
+    1. **All at once.** Splice every geometrically legal move and grade. This is
+       the common case and costs one KRT grading.
+    2. **One at a time.** If the batch makes DRC or connectivity worse, rebuild
+       from the original board accepting moves **one by one in file order**,
+       grading after each and reverting any that regresses. Partial success is
+       an explicitly good outcome here -- "9 of 11 relocated, 2 left in place"
+       beats an all-or-nothing revert.
+    3. **Keep the original.** If not a single via can be moved cleanly, the
+       pre-change board ships unchanged and the count is reported as unresolved.
+
+    ⛔ **A via is never dropped**, which is where this deliberately parts company
+    with Phase 5's thermal-via rule. A thermal via is additive; these are the
+    pads' only path to the plane, so dropping one can orphan a ground pad --
+    a failure ``check_drc`` cannot see and ``check_connected`` can. Never trade
+    connectivity for a lower via-in-pad number.
+    """
+    from .via_relocate import apply_via_relocations, plan_via_relocations
+
+    warnings: list[str] = []
+    plan = plan_via_relocations(final_pcb, spec)
+    report = plan.to_dict()
+    report["in_pad_before"] = plan.in_pad_count
+    report["relocated"] = 0
+    report["in_pad_after"] = plan.in_pad_count
+    report["applied_indices"] = []
+    report["drc_before"] = int(getattr(feedback, "drc_violation_count", 0) or 0)
+    report["unrouted_before"] = int(getattr(feedback, "unrouted_count", 0) or 0)
+
+    for note in plan.notes:
+        warnings.append(f"via-in-pad relocation: {note}")
+    for move in plan.foreign:
+        warnings.append(f"via-in-pad: {move.reason}")
+
+    if not plan.relocatable:
+        report["outcome"] = (
+            "nothing relocatable" if plan.in_pad_count
+            else "no via-in-pad found")
+        if plan.in_pad_count:
+            warnings.append(
+                f"via-in-pad: {len(plan.unresolved)} via(s) had no legal ring "
+                "position and stay in their pads (the board is unchanged)")
+        return final_pcb, feedback, report, warnings
+
+    baseline_drc = report["drc_before"]
+    baseline_unrouted = report["unrouted_before"]
+    candidate_path = os.path.join(workdir_abs, "power_copper_via_relocated.kicad_pcb")
+
+    def _try(indices):
+        """Splice ``indices`` onto the ORIGINAL board and grade. Never mutates."""
+        moved = apply_via_relocations(final_pcb, candidate_path, plan, only=indices)
+        _copy_sibling_project(final_pcb, candidate_path)
+        graded = krt.check_board(candidate_path, krt_dir=krt_dir,
+                                 timeout_s=timeout_s)
+        drc = int(getattr(graded, "drc_violation_count", 0) or 0)
+        ok = drc <= baseline_drc and graded.unrouted_count <= baseline_unrouted
+        return ok, moved, graded, drc
+
+    order = [m.via_index for m in plan.relocatable]
+
+    ok, moved, graded, drc = _try(set(order))
+    accepted = set(order) if ok else set()
+    if not ok:
+        warnings.append(
+            f"via-in-pad: relocating all {len(order)} at once cost DRC "
+            f"{baseline_drc} -> {drc} / unrouted {baseline_unrouted} -> "
+            f"{graded.unrouted_count}; retrying one via at a time")
+        for index in order:
+            trial = accepted | {index}
+            ok_one, _moved, graded_one, drc_one = _try(trial)
+            if ok_one:
+                accepted = trial
+            else:
+                move = next(m for m in plan.relocatable if m.via_index == index)
+                move.status = "unresolved"
+                move.reason = (
+                    f"relocation to ({move.new_x:.3f}, {move.new_y:.3f}) cost "
+                    f"DRC {baseline_drc} -> {drc_one} / unrouted "
+                    f"{baseline_unrouted} -> {graded_one.unrouted_count}; "
+                    "left in place")
+        if accepted:
+            ok, moved, graded, drc = _try(accepted)
+            if not ok:  # pragma: no cover - the accumulator was graded green
+                accepted = set()
+
+    if not accepted:
+        report.update(outcome="reverted: no via could be moved without cost",
+                      relocated=0, in_pad_after=plan.in_pad_count,
+                      moves=[m.to_dict() for m in plan.moves])
+        warnings.append(
+            "via-in-pad: every relocation cost DRC or connectivity; the "
+            "pre-change board ships unchanged")
+        return final_pcb, feedback, report, warnings
+
+    from .via_relocate import find_vias_in_pads
+
+    report.update(
+        outcome="relocated",
+        relocated=len(accepted),
+        applied_indices=sorted(accepted),
+        in_pad_after=len(find_vias_in_pads(candidate_path, spec)),
+        drc_after=drc,
+        unrouted_after=graded.unrouted_count,
+        moves=[m.to_dict() for m in plan.moves],
+        # Recount AFTER the ladder: the per-via fallback demotes a move to
+        # "unresolved" when it costs DRC or connectivity, so the counts taken
+        # from the pre-ladder plan are stale by this point.
+        relocatable=len(plan.relocatable),
+        unresolved=len(plan.unresolved),
+    )
+    still = report["in_pad_after"]
+    if still:
+        warnings.append(
+            f"via-in-pad: {len(accepted)} of {plan.in_pad_count} relocated; "
+            f"{still} via(s) remain in pads (no legal position, or the move "
+            "cost DRC/connectivity) -- reported, never dropped")
+    return candidate_path, graded, report, warnings
 
 
 def _shrink_ladder(cols: int, rows: int) -> list:

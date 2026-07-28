@@ -546,6 +546,7 @@ def generate_power_constraints(
     clearance_mm: float = 0.5,
     zones: bool = False,
     far_excludes_divider: bool = False,
+    escape_room: bool | float = False,
 ) -> PowerConstraintSet:
     """Turn a :class:`~skidl_layout.power_roles.PowerStagePlan` into constraints.
 
@@ -580,6 +581,18 @@ def generate_power_constraints(
             shared outline (4.68 either way) and worse on the derived one
             (12.52 vs 11.25), so the tug-of-war is real but costs less than
             leaving the divider unprotected.
+        escape_room: power-layout Phase 13, **opt-in and off by default** ->
+            byte-identical. ``True`` holds every other part at least one escape
+            via lane (:data:`~skidl_layout.power_escape.ESCAPE_LANE_MM`) clear
+            of each stage's controller courtyard; a ``float`` names that lane in
+            mm. The generated distances are centre-to-centre, converted from the
+            edge gap the escape actually needs -- see
+            :func:`~skidl_layout.power_escape.escape_far_constraints` for the
+            conversion and for why it is *measured* rather than asserted.
+            ⚠ The engine reaches the same primitive directly, so that **every**
+            placement candidate carries the constraint and not only
+            ``power_stage_first``; this keyword is the generator-level form, for
+            a caller assembling a constraint set by hand.
 
     Returns:
         A :class:`PowerConstraintSet`. Never raises on a missing role or a
@@ -612,5 +625,29 @@ def generate_power_constraints(
             emitter.claimed.add(constraint.target_ref)
         for zone in result.zones[before_zones:]:
             emitter.claimed.update(zone.refs or [])
+
+    # Phase 13, opt-in. Emitted LAST and outside the per-stage loop on purpose:
+    # the escape lane is a property of the whole board's crowding around a
+    # controller, not of one stage's device list, so ``claimed`` -- which exists
+    # to stop a second stage re-constraining a first stage's parts -- must not
+    # silence it. ``_Emitter.far`` would; these go straight onto the result.
+    if escape_room:
+        from .power_escape import escape_far_constraints
+
+        lane = None if escape_room is True else float(escape_room)
+        generated = escape_far_constraints(
+            power_stage_plan, footprint_by_ref, fp_geometries=fp_geometries,
+            fp_bboxes=fp_bboxes, lane_mm=lane)
+        existing = {(c.ref, c.target_ref) for c in result.far}
+        for constraint in generated:
+            key = (constraint.ref, constraint.target_ref)
+            if key in existing:
+                continue
+            existing.add(key)
+            result.far.append(constraint)
+            result.reasons.setdefault(
+                f"far {constraint.ref}->{constraint.target_ref}", []).append(
+                "escape room: the controller needs one clear via lane to leave "
+                "the top layer through, and this part is what would be in it")
 
     return result
