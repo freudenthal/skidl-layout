@@ -124,6 +124,16 @@ from .power_escape import (
     resolve_lane_mm,
     write_keepout_polygons,
 )
+from .power_zones import (
+    ZonePlan,
+    ZoneRegion,
+    board_uses_name_nets,
+    net_ids_from_board,
+    plan_zone_regions,
+    region_polygon,
+    splice_zones,
+    zone_sexprs,
+)
 from .power_metrics import (
     LoopGeometry,
     PowerMetrics,
