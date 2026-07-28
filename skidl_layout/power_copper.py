@@ -1301,6 +1301,35 @@ def emit_power_copper(
                 warnings.append(
                     "zone_plan: region(s) pour net(s) the power plan did not "
                     "promote: " + ", ".join(sorted(set(uncovered_regions))))
+            # ⛔⛔ THE MIXED-BOARD DEFECT, measured in Phase 15 and unfixed.
+            #
+            # A plane net no region covers still goes to ``route_planes.py``
+            # below -- and KRT sizes its Voronoi cell against the board as it is
+            # *before* our zones are spliced in, because the splice happens
+            # after the pour. The two pour paths therefore have **no
+            # arbitration**: they both lay claim to the same free copper.
+            #
+            # Measured on ``lt3724_buck``, the corpus's only two-ground board,
+            # where the regions pour SGND and PGND is left to KRT: one ground is
+            # ANNIHILATED -- PGND fell to 4.4 mm2 under 1 mm regions, and SGND to
+            # 2.8 mm2 under 4 mm regions -- and **which of the two loses is not
+            # stable between runs**, which moved that board's routing completion
+            # between two otherwise identical 35-route sweeps.
+            #
+            # The fix is to pour EVERY plane net through the region path, or to
+            # hand KRT the region outlines as obstacles. Neither exists yet, so
+            # the honest thing is to say so loudly at the seam rather than only
+            # in a report nobody reads at 2 a.m.
+            leftover = [n for n in plane_nets if n not in covered_nets]
+            if covered_nets and leftover:
+                warnings.append(
+                    "zone_plan covers " + ", ".join(sorted(covered_nets))
+                    + " but leaves " + ", ".join(leftover)
+                    + " to route_planes -- ⛔ the two pour paths do NOT arbitrate "
+                      "(KRT sizes its Voronoi cells before these zones are "
+                      "spliced in). Measured on a two-ground board, one ground "
+                      "was starved to under 5 mm2 and which one was not stable "
+                      "run to run. Cover every plane net, or expect it")
 
     # Pour the plane nets on the routed board, or fall through if none.
     # Nets a zone region covers are poured by the writer path below instead;
