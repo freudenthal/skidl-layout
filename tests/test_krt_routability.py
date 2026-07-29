@@ -506,3 +506,95 @@ def test_zone_counts_by_net_multi_zone_same_net():
     text = (ZONE_CONNECT_BOARD
             + '(zone (net 3) (net_name "GND") (layer "F.Cu") (fill yes))\n')
     assert krt._zone_counts_by_net(text)["GND"] == 2
+
+
+# --------------------------------------------------------------------------
+# Power-layout Phase 16: the router layer flags
+#
+# ⛔ Both parameters default to ``None`` and emit NOTHING, so every call made
+# before Phase 16 produces byte-identical argv. That is the contract gate F1
+# rests on, and it is tested here rather than asserted in prose.
+# --------------------------------------------------------------------------
+
+def test_layers_none_emits_neither_flag(monkeypatch, tmp_path):
+    args = _capture_route_argv(monkeypatch, tmp_path)
+    assert "--layers" not in args
+    assert "--layer-costs" not in args
+
+
+def test_layers_emitted_as_space_separated_names(monkeypatch, tmp_path):
+    args = _capture_route_argv(
+        monkeypatch, tmp_path, layers=["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    i = args.index("--layers")
+    assert args[i + 1:i + 5] == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+    assert "--layer-costs" not in args
+
+
+def test_layer_costs_emitted_in_the_same_order(monkeypatch, tmp_path):
+    """⚠ ``route.py`` pairs ``--layer-costs`` with ``--layers`` BY POSITION, and
+    ``-1`` is its FORBIDDEN sentinel."""
+    args = _capture_route_argv(
+        monkeypatch, tmp_path,
+        layers=["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"],
+        layer_costs=[1.0, -1, -1, 3.0])
+    i = args.index("--layer-costs")
+    assert args[i + 1:i + 5] == ["1", "-1", "-1", "3"]
+    # order preserved and the two lists still adjacent-and-matched
+    j = args.index("--layers")
+    assert args[j + 1:j + 5] == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+
+
+def test_layer_costs_length_mismatch_raises(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="layer_costs"):
+        _capture_route_argv(monkeypatch, tmp_path,
+                            layers=["F.Cu", "B.Cu"], layer_costs=[1.0])
+
+
+def test_layer_costs_without_layers_raises(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="layer_costs requires layers"):
+        _capture_route_argv(monkeypatch, tmp_path, layer_costs=[1.0, 3.0])
+
+
+def _capture_pour_argv(monkeypatch, tmp_path, **kwargs):
+    """``route_planes.py``'s argv, against a stubbed KRT."""
+    fake = _make_usable_krt(tmp_path / "krt_pour")
+    captured = {}
+
+    def fake_run(args, krt_dir, timeout_s):
+        captured.setdefault("args", args)
+
+        class P:
+            stdout = 'JSON_SUMMARY: {"successful": 1, "failed": 0}'
+            stderr = ""
+            returncode = 0
+        # ⚠ Only route_planes.py takes an output path; the checkers that run
+        # after it are invoked with the board alone.
+        if args[0] == "route_planes.py":
+            with open(args[2], "w", encoding="utf-8") as fh:
+                fh.write('(zone (net_name "GND") (fill yes))\n')
+        return P()
+
+    monkeypatch.setattr(krt, "_run_krt", fake_run)
+    krt.pour_planes(str(tmp_path / "in.kicad_pcb"),
+                    str(tmp_path / "out.kicad_pcb"),
+                    nets=["GND"], plane_layers=["In1.Cu"],
+                    workdir=str(tmp_path / "work"), krt_dir=str(fake), **kwargs)
+    return captured["args"]
+
+
+def test_pour_planes_layers_none_emits_no_flag(monkeypatch, tmp_path):
+    args = _capture_pour_argv(monkeypatch, tmp_path)
+    assert "--layers" not in args
+    assert "--plane-layers" in args
+
+
+def test_pour_planes_emits_layers_after_plane_layers(monkeypatch, tmp_path):
+    """⛔ No cost list here: ``route_planes.py`` is what routes plane-net taps
+    from pads DOWN to the plane layer, and forbidding that layer would
+    disconnect every ground pad on the board."""
+    args = _capture_pour_argv(monkeypatch, tmp_path,
+                              layers=["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"])
+    assert args.index("--layers") > args.index("--plane-layers")
+    i = args.index("--layers")
+    assert args[i + 1:i + 5] == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+    assert "--layer-costs" not in args

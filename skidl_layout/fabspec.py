@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field, fields
+import re
+from dataclasses import dataclass, field, fields, replace as _dc_replace
 
 # --------------------------------------------------------------------------
 # The spec
@@ -155,9 +156,28 @@ OSHPARK_2L = FabSpec(
     max_board_mm=(406.4, 558.8),    # 16 x 22 in
 )
 
+# ⭐ Power-layout Phase 16. A four-layer spec that is byte-for-byte OSHPARK_2L
+# except for its name and its copper count.
+#
+# ⛔ **This is NOT a sourced fabricator capture.** No published 4-layer
+# capability capture exists on this tree, and this arc's law is that every rule
+# carries a measurement and a source -- so rather than invent fab numbers, this
+# preset carries OSHPark's published *2-layer* floors across unchanged and says
+# so. Do not quote it as anybody's 4-layer service.
+#
+# ⭐ Carrying them across is also what makes the four-layer experiment a
+# CONTROLLED one: with identical track/clearance/via/edge floors, **the layer
+# count is the only variable** between the 2-layer baseline arm and the 4-layer
+# arms. A preset with tighter 4-layer rules would confound the one measurement
+# Phase 16 exists to make. ⚠ Whoever adds a real ``oshpark-4l`` / ``jlcpcb-4l``
+# must re-run that comparison -- the floors will differ and it stops being
+# controlled.
+GENERIC_4L = _dc_replace(OSHPARK_2L, name="generic-4l", copper_layers=4)
+
 _PRESETS: dict[str, FabSpec] = {
     "oshpark-2l": OSHPARK_2L,
     "oshpark": OSHPARK_2L,  # bare name -> the 2-layer default service
+    "generic-4l": GENERIC_4L,
 }
 
 
@@ -290,6 +310,12 @@ IPC2221B_TABLE_6_1_MM: dict = {
 IPC2221B_ABOVE_500V_MM_PER_VOLT: dict = {"B2": 0.005}
 
 #: Which column :func:`fab_check` grades against when the caller names none.
+#: Copper rows of a board's own ``(layers ...)`` table -- ``(0 "F.Cu" signal)``,
+#: ``(4 "In1.Cu" signal)``, ... ⚠ The leading ordinal is what distinguishes a
+#: board row from a footprint's ``(layers "F.Cu" "F.Mask")`` list, which must
+#: NOT be counted. (Phase 16; the same counter KRT's ``list_nets.py`` uses.)
+_BOARD_COPPER_ROW_RE = re.compile(r'\(\d+\s+"[^"]*\.Cu"')
+
 DEFAULT_SPACING_COLUMN = "B2"
 
 
@@ -765,6 +791,22 @@ def fab_check(
 
     result = FabCheckResult(spec_name=spec.name)
     net_map = _net_id_to_name(board)
+
+    # -- copper layer count (Phase 16) ------------------------------------
+    # ⭐ The rule that makes the four-layer defect impossible to reintroduce
+    # SILENTLY. Before Phase 16 the writer emitted a hardcoded 2-copper-layer
+    # table, so ``plan_pcb(board_layers=4, fab=...)`` wrote a two-layer board
+    # and every rule here still passed clean. That silence is what let Phase 12
+    # report a four-layer result it had never measured.
+    # ⚠ The regex deliberately does NOT match a footprint's ``(layers "F.Cu"
+    # ...)`` list -- only the board's own table carries the leading ordinal.
+    # Same counter KRT uses (``list_nets.py``).
+    result.checked.append("layer_count")
+    declared_cu = len(_BOARD_COPPER_ROW_RE.findall(text))
+    if declared_cu != int(spec.copper_layers):
+        result.violations.append(FabViolation(
+            "layer_count", "board (layers ...) table",
+            declared_cu, int(spec.copper_layers)))
 
     # -- tracks -----------------------------------------------------------
     result.checked.append("min_track")

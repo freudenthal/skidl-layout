@@ -86,7 +86,15 @@ def test_negative_voltage_is_graded_on_magnitude():
 def _two_net_board(gap_mm: float) -> str:
     """Two 0.2 mm tracks on F.Cu whose copper edges sit ``gap_mm`` apart."""
     y2 = 10.0 + 0.2 + gap_mm          # centre-to-centre = width + gap
+    # ⚠ The ``(layers ...)`` table is graded by Phase 16's ``layer_count`` rule,
+    # so a two-layer fixture has to declare two copper layers -- a fragment with
+    # no table at all counts as zero.
     return f"""(kicad_pcb
+\t(layers
+\t\t(0 "F.Cu" signal)
+\t\t(2 "B.Cu" signal)
+\t\t(25 "Edge.Cuts" user)
+\t)
 \t(net 0 "")
 \t(net 1 "HV")
 \t(net 2 "GND")

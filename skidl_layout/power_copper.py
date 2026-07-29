@@ -111,6 +111,15 @@ class PowerCopperResult:
     #: "reason": …}`` when it was given and nothing resolved, so "asked for and
     #: declined" can never read as "never asked for".
     zone_plan: dict = field(default_factory=dict)
+    #: ⭐ Phase 16: the copper stack handed to ``route.py --layers``, top to
+    #: bottom, and the ``--layer-costs`` paired with it (``-1`` = FORBIDDEN).
+    #: **Both ``None`` below four layers**, which is the byte-identical default
+    #: path -- an absent stack means "no layer flag was emitted", not "two
+    #: layers were assumed". They travel on the result so a driver can assert
+    #: what was requested without re-deriving it, which is half of the gate that
+    #: exists because Phase 12 reported a four-layer result it never measured.
+    route_layers: list[str] | None = None
+    route_layer_costs: list[float] | None = None
 
     def summary(self) -> str:
         lines = ["Power copper emitted:"]
@@ -205,6 +214,10 @@ class PowerCopperResult:
             "fanout": dict(self.fanout),
             "keepout": dict(self.keepout),
             "zone_plan": dict(self.zone_plan),
+            "route_layers": (list(self.route_layers)
+                             if self.route_layers is not None else None),
+            "route_layer_costs": (list(self.route_layer_costs)
+                                  if self.route_layer_costs is not None else None),
         }
 
 
@@ -722,6 +735,7 @@ def emit_power_copper(
     keepout_escape: bool = False,
     keepout_layer: str = "User.2",
     zone_plan=None,
+    reserve_plane_layers: bool = False,
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -939,8 +953,23 @@ def emit_power_copper(
     - The net header form (KiCad 9 ``(net id)`` + ``(net_name …)`` vs KiCad 10
       ``(net "NAME")``) is **detected from the board being spliced**, the same
       way ``route_planes.py`` decides it. Nothing here assumes a version.
+
+    **Phase-16: ``board_layers`` finally reaches the copper.** The placed board
+    written here now declares ``board_layers`` copper layers (the writer raises
+    if that contradicts ``fab_spec``), and the resolved stack is passed to every
+    route pass as ``--layers`` and to the pour as ``--layers``. Below four
+    layers nothing changes -- no layer keyword is passed at all, so the KRT
+    calls are literally the pre-Phase-16 calls.
+
+    ``reserve_plane_layers`` (default ``False``) additionally forbids the router
+    from routing on any layer that carries a plane, via ``--layer-costs`` with
+    KRT's ``-1`` FORBIDDEN sentinel. ⚠ **Both settings are real questions.**
+    Reserving the planes is what makes a 4-layer power board electrically
+    right; leaving them routable is the maximum-completion case. ⛔ It is
+    meaningless below four layers and is recorded in ``warnings`` if asked for
+    there.
     """
-    from .writer import write_kicad_pcb
+    from .writer import write_kicad_pcb, _copper_layer_names
     from .fabspec import resolve_fab_spec
 
     spec = resolve_fab_spec(fab_spec)
@@ -958,6 +987,11 @@ def emit_power_copper(
         lib_table=lib_table,
         strict_missing_footprints=strict_missing_footprints,
         fab_spec=spec,
+        # ⭐ Phase 16: the board KRT actually routes is written HERE, so this is
+        # where the four-layer request has to land. ⛔ The writer raises if this
+        # contradicts the spec -- a board that asks for four layers and declares
+        # two is exactly what voided Phase 12's four-layer arm.
+        copper_layers=board_layers,
     )
 
     warnings: list[str] = []
@@ -1143,6 +1177,51 @@ def emit_power_copper(
     routed_pcb = os.path.join(workdir_abs, "routed_power.kicad_pcb")
     dr = _spec_route_kwargs(spec)
 
+    # ⭐ Power-layout Phase 16: resolve the routing stack ONCE, here, and hand
+    # the same answer to every route pass and to the pour.
+    #
+    # ⛔ Below four layers this is ``None``/``None`` and NO layer flag is
+    # emitted, so the 2-layer argv is byte-identical to every run before
+    # Phase 16.
+    #
+    # ⭐ The reservation rule reads as one line of English: **a layer that
+    # carries a plane is not a routing layer**, ``F.Cu`` is preferred, and
+    # everything else costs more. It generalises to six layers without another
+    # edit. ``-1`` is KRT's FORBIDDEN sentinel; ``1.0``/``3.0`` reproduce KRT's
+    # own 2-layer bias. ⚠ Without it ``route.py`` gives every layer cost 1.0 at
+    # four or more layers -- a power board with signal tracks cut through its
+    # ground plane is not datasheet quality, it is worse than a 2-layer board.
+    route_layers: list[str] | None = None
+    route_layer_costs: list[float] | None = None
+    if board_layers >= 4:
+        route_layers = _copper_layer_names(board_layers)
+        if reserve_plane_layers:
+            poured = set(plane_layers)
+            route_layer_costs = [
+                -1.0 if name in poured else (1.0 if name == "F.Cu" else 3.0)
+                for name in route_layers
+            ]
+    elif reserve_plane_layers:
+        # Asked for and declined, recorded rather than silently ignored: on two
+        # layers there is no plane layer to withhold from the router.
+        warnings.append(
+            f"reserve_plane_layers requested at board_layers={board_layers}; "
+            "the concept needs 4+ copper layers, so no layer flags were passed")
+    # ⛔ Built as dicts rather than passed as ``layers=None`` so that below four
+    # layers the KRT calls are LITERALLY the pre-Phase-16 calls -- same keyword
+    # set, not merely the same argv. The kwargs a caller sees are part of the
+    # byte-identity claim, and two existing tests assert them exactly.
+    route_layer_kwargs: dict = {}
+    pour_layer_kwargs: dict = {}
+    if route_layers is not None:
+        route_layer_kwargs["layers"] = route_layers
+        # ⛔ The stack goes to the pour; the COSTS never do. ``route_planes.py``
+        # routes plane-net taps from pads down to the plane layer, and
+        # forbidding that layer there disconnects every ground pad.
+        pour_layer_kwargs["layers"] = route_layers
+        if route_layer_costs is not None:
+            route_layer_kwargs["layer_costs"] = route_layer_costs
+
     # ⭐ Phase 14 / WS-14.1: commit the commutation loop's copper BEFORE anything
     # else competes for the channels. Opt-in and default OFF -- with
     # ``loop_first=False`` the single call below is the pre-Phase-14 call
@@ -1195,6 +1274,7 @@ def emit_power_copper(
                 route_extra_args=route_extra_args,
                 net_clearances=clearance_map or None,
                 route_log_path=pass1_log,
+                **route_layer_kwargs,
                 **dr,
             )
             # ⚠ The sibling ``.kicad_pro`` carries the DRC floor pass 1 routed
@@ -1261,6 +1341,7 @@ def emit_power_copper(
         route_extra_args=pass2_extra,
         net_clearances=clearance_map or None,
         route_log_path=route_log_path,
+        **route_layer_kwargs,
         **dr,
     )
 
@@ -1286,6 +1367,20 @@ def emit_power_copper(
     resolved_zone_plan = None
     covered_nets: set = set()
     if zone_plan is not None and zone_plan is not False:
+        # ⛔⛔ Phase 16 limitation, recorded rather than fixed. Every region a
+        # zone plan builds pours on ``power_zones.BACK_COPPER`` ("B.Cu") unless
+        # a caller names a layer -- and on four layers B.Cu is a *signal* layer,
+        # not the ground plane. ``plan_zone_regions`` accepts ``board_layers``
+        # and never reads it. The zone plan is opt-in, off in every Phase-16
+        # arm, and building a 4-layer story for it is a later phase's work; what
+        # must not happen is a 4-layer board quietly pouring a region onto its
+        # escape-via landing area.
+        if board_layers >= 4:
+            warnings.append(
+                f"zone_plan requested at board_layers={board_layers}: regions "
+                "default to B.Cu, which is a SIGNAL layer on a 4+ layer board. "
+                "plan_zone_regions has no 4-layer story (Phase 16 §9.5) -- name "
+                "an explicit layer= or expect the region on the back copper")
         resolved_zone_plan, zone_record = _resolve_zone_plan(
             zone_plan, result, circuit, fp_lib_dirs, spec=spec,
             plane_nets=plane_nets, warnings=warnings)
@@ -1361,6 +1456,7 @@ def emit_power_copper(
             timeout_s=timeout_s,
             add_gnd_vias=add_gnd_vias,
             gnd_via_distance=gnd_via_distance,
+            **pour_layer_kwargs,
             **pour_kwargs,
         )
 
@@ -1452,6 +1548,8 @@ def emit_power_copper(
         fanout=fanout_record,
         keepout=keepout_record,
         zone_plan=zone_record,
+        route_layers=route_layers,
+        route_layer_costs=route_layer_costs,
     )
     logger.info("Power copper: %s", outcome.summary().replace("\n", " | "))
     return outcome

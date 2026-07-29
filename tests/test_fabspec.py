@@ -92,7 +92,16 @@ def test_resolve_unknown_name_raises_listing_presets():
 # WS-F4: fab_check against synthetic boards (one violation each)
 # --------------------------------------------------------------------------
 
+# ⚠ The ``(layers ...)`` table is not decoration: Phase 16's ``layer_count``
+# rule grades the board's declared copper against the spec's, and a fragment
+# with no table at all would grade as zero copper layers. Every fixture below
+# is a two-layer board, which is what ``OSHPARK_2L`` declares.
 _HEADER = """(kicad_pcb (version 20241229) (generator "test")
+  (layers
+    (0 "F.Cu" signal)
+    (2 "B.Cu" signal)
+    (25 "Edge.Cuts" user)
+  )
   (net 0 "")
   (net 1 "V5")
   (gr_rect (start 0 0) (end 40 30) (layer "Edge.Cuts") (width 0.1))
@@ -455,3 +464,87 @@ def test_write_krt_fab_overrides_rejects_no_spec(tmp_path):
 
     with pytest.raises(ValueError):
         write_krt_fab_overrides(None, str(tmp_path / "x.txt"))
+
+
+# --------------------------------------------------------------------------
+# Power-layout Phase 16: the four-layer preset + the layer_count rule
+# --------------------------------------------------------------------------
+
+def test_generic_4l_preset_resolves():
+    spec = resolve_fab_spec("generic-4l")
+    assert spec.name == "generic-4l"
+    assert spec.copper_layers == 4
+
+
+def test_generic_4l_differs_from_oshpark_in_name_and_layers_only():
+    """⭐ §4.3's controlled-experiment guarantee, encoded.
+
+    ``generic-4l`` carries OSHPark's published 2-layer floors verbatim so that
+    **the layer count is the only variable** between the 2-layer baseline arm
+    and the 4-layer arms. A preset with tighter 4-layer rules would confound
+    the one measurement Phase 16 exists to make.
+    ⛔ It is deliberately NOT a sourced fabricator capture -- see its docstring.
+    """
+    four = resolve_fab_spec("generic-4l").to_dict()
+    two = OSHPARK_2L.to_dict()
+    assert sorted(k for k in four if four[k] != two[k]) == ["copper_layers", "name"]
+
+
+def test_jlcpcb_6l_is_still_an_unknown_preset():
+    """⚠ skidl-eda asserts this sentinel raises; adding generic-4l must not
+    accidentally make it resolvable."""
+    with pytest.raises(ValueError, match="unknown fab spec"):
+        resolve_fab_spec("jlcpcb-6l")
+
+
+def _two_layer_board(tmp_path):
+    from skidl_layout.writer import PlacedPart, write_kicad_pcb
+
+    circuit = _Circuit(["V5", "GND"])
+    parts = [PlacedPart("R1", 10.0, 10.0, 0.0, "TestLib:R_Test")]
+    out = str(tmp_path / "two.kicad_pcb")
+    write_kicad_pcb(parts, circuit, [_fp_lib(tmp_path)], out)
+    return out
+
+
+def test_fab_check_layer_count_fails_a_two_layer_board_against_4l(tmp_path):
+    """⭐ The most valuable artefact of Phase 16: defect 1 can no longer be
+    reintroduced silently."""
+    board = _two_layer_board(tmp_path)
+    result = fab_check(board, resolve_fab_spec("generic-4l"), run_drc=False)
+    assert "layer_count" in result.checked
+    rules = [v.rule for v in result.violations]
+    assert "layer_count" in rules
+    assert not result.ok
+    row = next(v for v in result.violations if v.rule == "layer_count")
+    assert row.measured == 2 and row.limit == 4
+
+
+def test_fab_check_layer_count_passes_a_matching_board(tmp_path):
+    board = _two_layer_board(tmp_path)
+    result = fab_check(board, OSHPARK_2L, run_drc=False)
+    assert "layer_count" in result.checked
+    assert [v for v in result.violations if v.rule == "layer_count"] == []
+
+
+def test_writer_with_4l_spec_emits_four_foils_and_four_layer_rows(tmp_path):
+    """The stackup and the layer table must AGREE -- before Phase 16 a 4-layer
+    spec emitted In1/In2 inside ``(setup (stackup ...))`` while ``(layers ...)``
+    still declared two, an internally inconsistent board."""
+    from skidl_layout.writer import PlacedPart, write_kicad_pcb
+
+    circuit = _Circuit(["V5", "GND"])
+    parts = [PlacedPart("R1", 10.0, 10.0, 0.0, "TestLib:R_Test")]
+    out = str(tmp_path / "four.kicad_pcb")
+    write_kicad_pcb(parts, circuit, [_fp_lib(tmp_path)], out,
+                    fab_spec=resolve_fab_spec("generic-4l"))
+    text = (tmp_path / "four.kicad_pcb").read_text()
+    assert "(stackup" in text
+    for name in ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu"):
+        assert f'(layer "{name}"' in text          # the stackup foil
+    board = Sexp(text)
+    layers = next(child for child in board
+                  if isinstance(child, list) and child and child[0] == "layers")
+    rows = [(int(r[0]), str(r[1]).strip('"')) for r in layers[1:]
+            if isinstance(r, list) and str(r[1]).strip('"').endswith(".Cu")]
+    assert rows == [(0, "F.Cu"), (4, "In1.Cu"), (6, "In2.Cu"), (2, "B.Cu")]

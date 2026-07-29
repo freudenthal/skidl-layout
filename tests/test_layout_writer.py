@@ -715,3 +715,123 @@ def test_write_filters_unsupported_internal_footprint_layers(tmp_path):
     ]
     assert len(uuids) == len(set(uuids))
     assert "11111111-1111-1111-1111-111111111111" not in uuids
+
+
+# ---------------------------------------------------------------------------
+# Power-layout Phase 16: the four-layer copper table
+#
+# ⛔ The 2-layer test above (``test_write_filters_unsupported_internal_footprint
+# _layers``) must keep passing UNCHANGED -- on a 2-layer board inner copper is
+# still stripped, because the board declares no inner copper to put it on.
+# ---------------------------------------------------------------------------
+
+def _board_copper_rows(content):
+    """``[(ordinal, name), ...]`` from the board's own ``(layers ...)`` block.
+
+    ⚠ Reads the BOARD table, not a footprint's ``(layers "F.Cu" ...)`` list --
+    only the board rows carry an ordinal, which is what makes them selectable.
+    """
+    board = Sexp(content)
+    layers = next(child for child in board
+                  if isinstance(child, list) and child and child[0] == "layers")
+    return [(int(row[0]), str(row[1]).strip('"'))
+            for row in layers[1:]
+            if isinstance(row, list) and str(row[1]).strip('"').endswith(".Cu")]
+
+
+def _zone_footprint_lib(tmp_path):
+    """A footprint whose zone names inner copper -- the WS-16.1(c) subject."""
+    lib_dir = tmp_path / "TestLib.pretty"
+    lib_dir.mkdir()
+    (lib_dir / "Module_With_Zone.kicad_mod").write_text(
+        '(footprint "Module_With_Zone"\n'
+        '  (layer "F.Cu")\n'
+        '  (property "Reference" "REF**" (at 0 -2) (layer F.SilkS))\n'
+        '  (pad "1" smd rect (at 0 0) (size 1 1) (layers "*.Cu" "F.Mask"))\n'
+        '  (zone\n'
+        '    (net 0)\n'
+        '    (net_name "")\n'
+        '    (layers F.Cu B.Cu In1.Cu In2.Cu)\n'
+        '    (uuid "11111111-1111-1111-1111-111111111111")\n'
+        '    (hatch edge 0.5)\n'
+        '    (connect_pads (clearance 0.2))\n'
+        '    (polygon (pts (xy -1 -1) (xy 1 -1) (xy 1 1) (xy -1 1)))\n'
+        '  )\n'
+        ')\n'
+    )
+    return [PlacedPart(ref="U1", x_mm=5.0, y_mm=5.0, rot_deg=0.0,
+                       footprint="TestLib:Module_With_Zone")]
+
+
+def test_write_four_layer_board_layer_table_order_and_ordinals(tmp_path):
+    """⭐ The Phase-16 root fix, asserted exactly.
+
+    Order is F.Cu, In1.Cu, In2.Cu, B.Cu -- inner layers sit BETWEEN the outer
+    two in file order, which is the physical stackup order KRT reads. Ordinals
+    are KiCad 9/10's: F.Cu 0, B.Cu 2, In{k}.Cu = 2 + 2k. Verified against
+    KiCad 10's own ``(version 20241229)`` demo boards.
+    """
+    parts = _zone_footprint_lib(tmp_path)
+    out = str(tmp_path / "board.kicad_pcb")
+    write_kicad_pcb(parts, _MockCircuit(), [str(tmp_path)], out, copper_layers=4)
+    rows = _board_copper_rows(open(out).read())
+    assert rows == [(0, "F.Cu"), (4, "In1.Cu"), (6, "In2.Cu"), (2, "B.Cu")]
+
+
+def test_write_four_layer_board_keeps_inner_footprint_copper(tmp_path):
+    """A pad/zone naming In1.Cu survives when the board declares In1.Cu."""
+    parts = _zone_footprint_lib(tmp_path)
+    out = str(tmp_path / "board.kicad_pcb")
+    write_kicad_pcb(parts, _MockCircuit(), [str(tmp_path)], out, copper_layers=4)
+    content = open(out).read()
+    board = Sexp(content)
+    zone = list(board.search("zone"))[0]
+    layers = next(child for child in zone
+                  if isinstance(child, list) and child[0] == "layers")
+    assert layers == ["layers", "F.Cu", "B.Cu", "In1.Cu", "In2.Cu"]
+
+
+def test_write_two_layer_board_still_strips_inner_footprint_copper(tmp_path):
+    """⛔ The byte-identity half: the default path is unchanged."""
+    parts = _zone_footprint_lib(tmp_path)
+    out = str(tmp_path / "board.kicad_pcb")
+    write_kicad_pcb(parts, _MockCircuit(), [str(tmp_path)], out)
+    content = open(out).read()
+    assert "In1.Cu" not in content and "In2.Cu" not in content
+    assert _board_copper_rows(content) == [(0, "F.Cu"), (2, "B.Cu")]
+
+
+def test_write_six_layer_board_inner_ordinals(tmp_path):
+    """The generator is not special-cased at four: In1..In4 at 4, 6, 8, 10."""
+    parts = _zone_footprint_lib(tmp_path)
+    out = str(tmp_path / "board.kicad_pcb")
+    write_kicad_pcb(parts, _MockCircuit(), [str(tmp_path)], out, copper_layers=6)
+    assert _board_copper_rows(open(out).read()) == [
+        (0, "F.Cu"), (4, "In1.Cu"), (6, "In2.Cu"), (8, "In3.Cu"),
+        (10, "In4.Cu"), (2, "B.Cu"),
+    ]
+
+
+def test_write_copper_layers_contradicting_fab_spec_raises(tmp_path):
+    """⛔ RAISE, do not warn. A silently-two-layer board is the failure that
+    voided Phase 12's four-layer experiment."""
+    from skidl_layout.fabspec import OSHPARK_2L
+
+    parts = _zone_footprint_lib(tmp_path)
+    out = str(tmp_path / "board.kicad_pcb")
+    with pytest.raises(ValueError, match="copper_layers"):
+        write_kicad_pcb(parts, _MockCircuit(), [str(tmp_path)], out,
+                        copper_layers=4, fab_spec=OSHPARK_2L)
+
+
+def test_write_copper_layers_defaults_to_the_fab_spec(tmp_path):
+    """With no explicit count the spec decides -- which is how the placed board
+    ``emit_power_copper`` writes gets four layers."""
+    from skidl_layout.fabspec import resolve_fab_spec
+
+    parts = _zone_footprint_lib(tmp_path)
+    out = str(tmp_path / "board.kicad_pcb")
+    write_kicad_pcb(parts, _MockCircuit(), [str(tmp_path)], out,
+                    fab_spec=resolve_fab_spec("generic-4l"))
+    assert _board_copper_rows(open(out).read()) == [
+        (0, "F.Cu"), (4, "In1.Cu"), (6, "In2.Cu"), (2, "B.Cu")]

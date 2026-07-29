@@ -31,6 +31,7 @@ from .fabspec import (
     FabCheckResult,
     FabSpec,
     FabViolation,
+    GENERIC_4L,
     OSHPARK_2L,
     fab_check,
     resolve_fab_spec,

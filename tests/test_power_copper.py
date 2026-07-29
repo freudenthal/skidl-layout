@@ -1349,3 +1349,93 @@ def test_keepout_with_no_measurable_annulus_emits_no_flag(patched):
     assert out.keepout["written"] == 0
     assert "--keepout" not in (cap["route_extra_args"] or [])
     assert any("no polygon written" in w for w in out.warnings)
+
+
+# --------------------------------------------------------------------------
+# Power-layout Phase 16: the routing stack and the plane-layer reservation
+#
+# ⚠ The ~90 existing ``board_layers=2`` call sites above guard the default
+# path; they must all still pass unchanged.
+# --------------------------------------------------------------------------
+
+def test_two_layer_board_passes_no_layer_flags(patched):
+    """⛔ Byte-identity: at two layers nothing about the router call changes."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(
+        _intent("GND", "pour", 0.3, "F.Cu"),
+        _intent("VIN_12V", "wide_trunk", 0.8, "F.Cu"),
+    ))
+    emit_power_copper(result, object(), [], str(tmp_path), board_layers=2)
+    assert cap["route_design_rules"].get("layers") is None
+    assert cap["route_design_rules"].get("layer_costs") is None
+    assert cap["pour_kwargs"].get("layers") is None
+
+
+def test_four_layer_board_passes_the_full_stack(patched):
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(
+        _intent("GND", "plane", 0.3, "In1.Cu"),
+        _intent("V5", "internal_rail", 0.5, "In2.Cu"),
+    ))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=4)
+    stack = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+    assert cap["route_design_rules"]["layers"] == stack
+    # ⛔ No costs unless the reservation is asked for: arm L4 is the
+    # maximum-completion case and every layer is routable there.
+    assert "layer_costs" not in cap["route_design_rules"]
+    assert cap["pour_kwargs"]["layers"] == stack
+    assert "In1.Cu" in cap["pour_layers"]
+    # the resolved stack travels on the result, so a driver reads it rather
+    # than re-deriving it
+    assert out.route_layers == stack
+    assert out.route_layer_costs is None
+    assert out.to_dict()["route_layers"] == stack
+
+
+def test_reserve_plane_layers_forbids_exactly_the_poured_layers(patched):
+    """⭐ The rule, in one line of English: a layer that carries a plane is not
+    a routing layer, F.Cu is preferred, everything else costs more.
+
+    ``-1`` is KRT's FORBIDDEN sentinel; ``1.0``/``3.0`` reproduce KRT's own
+    2-layer bias. ⛔ Without this, ``route.py`` gives every layer cost 1.0 at
+    four layers and runs signal tracks straight through the ground plane.
+    """
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(
+        _intent("GND", "plane", 0.3, "In1.Cu"),
+        _intent("V5", "internal_rail", 0.5, "In2.Cu"),
+    ))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=4,
+                            reserve_plane_layers=True)
+    assert cap["route_design_rules"]["layers"] == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+    assert cap["route_design_rules"]["layer_costs"] == [1.0, -1.0, 3.0, 3.0]
+    assert out.route_layer_costs == [1.0, -1.0, 3.0, 3.0]
+    # ⛔ NEVER on the pour: route_planes.py routes plane-net taps down to the
+    # plane layer, and forbidding it there disconnects every ground pad.
+    assert "layer_costs" not in cap["pour_kwargs"]
+
+
+def test_reserve_plane_layers_forbids_two_poured_layers(patched):
+    """Both a ground plane and a promoted supply plane get reserved."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(
+        _intent("GND", "plane", 0.3, "In1.Cu"),
+        _intent("VIN_12V", "plane", 0.8, "In2.Cu"),
+    ))
+    emit_power_copper(result, object(), [], str(tmp_path), board_layers=4,
+                      reserve_plane_layers=True)
+    assert cap["route_design_rules"]["layer_costs"] == [1.0, -1.0, -1.0, 3.0]
+
+
+def test_reserve_plane_layers_at_two_layers_is_a_recorded_no_op(patched):
+    """⚠ Meaningless on two layers -> a warning, and argv byte-identical."""
+    cap, tmp_path = patched
+    result = _FakeResult(_plan(
+        _intent("GND", "pour", 0.3, "F.Cu"),
+        _intent("VIN_12V", "wide_trunk", 0.8, "F.Cu"),
+    ))
+    out = emit_power_copper(result, object(), [], str(tmp_path), board_layers=2,
+                            reserve_plane_layers=True)
+    assert cap["route_design_rules"].get("layers") is None
+    assert cap["route_design_rules"].get("layer_costs") is None
+    assert any("reserve_plane_layers" in w for w in out.warnings)

@@ -41,9 +41,35 @@ def _requote_strings(sexp):
             sexp[i] = _q(item)
 
 
-_LAYERS = [
-    (0,  _q("F.Cu"),      "signal"),
-    (2,  _q("B.Cu"),      "signal"),
+#: KiCad 9/10 copper ordinals: ``F.Cu`` 0, ``B.Cu`` 2, ``In{k}.Cu`` = 2 + 2k
+#: (In1 = 4, In2 = 6, In3 = 8 ...). ⚠ This is KiCad 9's renumbering; it is *not*
+#: the old ``In1 = 1`` scheme. Verified against KiCad 10's own demo boards at the
+#: exact ``(version 20241229)`` this writer stamps -- see
+#: ``workingdocs/plans/executed/power-layout-phase-16-four-layer-plan.md`` §4.1.
+_INNER_CU_ORDINAL_BASE = 2
+
+
+def _copper_layer_rows(copper_layers: int) -> list[tuple]:
+    """``(layers ...)`` rows for an N-layer copper stack, in KiCad's file order.
+
+    ``F.Cu``, then ``In1..In(N-2)``, then ``B.Cu`` -- the inner layers sit
+    *between* the outer two in file order, and that order is the physical
+    stackup order KRT reads (its parser preserves file order, and layer order
+    drives layer-cost indexing and its horizontal/vertical lane preference).
+
+    ``copper_layers <= 2`` returns exactly the two rows the historical constant
+    carried, so the default path stays **byte-identical**.
+    """
+    rows = [(0, _q("F.Cu"), "signal")]
+    for i in range(1, max(int(copper_layers), 2) - 1):
+        rows.append((_INNER_CU_ORDINAL_BASE + 2 * i, _q(f"In{i}.Cu"), "signal"))
+    rows.append((2, _q("B.Cu"), "signal"))
+    return rows
+
+
+#: Everything that is not copper. Ordinals and order unchanged from the
+#: pre-Phase-16 ``_LAYERS`` constant, and independent of the copper count.
+_NON_COPPER_LAYERS = [
     (9,  _q("F.Adhes"),   "user",   _q("F.Adhesive")),
     (11, _q("B.Adhes"),   "user",   _q("B.Adhesive")),
     (13, _q("F.Paste"),   "user"),
@@ -63,7 +89,16 @@ _LAYERS = [
     (35, _q("F.Fab"),     "user"),
     (33, _q("B.Fab"),     "user"),
 ]
-_BOARD_LAYER_NAMES = {str(entry[1]).strip('"') for entry in _LAYERS}
+
+
+def _board_layer_rows(copper_layers: int = 2) -> list[tuple]:
+    """The whole ``(layers ...)`` table: copper rows first, then the tail."""
+    return _copper_layer_rows(copper_layers) + _NON_COPPER_LAYERS
+
+
+def _board_layer_names(copper_layers: int = 2) -> set:
+    """Layer names a footprint may name on an N-copper-layer board."""
+    return {str(row[1]).strip('"') for row in _board_layer_rows(copper_layers)}
 _FOOTPRINT_LAYER_WILDCARDS = {"*.Cu", "*.Mask", "*.Paste"}
 _FOOTPRINT_EDGE_CUTS_LAYER = "Dwgs.User"
 _SILKSCREEN_LAYERS = {"F.SilkS", "B.SilkS"}
@@ -352,7 +387,15 @@ def _walk_nodes(node):
             yield from _walk_nodes(child)
 
 
-def _sanitize_layer_nodes(fp: Sexp):
+def _sanitize_layer_nodes(fp: Sexp, board_layer_names: set | None = None):
+    """Drop footprint layers the BOARD does not declare.
+
+    ``board_layer_names`` (Phase 16) is the allowed set for this board's copper
+    count; ``None`` means the historical 2-layer set, so an inner-copper pad or
+    zone is still stripped on a 2-layer board -- there is no In1.Cu to put it
+    on. On a 4-layer board the same node survives.
+    """
+    allowed = _board_layer_names() if board_layer_names is None else board_layer_names
     for node in _walk_nodes(fp):
         if not node:
             continue
@@ -363,7 +406,7 @@ def _sanitize_layer_nodes(fp: Sexp):
             filtered = [
                 layer
                 for layer in layers
-                if layer in _BOARD_LAYER_NAMES
+                if layer in allowed
                 or layer in _FOOTPRINT_LAYER_WILDCARDS
             ]
             if filtered:
@@ -479,12 +522,13 @@ def _quote_known_fields(sexp):
                 node[1] = _q(node[1])
 
 
-def _prepare_footprint_for_board(fp: Sexp, fp_uuid: str):
+def _prepare_footprint_for_board(fp: Sexp, fp_uuid: str,
+                                 board_layer_names: set | None = None):
     _requote_strings(fp)
     _quote_known_fields(fp)
     if len(fp) > 1:
         fp[1] = _q(fp[1])
-    _sanitize_layer_nodes(fp)
+    _sanitize_layer_nodes(fp, board_layer_names)
     _demote_footprint_edge_cuts(fp)
     _ensure_uuid(fp, fp_uuid)
 
@@ -631,9 +675,10 @@ def _place_footprint(
     net_map: dict[str, int],
     part,
     outline: BoardOutline = None,
+    board_layer_names: set | None = None,
 ) -> Sexp:
     fp = copy.deepcopy(fp_sexp)
-    _prepare_footprint_for_board(fp, fp_uuid)
+    _prepare_footprint_for_board(fp, fp_uuid, board_layer_names)
     if str(getattr(pp, "side", "front") or "front").lower() == "back":
         _place_footprint_on_back(fp)
     _apply_footprint_rotation_to_pads(fp, pp.rot_deg)
@@ -849,6 +894,7 @@ def write_kicad_pcb(
     strict_missing_footprints: bool = True,
     lib_table: dict[str, str] = None,
     fab_spec=None,
+    copper_layers: int | None = None,
 ):
     """Write a complete .kicad_pcb file.
 
@@ -858,7 +904,32 @@ def write_kicad_pcb(
     from the PCB file. ``fab_spec=None`` keeps the output **byte-identical** to
     the pre-FabSpec writer. Net classes/design rules are NOT written here -- they
     live in the ``.kicad_pro`` (skidl-eda WS-F5).
+
+    ``copper_layers`` (Phase 16, default ``None``): how many copper layers the
+    ``(layers ...)`` table declares. ``None`` takes the count from ``fab_spec``
+    (and 2 when there is no spec), so **every existing call is byte-identical**.
+
+    ⛔ **Before Phase 16 the copper rows were a module constant.** The table
+    always declared exactly ``F.Cu``/``B.Cu``, whatever the caller or the fab
+    spec asked for -- and a 4-layer ``fab_spec`` emitted ``In1.Cu``/``In2.Cu``
+    inside ``(setup (stackup ...))`` while ``(layers ...)`` still said two, an
+    internally inconsistent board. That silence is what made Phase 12's
+    four-layer experiment produce a result it had not measured. A
+    ``copper_layers`` that contradicts ``fab_spec.copper_layers`` now **raises**.
     """
+    if copper_layers is None:
+        n_cu = (int(getattr(fab_spec, "copper_layers", 2) or 2)
+                if fab_spec is not None else 2)
+    else:
+        n_cu = int(copper_layers)
+        if fab_spec is not None and int(fab_spec.copper_layers) != n_cu:
+            raise ValueError(
+                f"copper_layers={n_cu} contradicts fab spec {fab_spec.name!r} "
+                f"(copper_layers={fab_spec.copper_layers}); a board must not "
+                "declare a stackup its fab spec does not"
+            )
+    board_layer_names = _board_layer_names(n_cu)
+
     net_map, nets = _build_net_map(circuit)
 
     board = Sexp(["kicad_pcb"])
@@ -870,7 +941,7 @@ def write_kicad_pcb(
     board.append(Sexp(["paper", _q("A4")]))
 
     layers = Sexp(["layers"])
-    for entry in _LAYERS:
+    for entry in _board_layer_rows(n_cu):
         row = Sexp([entry[0], entry[1], entry[2]])
         if len(entry) == 4:
             row.append(entry[3])
@@ -902,7 +973,8 @@ def write_kicad_pcb(
 
         fp_uuid = _part_uuid(part) if part is not None else str(uuid.uuid4())
 
-        fp = _place_footprint(fp_sexp, pp, fp_uuid, net_map, part, outline)
+        fp = _place_footprint(fp_sexp, pp, fp_uuid, net_map, part, outline,
+                              board_layer_names=board_layer_names)
         board.append(fp)
 
     if missing_fps:

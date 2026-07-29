@@ -338,6 +338,8 @@ def route_and_check(
     board_edge_clearance: float | None = None,
     net_clearances: dict[str, float] | None = None,
     route_log_path: str | None = None,
+    layers: list[str] | None = None,
+    layer_costs: list[float] | None = None,
 ) -> RoutabilityFeedback:
     """Route ``pcb_path`` with KRT, verify connectivity + DRC, return feedback.
 
@@ -387,6 +389,30 @@ def route_and_check(
       of ``0.1524 / 0.1768 / 0.2012 / 0.2256 / 0.25`` mm on this stack's fab
       numbers, whatever the map asked for. See
       ``workingdocs/design_considerations/krt-upstream-rescue-ladder-report.md``.
+
+    ``layers`` / ``layer_costs`` (Phase 16, both default ``None`` -> **no flag
+    at all**, so every pre-Phase-16 call emits byte-identical argv). Four facts
+    about ``route.py`` that decide how these are used:
+
+    - ``--layers`` takes **space-separated KiCad layer names**, and ``route.py``
+      already defaults it to *all* of the board's copper layers (its own issue
+      #98: the old ``F.Cu``/``B.Cu`` default silently routed 4-layer boards as
+      2-layer). Passing it explicitly is therefore partly redundant -- and
+      deliberate: intent that is only implicit cannot be asserted.
+    - ``--layer-costs`` is matched to ``--layers`` **by position**, so the two
+      lists must be the same length. This wrapper raises rather than emit a
+      mismatched pair.
+    - ⛔ ``-1`` is KRT's ``FORBIDDEN_LAYER_COST``: no routed copper on that
+      layer, but its copper still blocks and through-vias still span it. This is
+      how "a layer that carries a plane is not a routing layer" is expressed.
+      ⚠ Without it, ``route.py`` gives **every** layer cost 1.0 at four or more
+      layers and will run signal tracks straight across a ground plane.
+    - Any board copper layer omitted from ``layers`` is **appended by KRT as a
+      FORBIDDEN obstacle**, so a subset is a different spelling of the same
+      thing rather than a hole in the obstacle map.
+
+    ⚠ Layer **order** is load-bearing: KRT preserves file order and derives its
+    horizontal/vertical lane preference from the layer index.
     """
     resolved = find_krt(krt_dir)
     if resolved is None:
@@ -412,6 +438,23 @@ def route_and_check(
     # call with no spec is byte-identical argv to before this change.
     route_args.extend(_design_rule_flags(
         track_width, clearance, via_size, via_drill, board_edge_clearance))
+    # Phase 16: the routing stack. ⛔ Deliberately NOT routed through
+    # ``_design_rule_flags`` -- that helper's exact output is pinned by a test
+    # and shared with ``pour_planes``, which must never receive layer costs.
+    if layers:
+        route_args.append("--layers")
+        route_args.extend(layers)
+        if layer_costs:
+            if len(layer_costs) != len(layers):
+                raise ValueError(
+                    f"layer_costs has {len(layer_costs)} entries for "
+                    f"{len(layers)} layers; route.py matches them by position"
+                )
+            route_args.append("--layer-costs")
+            route_args.extend(f"{c:g}" for c in layer_costs)
+    elif layer_costs:
+        raise ValueError(
+            "layer_costs requires layers (route.py pairs them by position)")
     if net_clearances:
         # Empty dict deliberately falls through to no flag: an explicit map
         # REPLACES KRT's auto-read net-class map, so passing "{}" would throw
@@ -603,8 +646,17 @@ def pour_planes(
     via_drill: float | None = None,
     zone_clearance: float | None = None,
     min_thickness: float | None = None,
+    layers: list[str] | None = None,
 ) -> dict:
     """Pour copper planes on ``nets`` and re-verify the board.
+
+    ``layers`` (Phase 16, default ``None`` -> no flag, byte-identical argv) is
+    the full copper stack ``route_planes.py`` may use for the plane-net *taps*
+    and via spans. Its own default is ``F.Cu + --plane-layers + B.Cu``, which
+    happens to equal a 4-layer stack only when both inner layers carry planes.
+    ⛔ **Never pass routing costs here.** ``route_planes.py`` is what routes a
+    plane net's taps from its pads *down* to the plane layer; forbidding the
+    plane layer in this call would disconnect every ground pad on the board.
 
     Runs KRT ``route_planes.py --nets <names> --plane-layers <layers>`` (one
     layer per net, paired positionally) to write real ``(zone ... (fill yes))``
@@ -645,6 +697,8 @@ def pour_planes(
 
     args = ["route_planes.py", in_abs, out_abs, "--nets", *nets,
             "--plane-layers", *plane_layers]
+    if layers:
+        args += ["--layers", *layers]
     # Via/track/clearance design-rule flags (from a FabSpec); None emits nothing
     # so a no-spec pour keeps KRT's own defaults and byte-identical argv.
     args.extend(_design_rule_flags(track_width, clearance, via_size, via_drill))

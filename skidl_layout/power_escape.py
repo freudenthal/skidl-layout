@@ -83,7 +83,7 @@ ESCAPE_LANE_MM = 0.9048
 DEFAULT_KEEPOUT_LAYER = "User.2"
 
 #: KiCad-10 canonical layer ids for the nine user layers. The skidl-layout board
-#: writer declares none of them (``writer._LAYERS`` stops at ``B.Fab``), so a
+#: writer declares none of them (``writer._board_layer_rows`` stops at ``B.Fab``), so a
 #: board that is to carry a keepout polygon needs the declaration added -- see
 #: :func:`write_keepout_polygons`. Read off KiCad's own demo boards, whose
 #: ``(layers ...)`` block is otherwise byte-identical to the writer's.
@@ -1003,7 +1003,7 @@ def _ensure_user_layer(text: str, layer: str) -> str:
     """Declare ``layer`` in the board's ``(layers ...)`` block if it is absent.
 
     ⚠ The skidl-layout writer emits no user layers at all
-    (``writer._LAYERS`` stops at ``B.Fab``), and KRT reads a keepout out of the
+    (``writer._board_layer_rows`` stops at ``B.Fab``), and KRT reads a keepout out of the
     **file text** -- so a ``gr_poly`` on an undeclared layer is a polygon KiCad
     will not load. Adding the declaration HERE, on a copy, rather than in the
     writer keeps every default-path board byte-identical, which is the arc's
