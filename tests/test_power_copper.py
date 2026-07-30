@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import os
+
 import pytest
 
 from skidl_layout import power_copper
@@ -1276,6 +1278,175 @@ def test_fanout_uses_the_routing_clearance_not_the_fab_floor(patched):
     assert seen["track_width"] == spec.min_track_mm
     assert seen["via_size"] == spec.via_size_mm
     assert seen["via_drill"] == spec.via_drill_mm
+
+
+def _capture_fanout(seen):
+    """A ``fanout_controller`` stand-in that records its kwargs and writes a board."""
+    def capture(pcb, out_pcb, ref, **kw):
+        seen.update(kw)
+        with open(out_pcb, "w", encoding="utf-8") as fh:
+            fh.write("(fanned)\n")
+        return {"ran": True, "vias_placed": 1, "vias_dropped": 0,
+                "failed_nets": [], "controller": ref,
+                # what KRT reports back: the ledger never fires in a fanout
+                # process, so this equals the --clearance it was handed.
+                "min_clearance_used": kw.get("clearance")}
+    return capture
+
+
+# --------------------------------------------------------------------------- #
+# Spacing plan C -- the fanout's clearance, sized from IPC-2221B
+# --------------------------------------------------------------------------- #
+HV_VOLTS = {"VIN": 72.0, "SW": 150.0, "VOUT": 12.0}
+
+
+def test_fanout_voltage_spacing_off_leaves_the_clearance_at_the_fab_spec(patched):
+    """⛔ The byte-identity contract: with the flag off, the scalar is the
+    pre-plan-C one even on a board whose voltages ask for much more."""
+    cap, tmp_path = patched
+    seen = {}
+    with _mock.patch.object(_pe, "fanout_controller", _capture_fanout(seen)):
+        out = emit_power_copper(_looped_result(), object(), [], str(tmp_path),
+                                board_layers=2, fab_spec="oshpark-2l",
+                                fanout_controller=True, net_voltages=HV_VOLTS)
+    assert seen["clearance"] == 0.25
+    assert out.fanout["clearance_requested_mm"] is None
+    assert not any("fanout_voltage_spacing" in w for w in out.warnings)
+
+
+def test_the_deficit_judge_runs_even_with_the_lever_off(patched):
+    """⭐ "Judge before lever", made structural: the defect is measured on the
+    default fanout path, not only in the arm that fixes it."""
+    cap, tmp_path = patched
+    seen = {}
+    with _mock.patch.object(_pe, "fanout_controller", _capture_fanout(seen)):
+        out = emit_power_copper(_looped_result(), object(), [], str(tmp_path),
+                                board_layers=2, fab_spec="oshpark-2l",
+                                fanout_controller=True, net_voltages=HV_VOLTS)
+    deficits = out.fanout["deficits"]
+    assert sorted(deficits) == ["SW", "VIN"]         # VOUT's 12V asks 0.1mm
+    assert deficits["SW"]["used_mm"] == 0.25
+    assert deficits["SW"]["required_mm"] == 0.6
+    assert out.fanout["min_clearance_used"] == 0.25
+    assert any("below what IPC-2221B asks" in w for w in out.warnings)
+
+
+def test_fanout_voltage_spacing_on_widens_the_clearance_and_clears_the_deficit(patched):
+    """The lever: ``max(board clearance, worst declared requirement)``."""
+    cap, tmp_path = patched
+    seen = {}
+    with _mock.patch.object(_pe, "fanout_controller", _capture_fanout(seen)):
+        out = emit_power_copper(_looped_result(), object(), [], str(tmp_path),
+                                board_layers=2, fab_spec="oshpark-2l",
+                                fanout_controller=True, net_voltages=HV_VOLTS,
+                                fanout_voltage_spacing=True)
+    assert seen["clearance"] == 0.6
+    assert out.fanout["clearance_requested_mm"] == 0.6
+    assert out.fanout["deficits"] == {}
+    assert any("escaping at 0.6mm instead of the board's 0.25mm" in w
+               for w in out.warnings)
+    # ⚠ The stub width and the via are untouched -- only the spacing moved.
+    assert seen["track_width"] == 0.1524
+
+
+def test_fanout_voltage_spacing_on_a_board_with_no_declared_voltage_is_inert(patched):
+    """⛔ Gate C3's property: no voltages -> the max collapses -> the argv is the
+    default path's argv, and the no-op is RECORDED rather than silent."""
+    cap, tmp_path = patched
+    seen = {}
+    with _mock.patch.object(_pe, "fanout_controller", _capture_fanout(seen)):
+        out = emit_power_copper(_looped_result(), object(), [], str(tmp_path),
+                                board_layers=2, fab_spec="oshpark-2l",
+                                fanout_controller=True,
+                                fanout_voltage_spacing=True)
+    assert seen["clearance"] == 0.25
+    assert out.fanout["clearance_requested_mm"] is None
+    assert out.fanout["deficits"] == {}
+    assert any("no net_voltages were given" in w for w in out.warnings)
+
+
+def test_fanout_voltage_spacing_records_a_no_op_when_the_board_already_complies(patched):
+    """A board whose every declared net sits under 30 V needs nothing; the flag
+    must say it changed nothing rather than imply it bit."""
+    cap, tmp_path = patched
+    seen = {}
+    with _mock.patch.object(_pe, "fanout_controller", _capture_fanout(seen)):
+        out = emit_power_copper(_looped_result(), object(), [], str(tmp_path),
+                                board_layers=2, fab_spec="oshpark-2l",
+                                fanout_controller=True,
+                                net_voltages={"VIN": 12.0, "VOUT": 5.0},
+                                fanout_voltage_spacing=True)
+    assert seen["clearance"] == 0.25
+    assert out.fanout["clearance_requested_mm"] is None
+    assert any("already meets every declared net" in w for w in out.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# Spacing plan C, unplanned -- the placed board's missing sibling project
+# --------------------------------------------------------------------------- #
+def test_the_placed_board_ships_with_no_sibling_project_by_default(patched):
+    """⛔⛔ The defect, pinned as a characterisation test.
+
+    This is the root cause of open defect 8: with no ``.kicad_pro`` beside it,
+    whichever KRT stage reads ``placed.kicad_pcb`` first calls
+    ``fix_project_for_output``, finds nothing to carry over, and seeds KiCad's
+    **stock 0.2 mm** ``Default`` net class. That writeback only ever *lowers*, so
+    the board's real 0.25 mm design clearance can never be recovered, and
+    ``route.py`` routes every net against a 0.2 mm nominal.
+    """
+    cap, tmp_path = patched
+    out = emit_power_copper(_looped_result(), object(), [], str(tmp_path),
+                            board_layers=2, fab_spec="oshpark-2l")
+    placed = os.path.join(str(tmp_path), "placed.kicad_pcb")
+    assert os.path.isfile(placed)
+    assert not os.path.isfile(os.path.join(str(tmp_path), "placed.kicad_pro"))
+    assert out.seed_project == {}
+    assert out.to_dict()["seed_project"] == {}
+
+
+def test_seed_placed_project_writes_the_boards_real_design_clearance(patched):
+    """The one-file fix: a COMPLETE Default class at the spec's clearance.
+
+    ⚠ Complete, not sparse -- KiCad ignores a partial net class and falls back to
+    its stock 0.2 mm, which is exactly the failure being fixed.
+    """
+    import json
+
+    from skidl_layout.power_copper import _STOCK_NETCLASS_CLEARANCE_MM
+
+    cap, tmp_path = patched
+    out = emit_power_copper(_looped_result(), object(), [], str(tmp_path),
+                            board_layers=2, fab_spec="oshpark-2l",
+                            seed_placed_project=True)
+    path = os.path.join(str(tmp_path), "placed.kicad_pro")
+    assert out.seed_project["written"] is True
+    assert out.seed_project["clearance_mm"] == 0.25
+    project = json.load(open(path, encoding="utf-8"))
+    default = next(c for c in project["net_settings"]["classes"]
+                   if c["name"] == "Default")
+    assert default["clearance"] == 0.25 != _STOCK_NETCLASS_CLEARANCE_MM
+    assert default["track_width"] == 0.1524
+    assert project["board"]["design_settings"]["rules"]["min_clearance"] == 0.25
+    # ⛔ KiCad ignores a sparse class; every field the stock class carries must be
+    # present or the fallback re-appears.
+    assert {"via_diameter", "via_drill", "diff_pair_gap", "priority"} <= set(default)
+    assert any("seed_placed_project" in w for w in out.warnings)
+
+
+def test_seed_placed_project_never_overwrites_an_existing_project(patched):
+    """⛔ It may be a real user project, and the whole point is that ours is
+    ABSENT -- so an existing file is left alone and the decline is recorded."""
+    cap, tmp_path = patched
+    path = os.path.join(str(tmp_path), "placed.kicad_pro")
+    os.makedirs(str(tmp_path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"mine": true}\n')
+    out = emit_power_copper(_looped_result(), object(), [], str(tmp_path),
+                            board_layers=2, fab_spec="oshpark-2l",
+                            seed_placed_project=True)
+    assert out.seed_project["written"] is False
+    assert open(path, encoding="utf-8").read() == '{"mine": true}\n'
+    assert any("already" in w and "untouched" in w for w in out.warnings)
 
 
 def test_a_declining_fanout_is_recorded_and_routed_past(patched):

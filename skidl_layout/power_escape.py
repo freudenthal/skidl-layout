@@ -41,6 +41,7 @@ regression baseline.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -1149,7 +1150,8 @@ def fanout_controller(
 
     Returns:
         ``{"ran", "controller", "escape_method", "out_path", "argv",
-        "vias_placed", "vias_dropped", "tracks", "failed_nets", "reason"}``.
+        "vias_placed", "vias_dropped", "tracks", "failed_nets",
+        "min_clearance_used", "summary", "reason"}``.
         ``ran=False`` with a ``reason`` when KRT could not analyse the part or
         the CLI failed -- ⛔ never an exception, because a fanout that declines
         is an outcome the caller must be able to route past.
@@ -1216,9 +1218,35 @@ def _parse_fanout_output(text: str) -> dict:
     workdir is disposable and a row that carries its own evidence can be
     re-graded without re-running the pre-pass. Same reason Phase 13 parsed the
     keepout line at route time.
+
+    ⭐ **Spacing plan C** adds ``min_clearance_used`` (and the rest of KRT's
+    ``JSON_SUMMARY``, under ``summary``). That single number is what makes the
+    plan's conductor-spacing judge free:
+    :func:`skidl_layout.power_clearance.net_clearance_deficits` compares it
+    against IPC-2221B's per-net ask with no board, no route and no measurement.
+    ⚠ **It is not the ledger's doing on this path.** Nothing inside a
+    ``qfn_fanout`` process calls ``clearance_ledger.record`` -- the recorders are
+    ``plane_pad_tap`` and ``kicad_oracle``, in other processes -- so the ledger is
+    empty and ``min_clearance_used`` equals the ``--clearance`` we passed,
+    exactly. Measured on all five power boards: 0.25 mm, every time. It is worth
+    parsing anyway because it is KRT's own answer rather than our request, so the
+    day a recorder does fire in-process the judge sees it.
     """
     out: dict = {"vias_placed": None, "vias_dropped": None, "tracks": None,
-                 "failed_nets": []}
+                 "failed_nets": [], "min_clearance_used": None, "summary": {}}
+    for line in (text or "").splitlines():
+        marker = line.find("JSON_SUMMARY:")
+        if marker < 0:
+            continue
+        try:
+            summary = json.loads(line[marker + len("JSON_SUMMARY:"):].strip())
+        except ValueError:
+            continue
+        if isinstance(summary, dict):
+            out["summary"] = summary
+            used = summary.get("min_clearance_used")
+            if isinstance(used, (int, float)):
+                out["min_clearance_used"] = float(used)
     via = _FANOUT_VIA_RE.search(text or "")
     if via:
         out["vias_placed"] = int(via.group(1))

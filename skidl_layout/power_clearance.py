@@ -57,7 +57,8 @@ from __future__ import annotations
 
 from .fabspec import DEFAULT_SPACING_COLUMN, ipc2221_spacing_mm
 
-__all__ = ["plan_net_clearances", "net_clearance_map"]
+__all__ = ["plan_net_clearances", "net_clearance_map",
+           "max_required_clearance", "net_clearance_deficits"]
 
 
 def plan_net_clearances(
@@ -129,3 +130,66 @@ def net_clearance_map(records: dict) -> dict:
     """
     return {net: row["applied_mm"] for net, row in (records or {}).items()
             if row.get("applied") and row.get("applied_mm") is not None}
+
+
+def max_required_clearance(records: dict) -> float | None:
+    """The widest clearance Table 6-1 asks for anywhere in ``records``.
+
+    ``None`` when no record states a requirement -- a board with no declared
+    voltages, or one whose every voltage falls in a band the column does not
+    state. ⛔ **``None`` must mean "pass the board clearance unchanged"**, never
+    "pass zero": a caller that folds this into ``max(...)`` with a default of 0
+    would silently narrow whatever it was going to use.
+
+    ⚠ Deliberately the max over **every** record, not only the ones
+    :func:`plan_net_clearances` widened. The nets a fanout escapes are the
+    controller's *housekeeping* nets, and the copper they must stand off is
+    whatever is nearest -- including an HV net that carries no escape of its
+    own. Spacing between two conductors is set by the voltage *between* them, so
+    the conservative scalar is the board's worst requirement, not the worst
+    requirement among the nets being drawn.
+    """
+    values = [row.get("required_mm") for row in (records or {}).values()
+              if row.get("required_mm") is not None]
+    return max(values) if values else None
+
+
+def net_clearance_deficits(records: dict, used_mm: float | None) -> dict:
+    """Which nets were drawn at less clearance than Table 6-1 asks for.
+
+    ⭐ **The judge that needs no routing run** (spacing plan C, §2). A routing or
+    escape step reports the clearance it actually used -- ``qfn_fanout``'s
+    ``JSON_SUMMARY.min_clearance_used``, ``route.py``'s field of the same name,
+    or a graded board's ``.kicad_pro`` ``rules.min_clearance``. Comparing that
+    one number against :func:`plan_net_clearances`' ``required_mm`` names every
+    net whose spacing requirement the step could not have met, in microseconds
+    and without measuring a single track.
+
+    ``{net: {volts, column, required_mm, used_mm, deficit_mm}}``, one entry per
+    net in deficit and nothing for the rest. Empty when ``used_mm`` is ``None``
+    (nothing reported a clearance, so there is no claim to test) or when every
+    requirement is met.
+
+    ⛔ **A deficit is not a DRC violation and must never be reported as one.** It
+    says the step's own clearance scalar is below the standard's ask, which is a
+    statement about the *request*; whether any two conductors ended up that close
+    is what :func:`fabspec.measure_voltage_spacing` measures off the copper. The
+    two are complementary: this one is cheap and cannot miss a systematic
+    under-request, that one is expensive and cannot miss an actual violation.
+    """
+    if used_mm is None:
+        return {}
+    used = float(used_mm)
+    out: dict = {}
+    for net, row in sorted((records or {}).items()):
+        required = row.get("required_mm")
+        if required is None or float(required) <= used + 1e-9:
+            continue
+        out[str(net)] = {
+            "volts": row.get("volts"),
+            "column": row.get("column"),
+            "required_mm": float(required),
+            "used_mm": used,
+            "deficit_mm": round(float(required) - used, 6),
+        }
+    return out

@@ -55,6 +55,8 @@ from .current_widths import (
     widths_from_currents,
 )
 from .power_clearance import (
+    max_required_clearance,
+    net_clearance_deficits,
     net_clearance_map,
     plan_net_clearances,
 )

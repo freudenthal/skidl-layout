@@ -11,7 +11,12 @@ from __future__ import annotations
 import pytest
 
 from skidl_layout.fabspec import OSHPARK_2L
-from skidl_layout.power_clearance import net_clearance_map, plan_net_clearances
+from skidl_layout.power_clearance import (
+    max_required_clearance,
+    net_clearance_deficits,
+    net_clearance_map,
+    plan_net_clearances,
+)
 
 BASE = OSHPARK_2L.clearance_mm          # 0.25 mm, the design clearance we route at
 
@@ -119,3 +124,78 @@ def test_widening_stays_the_only_direction_even_at_board_scale():
     assert records["HV"]["applied"] is True
     assert records["SIG"]["applied"] is False        # 0.1mm asked < 0.25 board
     assert net_clearance_map(records) == {"HV": 0.6}
+
+
+# --------------------------------------------------------------------------- #
+# Spacing plan C -- the free judge, and the scalar it prices
+# --------------------------------------------------------------------------- #
+def test_max_required_is_the_worst_ask_not_the_worst_widening():
+    """⚠ The max is over **every** record, including nets the map left alone.
+
+    The nets a fanout draws are the controller's housekeeping nets; the copper
+    they must stand off is whatever is nearest, which includes an HV net that
+    gets no escape of its own. Spacing is set by the voltage *between* two
+    conductors, so the conservative scalar is the board's worst requirement.
+    """
+    records = plan_net_clearances({"HV": 150.0, "SIG": 5.0}, base_clearance_mm=BASE)
+
+    assert net_clearance_map(records) == {"HV": 0.6}      # only HV was widened
+    assert max_required_clearance(records) == 0.6
+    # ⛔ SIG's 0.1mm ask is real but below the board clearance; it must not drag
+    # the max down.
+    assert records["SIG"]["required_mm"] == pytest.approx(0.1)
+
+
+def test_max_required_is_none_when_nothing_is_stated():
+    """⛔ ``None`` means "pass the board clearance unchanged", never zero."""
+    assert max_required_clearance({}) is None
+    assert max_required_clearance(None) is None
+    assert max_required_clearance(
+        plan_net_clearances(None, base_clearance_mm=BASE)) is None
+
+
+def test_the_deficit_judge_names_every_under_requested_net():
+    """⭐ The whole judge: one reported clearance vs Table 6-1's per-net ask.
+
+    0.25 mm is what ``qfn_fanout`` is handed on this corpus today (the fab's
+    design clearance) and 0.6 mm is what column B2 asks of every net above 30 V,
+    so the measured deficit is 0.35 mm -- on four of the five power boards.
+    """
+    records = plan_net_clearances(
+        {"VIN": 72.0, "SW": 150.0, "VOUT": 12.0}, base_clearance_mm=BASE)
+
+    deficits = net_clearance_deficits(records, 0.25)
+
+    assert sorted(deficits) == ["SW", "VIN"]              # VOUT asks 0.1mm
+    assert deficits["SW"]["deficit_mm"] == pytest.approx(0.35)
+    assert deficits["SW"]["required_mm"] == 0.6
+    assert deficits["SW"]["used_mm"] == 0.25
+    assert deficits["SW"]["volts"] == 150.0
+
+
+def test_the_deficit_judge_is_empty_once_the_clearance_is_wide_enough():
+    """The lever's success condition, expressed as the judge's output."""
+    records = plan_net_clearances({"VIN": 72.0, "SW": 150.0},
+                                  base_clearance_mm=BASE)
+
+    assert net_clearance_deficits(records, 0.6) == {}
+    assert net_clearance_deficits(records, 0.61) == {}
+
+
+def test_no_reported_clearance_is_not_a_deficit():
+    """⛔ ``used_mm=None`` means nothing reported a clearance, so there is no
+    claim to test -- distinct from "reported a clearance that was fine"."""
+    records = plan_net_clearances({"SW": 150.0}, base_clearance_mm=BASE)
+
+    assert net_clearance_deficits(records, None) == {}
+    assert net_clearance_deficits(records, 0.25) != {}
+
+
+def test_a_board_with_no_declared_voltage_has_no_deficit_at_any_clearance():
+    """``lt8710_inverting`` is this case, which is why it is gate C3's control:
+    the max collapses to ``None``, the lever changes no argv, and the judge has
+    nothing to report."""
+    records = plan_net_clearances(None, base_clearance_mm=BASE)
+
+    assert max_required_clearance(records) is None
+    assert net_clearance_deficits(records, 0.1524) == {}

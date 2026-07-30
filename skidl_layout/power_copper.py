@@ -106,6 +106,13 @@ class PowerCopperResult:
     #: placed, vias dropped, and the nets it could **not** escape. Empty unless
     #: ``fanout_controller=True``.
     fanout: dict = field(default_factory=dict)
+    #: ⛔⛔ Spacing plan C: whether the placed board was given the sibling
+    #: ``.kicad_pro`` it has never had, and at what clearance. Empty unless
+    #: ``seed_placed_project=True``. **The root cause of open defect 8** -- without
+    #: it, whichever KRT stage reads the board first seeds KiCad's stock 0.2 mm
+    #: Default net class and the router's nominal clearance drops from 0.25 to
+    #: 0.2 mm for every net. See :func:`_seed_placed_project`.
+    seed_project: dict = field(default_factory=dict)
     #: What the Phase-14 escape keepout wrote: how many annulus polygons, on
     #: which layer, around which controllers, and whether it was applied after
     #: a loop pass (the only ordering in which it is not Phase 13's arm C).
@@ -220,6 +227,7 @@ class PowerCopperResult:
             "pad_clearance": dict(self.pad_clearance),
             "loop_first": dict(self.loop_first),
             "fanout": dict(self.fanout),
+            "seed_project": dict(self.seed_project),
             "keepout": dict(self.keepout),
             "zone_plan": dict(self.zone_plan),
             "route_layers": (list(self.route_layers)
@@ -411,6 +419,7 @@ def plan_loop_first_nets(
 def _run_fanout_prepass(
     in_pcb, workdir_abs, result, circuit, fp_lib_dirs, *, spec, krt_dir,
     timeout_s, escape_method, plane_nets, width_map, warnings,
+    clearance_mm=None, clearance_records=None,
 ) -> dict:
     """Fan out every resolved controller, chaining board to board.
 
@@ -423,6 +432,16 @@ def _run_fanout_prepass(
     the trunked power nets are excluded. Stubs on a poured net are wasted copper
     and can fence the pour into islands, which is the measured Phase-4 reason
     ``route_promoted`` defaults ``True``.
+
+    ``clearance_mm`` overrides the scalar handed to ``qfn_fanout --clearance``
+    (spacing plan C). ``None`` -- the default and every pre-plan-C caller -- keeps
+    ``spec.clearance_mm``, so not a byte of argv moves.
+
+    ``clearance_records`` are :func:`power_clearance.plan_net_clearances` rows;
+    when given, each row's per-controller deficit against the clearance the
+    fanout actually reported is recorded under ``deficits``. ⭐ That is the
+    plan's free judge, run inline at every fanout rather than only in a driver,
+    so it keeps working after this plan ships.
     """
     from .power_escape import fanout_controller as _fanout
     from .power_escape import resolve_escape_targets
@@ -462,13 +481,24 @@ def _run_fanout_prepass(
             # ``lt3757_sepic`` as ``Via:UVLO <-> Seg:INTVCC, overlap 0.036 mm``.
             # ⚠ The fab FLOOR is still the right bound for ``track_width`` -- a
             # thin escape stub is legal; copper too CLOSE to its neighbour is not.
-            clearance=(spec.clearance_mm if spec is not None else None),
+            # ⭐ Spacing plan C: ``clearance_mm`` (when given) is the voltage-aware
+            # scalar, computed from IPC-2221B Table 6-1 rather than from the fab.
+            clearance=(clearance_mm if clearance_mm is not None else
+                       (spec.clearance_mm if spec is not None else None)),
             via_size=(spec.via_size_mm if spec is not None else None),
             via_drill=(spec.via_drill_mm if spec is not None else None),
             board_edge_clearance=(spec.board_edge_keepout_mm
                                   if spec is not None else None),
             timeout_s=timeout_s,
         )
+        # ⭐ Spacing plan C's judge, inline and free: KRT's own reported clearance
+        # against IPC-2221B's per-net ask. Runs on EVERY fanout, including the
+        # ones this plan changes nothing about -- a defect that is only measured
+        # in the phase that fixes it is a defect that comes back.
+        if clearance_records:
+            from .power_clearance import net_clearance_deficits
+            row["deficits"] = net_clearance_deficits(
+                clearance_records, row.get("min_clearance_used"))
         rows.append(row)
         if row.get("ran"):
             board = out_pcb
@@ -477,6 +507,17 @@ def _run_fanout_prepass(
                 f"{row.get('vias_dropped')} dropped, "
                 f"{len(row.get('failed_nets') or [])} net(s) not escaped "
                 f"({escape_method})")
+            deficits = row.get("deficits") or {}
+            if deficits:
+                worst = max(d["deficit_mm"] for d in deficits.values())
+                warnings.append(
+                    f"fanout {ref}: escaped at "
+                    f"{row.get('min_clearance_used')}mm clearance, which is "
+                    f"below what IPC-2221B asks for {len(deficits)} net(s) "
+                    f"({', '.join(sorted(deficits))}) -- worst deficit "
+                    f"{worst:g}mm. ⛔ A deficit is a statement about the "
+                    f"REQUEST, not a DRC violation; measure_voltage_spacing "
+                    f"grades the copper.")
         else:
             # ⛔ Declining is an outcome, not a failure -- but a silent decline
             # reads as a pre-pass that worked.
@@ -488,6 +529,17 @@ def _run_fanout_prepass(
         "controllers": [ref for ref, _ in targets],
         "nets": list(nets),
         "rows": rows,
+        # ⭐ Plan C. ``clearance_requested_mm`` is what we asked for;
+        # ``min_clearance_used`` is what KRT says it did. They are separate keys
+        # on purpose -- the arc has already been bitten once by reading a request
+        # as a measurement (spacing-02's "best P arm" trap).
+        "clearance_requested_mm": (float(clearance_mm)
+                                   if clearance_mm is not None else None),
+        "min_clearance_used": min(
+            (r["min_clearance_used"] for r in ran
+             if r.get("min_clearance_used") is not None), default=None),
+        "deficits": {net: row for r in ran
+                     for net, row in (r.get("deficits") or {}).items()},
         # ``None`` when nothing ran, so the caller keeps its original input.
         "board": board if ran else None,
         "vias_placed": sum(int(r.get("vias_placed") or 0) for r in ran),
@@ -495,6 +547,103 @@ def _run_fanout_prepass(
         "failed_nets": sorted({n for r in ran
                                for n in (r.get("failed_nets") or [])}),
     }
+
+
+#: KiCad's stock Default net class, which is what KRT's
+#: ``fix_kicad_drc_settings._DEFAULT_NETCLASS`` seeds when a board arrives with no
+#: sibling project — and its ``clearance`` is **0.2 mm**, not our 0.25 mm.
+_STOCK_NETCLASS_CLEARANCE_MM = 0.2
+
+
+def _seed_placed_project(placed_pcb: str, spec, warnings: list) -> dict:
+    """Write the sibling ``.kicad_pro`` the placed board has never had.
+
+    ⛔⛔ **This is the mechanism behind open defect 8** — "the fanout pre-pass
+    tightens HV conductor spacing, invisibly to DRC" — found by spacing plan C
+    after four reproductions and one wrong hypothesis. It is not about the
+    clearance the fanout *draws* at. It is this:
+
+    1. ``write_kicad_pcb`` emits ``placed.kicad_pcb`` and **no ``.kicad_pro``**.
+    2. Every KRT front end calls ``fix_project_for_output``, which, finding no
+       project to carry over, **seeds a minimal one** and creates a complete
+       ``Default`` net class from ``_DEFAULT_NETCLASS`` — KiCad's stock class,
+       whose ``clearance`` is **0.2 mm**. It then only ever *lowers*, so our
+       0.25 mm design clearance can never be written back in.
+    3. The next stage reads that project. ``route.py``'s
+       ``project_copper_clearance`` returns the Default class's clearance, so the
+       router's nominal clearance becomes **0.2 mm instead of 0.25 mm** — for
+       *every net on the board*.
+
+    ⭐ **Measured, on the default path, in spacing-02's own logs.** Whichever
+    stage sees the board first is the one that seeds the project. With no fanout
+    that is ``route.py`` itself, which uses its own ``--clearance``: the logs read
+    ``Min clearance used: 0.1768 mm (below nominal 0.25)``. With the fanout, the
+    pre-pass seeds first and the very same boards read ``below nominal 0.2``.
+    ⛔ **A 20 % clearance cut on every net, bought by a missing file** — and the
+    ledger writeback then records the tighter floor, so KiCad grades what was
+    routed and DRC stays 0. That is the whole of the word "invisibly".
+
+    ⛔ Opt-in, because turning it on moves the routed result on **every** arm
+    including the default path, which §4.3's byte-identity contract forbids doing
+    silently.
+    """
+    import json as _json
+
+    out = {"requested": True, "written": False, "path": None,
+           "clearance_mm": None}
+    if spec is None:
+        warnings.append(
+            "seed_placed_project requested but no fab spec resolved; the placed "
+            "board keeps its missing sibling project")
+        return out
+    path = os.path.splitext(placed_pcb)[0] + ".kicad_pro"
+    if os.path.isfile(path):
+        # ⛔ Never overwrite a project that already exists -- it may be a real
+        # user project, and this function's whole point is that ours is absent.
+        out["path"] = path
+        warnings.append(f"seed_placed_project: {os.path.basename(path)} already "
+                        "exists; left untouched")
+        return out
+    clearance = float(spec.clearance_mm)
+    project = {
+        "board": {"design_settings": {
+            "rules": {
+                "min_clearance": clearance,
+                "min_track_width": float(spec.min_track_mm),
+                "min_via_diameter": float(spec.via_size_mm),
+                "min_through_hole_diameter": float(spec.via_drill_mm),
+                "min_copper_edge_clearance": float(spec.board_edge_keepout_mm),
+            },
+            "rule_severities": {},
+        }},
+        "meta": {"filename": os.path.basename(path), "version": 1},
+        # ⚠ A COMPLETE class, not a sparse one: KiCad ignores a partial class and
+        # falls back to its stock 0.2 mm, which is the failure this fixes.
+        "net_settings": {"meta": {"version": 3}, "classes": [{
+            "bus_width": 12, "clearance": clearance,
+            "diff_pair_gap": 0.25, "diff_pair_via_gap": 0.25,
+            "diff_pair_width": 0.2, "line_style": 0,
+            "microvia_diameter": 0.3, "microvia_drill": 0.2, "name": "Default",
+            "pcb_color": "rgba(0, 0, 0, 0.000)", "priority": 2147483647,
+            "schematic_color": "rgba(0, 0, 0, 0.000)",
+            "track_width": float(spec.min_track_mm),
+            "via_diameter": float(spec.via_size_mm),
+            "via_drill": float(spec.via_drill_mm), "wire_width": 6,
+        }]},
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            _json.dump(project, handle, indent=2)
+    except OSError as exc:                                      # noqa: BLE001
+        warnings.append(f"seed_placed_project failed: {exc}")
+        return out
+    out.update({"written": True, "path": path, "clearance_mm": clearance})
+    warnings.append(
+        f"seed_placed_project: wrote {os.path.basename(path)} declaring the "
+        f"board's real {clearance:g}mm design clearance, so no downstream stage "
+        f"has to seed KiCad's stock "
+        f"{_STOCK_NETCLASS_CLEARANCE_MM:g}mm Default class (open defect 8)")
+    return out
 
 
 def _apply_pad_clearance(
@@ -785,6 +934,8 @@ def emit_power_copper(
     loop_first: bool | list | None = False,
     fanout_controller: bool = False,
     fanout_escape_method: str = "underpad",
+    fanout_voltage_spacing: bool = False,
+    seed_placed_project: bool = False,
     keepout_escape: bool = False,
     keepout_layer: str = "User.2",
     zone_plan=None,
@@ -988,6 +1139,48 @@ def emit_power_copper(
       (68/81 -> 36/81, DRC 0 throughout). Used alone it reproduces that arm and
       says so in ``warnings``.
 
+    **Spacing plan C knob (default OFF -> byte-identical).**
+    ``fanout_voltage_spacing=True`` sizes ``qfn_fanout``'s ``--clearance`` from
+    IPC-2221B Table 6-1 instead of from the fab:
+    ``max(spec.clearance_mm, max required_mm over every declared net)``.
+
+    ⛔⛔ **Why it is needed: the fanout runs at ONE uniform clearance and reads no
+    netclass.** ``net_clearance_map_by_id`` has no caller anywhere in
+    ``qfn_fanout/``, ``bga_fanout/`` or ``placement/``, while ``route.py``,
+    ``route_diff.py``, ``route_planes.py`` and ``route_disconnected_planes.py``
+    all read the sibling ``.kicad_pro``. Handed the fab's 0.25 mm on a board
+    whose ``SW`` is declared at 150 V -- which asks 0.6 mm -- the pre-pass draws
+    escape copper at less than half the required spacing, and the arc has
+    measured the consequence four times (open defect 8: HV conductors necked at
+    DRC 0 on `uc3844_flyback`, `lt3757_sepic` and `lt3758_flyback`).
+
+    ⚠ **The trade is the deliverable, not a side effect.** A wider clearance
+    leaves fewer legal stub tips and fewer legal via sites, and ``qfn_fanout``
+    walks the tip inward in ninths before giving up, so escapes will be lost.
+    Report both halves.
+
+    ⭐ **The judge runs whether or not the flag is on.** Whenever ``net_voltages``
+    are given, every fanout row carries ``deficits`` --
+    :func:`power_clearance.net_clearance_deficits` of KRT's own reported
+    ``min_clearance_used`` against Table 6-1 -- so the defect stays measured
+    after this plan ships. ⛔ A deficit is a claim about the *request*; only
+    :func:`fabspec.measure_voltage_spacing` grades the copper.
+
+    ⛔⛔ **Spacing plan C's second knob, and the one that names open defect 8's
+    cause: ``seed_placed_project=True``.** ``write_kicad_pcb`` emits
+    ``placed.kicad_pcb`` with **no sibling ``.kicad_pro``**, so whichever KRT
+    front end reads the board first calls ``fix_project_for_output``, finds no
+    project to carry over, and **seeds KiCad's stock ``Default`` net class — whose
+    clearance is 0.2 mm, not our 0.25 mm.** That writeback only ever *lowers*, so
+    the board's real design clearance can never come back, and ``route.py``'s
+    ``project_copper_clearance`` then reads 0.2 mm as the clearance for **every
+    net**. ⭐ Visible in spacing-02's own logs: with no fanout the router seeds the
+    project itself and logs ``below nominal 0.25``; with the fanout seeding first
+    the same boards log ``below nominal 0.2``. **A 20 % clearance cut on every
+    net, bought by a missing file.** This flag writes that file.
+    ⛔ Opt-in because it moves the routed result on *every* arm, the default path
+    included.
+
     **Spacing plan B knob (default ``None`` -> byte-identical).**
     ``pad_clearance`` (mm) writes a per-pad ``(clearance …)`` override onto every
     resolved controller's pads, in the form ``pad_clearance_form`` selects
@@ -1063,6 +1256,15 @@ def emit_power_copper(
     )
 
     warnings: list[str] = []
+
+    # ⛔⛔ Spacing plan C's unplanned finding, and the root cause of open defect 8:
+    # ``write_kicad_pcb`` writes no sibling ``.kicad_pro``, so whichever KRT stage
+    # sees this board FIRST seeds one from KiCad's stock 0.2 mm Default class and
+    # every later stage reads 0.2 mm as the board's clearance. Opt-in, because it
+    # moves the routed result on every arm. See :func:`_seed_placed_project`.
+    seed_project_record: dict = {}
+    if seed_placed_project:
+        seed_project_record = _seed_placed_project(placed_pcb, spec, warnings)
 
     # Phase-4 recognition/policy knobs recompute the plan here rather than
     # anywhere placement can see. With neither engaged this is the default path
@@ -1314,11 +1516,68 @@ def emit_power_copper(
     # router routes from a pad that has already left the package. Opt-in and
     # default OFF.
     if fanout_controller:
+        # ⭐⭐ Spacing plan C. ``qfn_fanout`` runs at ONE uniform ``--clearance``
+        # and reads no netclass: grepping ``net_clearance_map_by_id`` across
+        # ``qfn_fanout/``, ``bga_fanout/`` and ``placement/`` returns nothing,
+        # while ``route.py``, ``route_diff.py`` and both plane routers all read
+        # the sibling ``.kicad_pro``. (⚠ KRT's #498 work gave the fanout
+        # ``install_layer_clearances``, which is the ``.kicad_dru`` PER-LAYER map
+        # -- a different thing, and inert here because nothing this stack writes
+        # emits a ``.kicad_dru``.) So the scalar we choose is the whole of the
+        # fanout's spacing behaviour, and choosing the FAB's clearance on a board
+        # with a declared 150 V net is the caller error this flag fixes.
+        #
+        # ⛔ Opt-in and default OFF: with ``fanout_voltage_spacing=False`` the
+        # override is ``None`` and the call below is the pre-plan-C call verbatim.
+        # ⛔ And with it ON on a board with no declared voltages the max collapses
+        # to ``None`` too, so THAT case is byte-identical as well (gate C3).
+        fanout_clearance = None
+        fanout_clearance_records: dict = {}
+        if net_voltages:
+            from .power_clearance import (max_required_clearance,
+                                          plan_net_clearances)
+            # ⛔ Judged against the BOARD's clearance, not the fab floor: the
+            # requirement is met or not met by the copper the board actually
+            # routes at. Same base as the Phase-10 lever, so the two agree.
+            fanout_clearance_records = plan_net_clearances(
+                net_voltages,
+                base_clearance_mm=(spec.clearance_mm if spec is not None
+                                   else None),
+                column=spacing_column,
+            )
+            required = max_required_clearance(fanout_clearance_records)
+            if fanout_voltage_spacing and required is not None:
+                base = spec.clearance_mm if spec is not None else 0.0
+                fanout_clearance = max(float(base), float(required))
+                if fanout_clearance > float(base) + 1e-9:
+                    warnings.append(
+                        f"fanout_voltage_spacing: escaping at "
+                        f"{fanout_clearance:g}mm instead of the board's "
+                        f"{base:g}mm -- IPC-2221B column {spacing_column} asks "
+                        f"{required:g}mm of the widest declared net. ⚠ A wider "
+                        f"clearance means fewer legal stub tips and via sites, "
+                        f"so expect to lose escapes; that trade is the point.")
+                else:
+                    # ⛔ Recorded, not silent: "the flag was on and changed
+                    # nothing" is a different claim from "the flag was off".
+                    warnings.append(
+                        f"fanout_voltage_spacing requested but the board's "
+                        f"{base:g}mm clearance already meets every declared "
+                        f"net's IPC-2221B requirement; the fanout's argv is "
+                        f"unchanged")
+                    fanout_clearance = None
+        elif fanout_voltage_spacing:
+            warnings.append(
+                "fanout_voltage_spacing requested but no net_voltages were "
+                "given, so there is no requirement to size the fanout's "
+                "clearance from; the fanout's argv is unchanged")
         fanout_record = _run_fanout_prepass(
             route_input, workdir_abs, result, circuit, fp_lib_dirs,
             spec=spec, krt_dir=krt_dir, timeout_s=timeout_s,
             escape_method=fanout_escape_method,
-            plane_nets=plane_nets, width_map=width_map, warnings=warnings)
+            plane_nets=plane_nets, width_map=width_map, warnings=warnings,
+            clearance_mm=fanout_clearance,
+            clearance_records=fanout_clearance_records)
         if fanout_record.get("board"):
             route_input = fanout_record["board"]
     if loop_first is not False and loop_first is not None:
@@ -1625,6 +1884,7 @@ def emit_power_copper(
         pad_clearance=pad_clearance_record,
         loop_first=loop_first_record,
         fanout=fanout_record,
+        seed_project=seed_project_record,
         keepout=keepout_record,
         zone_plan=zone_record,
         route_layers=route_layers,

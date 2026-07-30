@@ -704,3 +704,62 @@ def test_written_keepouts_round_trip_through_krt(tmp_path):
     # And nothing lands on a layer nobody asked for.
     assert kicad_parser.parse_keepout_zones(
         board.read_text(encoding="utf-8"), "User.3") == []
+
+
+# --------------------------------------------------------------------------- #
+# Spacing plan C -- the fanout's JSON_SUMMARY, parsed at the source
+# --------------------------------------------------------------------------- #
+def test_fanout_output_parse_reads_min_clearance_used():
+    """⭐ The one number that makes plan C's judge free.
+
+    ⚠ Recorded, and load-bearing: nothing inside a ``qfn_fanout`` process calls
+    ``clearance_ledger.record`` (the recorders are ``plane_pad_tap`` and
+    ``kicad_oracle``, in other processes), so the ledger is empty and
+    ``min_clearance_used`` equals the ``--clearance`` we passed. Measured at
+    0.25 mm on all five power boards.
+    """
+    from skidl_layout.power_escape import _parse_fanout_output
+
+    text = (
+        "Parsing board.kicad_pcb...\n"
+        "Underpad via-drop: 5 vias placed, 0 dropped (pitch 0.50, ...)\n"
+        "Generated 10 track segments (5 stubs x 2 segments)\n"
+        'JSON_SUMMARY: {"clearance": 0.25, "min_clearance_used": 0.25, '
+        '"drc_grazes": 0, "total": 0}\n'
+    )
+
+    out = _parse_fanout_output(text)
+
+    assert out["min_clearance_used"] == 0.25
+    assert out["summary"]["clearance"] == 0.25
+    assert out["vias_placed"] == 5 and out["vias_dropped"] == 0
+
+
+def test_fanout_output_parse_survives_a_missing_or_broken_summary():
+    """⛔ A pre-pass that declines is an outcome the caller routes past, so a
+    log with no summary -- or a truncated one -- must parse to ``None``, never
+    raise."""
+    from skidl_layout.power_escape import _parse_fanout_output
+
+    assert _parse_fanout_output("")["min_clearance_used"] is None
+    assert _parse_fanout_output(
+        "Underpad via-drop: 1 vias placed, 6 dropped"
+    )["min_clearance_used"] is None
+    assert _parse_fanout_output(
+        'JSON_SUMMARY: {"min_clearance_used": 0.2'      # truncated JSON
+    )["min_clearance_used"] is None
+    assert _parse_fanout_output(
+        'JSON_SUMMARY: {"min_clearance_used": null}'
+    )["min_clearance_used"] is None
+
+
+def test_fanout_output_parse_takes_the_last_summary_line():
+    """A chained run prints one summary per controller; the parser keeps the
+    last, which is the board the next step reads."""
+    from skidl_layout.power_escape import _parse_fanout_output
+
+    out = _parse_fanout_output(
+        'JSON_SUMMARY: {"min_clearance_used": 0.25}\n'
+        'JSON_SUMMARY: {"min_clearance_used": 0.6}\n')
+
+    assert out["min_clearance_used"] == 0.6
