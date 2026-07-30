@@ -125,6 +125,15 @@ from .power_escape import (
     resolve_lane_mm,
     write_keepout_polygons,
 )
+from .power_pads import (
+    PAD_CLEARANCE_FIELD,
+    PAD_CLEARANCE_FORMS,
+    apply_pad_clearance,
+    declared_pad_clearance_refs,
+    mark_pad_clearance,
+    pad_clearance_value,
+    resolve_pad_clearance_targets,
+)
 from .power_zones import (
     ZonePlan,
     ZoneRegion,

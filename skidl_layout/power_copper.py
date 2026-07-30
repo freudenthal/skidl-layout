@@ -95,6 +95,13 @@ class PowerCopperResult:
     #: when it was requested and no commutation loop was classified, so "asked
     #: for and declined" can never read as "never asked for".
     loop_first: dict = field(default_factory=dict)
+    #: What spacing plan B's per-pad clearance override did: the resolved
+    #: targets and their values, which s-expression form was written, how many
+    #: tokens landed, and where the refs came from. Empty unless
+    #: ``pad_clearance=`` was given; ``{"requested": True, "written": 0,
+    #: "reason": …}`` when it was given and no controller resolved, so "asked
+    #: for and declined" can never read as "never asked for".
+    pad_clearance: dict = field(default_factory=dict)
     #: What the Phase-14 fanout pre-pass did, per resolved controller: vias
     #: placed, vias dropped, and the nets it could **not** escape. Empty unless
     #: ``fanout_controller=True``.
@@ -210,6 +217,7 @@ class PowerCopperResult:
                                if self.via_relocation else None),
             "net_clearances": {k: dict(v) for k, v in self.net_clearances.items()},
             "pinned_widths": {k: dict(v) for k, v in self.pinned_widths.items()},
+            "pad_clearance": dict(self.pad_clearance),
             "loop_first": dict(self.loop_first),
             "fanout": dict(self.fanout),
             "keepout": dict(self.keepout),
@@ -489,6 +497,51 @@ def _run_fanout_prepass(
     }
 
 
+def _apply_pad_clearance(
+    board_pcb, result, circuit, *, clearance_mm, form, spec, warnings,
+) -> dict:
+    """Write the per-pad clearance override into ``board_pcb``, in place.
+
+    ⭐ **Spacing plan B.** This is the only mechanism in the stack that can hold
+    *routed* copper off a controller's pins: track-to-pad clearance is not
+    separately configurable from track-to-track, no router reads courtyards, and
+    the user-layer track keep-out is refuted three times (−32, −22,
+    ±0-with-8-DRC) because it blocks every net including the controller's own.
+
+    ⛔ **A different mechanism from that keep-out, and the difference is
+    net-exemption.** A clearance override binds between items of *different*
+    nets, so the controller's own escape keeps using the room while foreign
+    copper is pushed out of it.
+
+    ⚠ Applied to the board the writer just emitted -- **before** the fanout
+    pre-pass and every route pass -- so it is a property of the board rather
+    than of one pass, and ``writer.py`` stays untouched (the two-layer
+    byte-identity all three Phase-0 digests rest on cannot move).
+    """
+    from .power_pads import apply_pad_clearance, resolve_pad_clearance_targets
+
+    placed = [str(p.ref) for p in (getattr(result, "placed_parts", None) or [])]
+    targets, source = resolve_pad_clearance_targets(
+        placed_refs=placed, circuit=circuit, clearance_mm=clearance_mm,
+        power_stage_plan=getattr(result, "power_stage_plan", None),
+        warnings=warnings)
+    if not targets:
+        warnings.append(
+            "pad_clearance requested but no controller resolved "
+            "(no declaration, no classified stage); no override written")
+        return {"requested": True, "written": 0, "source": source,
+                "reason": "no controller resolved"}
+    record = apply_pad_clearance(board_pcb, targets, form=form, fab_spec=spec)
+    record.update({"requested": True, "source": source,
+                   "clearance_mm": float(clearance_mm) if clearance_mm else None,
+                   "targets": {ref: value for ref, value in targets}})
+    warnings.append(
+        "pad_clearance: "
+        + ", ".join(f"{ref} at {value:g}mm" for ref, value in targets)
+        + f" ({record['written']} {form}-level token(s), {source})")
+    return record
+
+
 def _apply_escape_keepout(
     board_pcb, result, fp_lib_dirs, *, spec, layer, loop_ran, warnings,
 ) -> dict:
@@ -736,6 +789,8 @@ def emit_power_copper(
     keepout_layer: str = "User.2",
     zone_plan=None,
     reserve_plane_layers: bool = False,
+    pad_clearance: float | None = None,
+    pad_clearance_form: str = "pad",
 ) -> PowerCopperResult:
     """Emit real power copper for a placed ``result``; grade the final board.
 
@@ -932,6 +987,19 @@ def emit_power_copper(
       escape -- Phase 13 measured that at **-32 routed nets across the corpus**
       (68/81 -> 36/81, DRC 0 throughout). Used alone it reproduces that arm and
       says so in ``warnings``.
+
+    **Spacing plan B knob (default ``None`` -> byte-identical).**
+    ``pad_clearance`` (mm) writes a per-pad ``(clearance …)`` override onto every
+    resolved controller's pads, in the form ``pad_clearance_form`` selects
+    (``"pad"``, the default, or ``"footprint"``; KRT's parser resolves both into
+    ``pad.local_clearance``). ⭐ It is the **only** mechanism here that holds
+    *routed* copper off a controller's pins -- track-to-pad clearance is not
+    separately configurable from track-to-track, and no router reads courtyards.
+    ⛔ **Not the thrice-refuted user-layer keep-out:** a clearance override binds
+    only between items of *different* nets, so the controller's own escape still
+    uses the room. ⚠ It is a **floor**, so it also stops KRT's fine-pitch rescue
+    ladder necking near those pads -- which is the quality it buys and the
+    completion it can cost. See :mod:`skidl_layout.power_pads`.
 
     **Phase-15 knob (default OFF -> byte-identical).** ``zone_plan`` pours
     **polygons we choose** instead of accepting ``route_planes.py``'s Voronoi
@@ -1229,8 +1297,18 @@ def emit_power_copper(
     loop_first_record: dict = {}
     fanout_record: dict = {}
     keepout_record: dict = {}
+    pad_clearance_record: dict = {}
     route_input = placed_pcb
     pass2_extra = route_extra_args
+
+    # ⭐ Spacing plan B: the per-pad clearance override goes onto the board
+    # FIRST, before the fanout pre-pass and every route pass, because it is a
+    # property of the board and not of a pass. Opt-in and default ``None`` ->
+    # not a byte is touched.
+    if pad_clearance is not None and pad_clearance is not False:
+        pad_clearance_record = _apply_pad_clearance(
+            placed_pcb, result, circuit, clearance_mm=pad_clearance,
+            form=pad_clearance_form, spec=spec, warnings=warnings)
 
     # ⭐ Phase 14 / WS-14.3: the fanout pre-pass runs BEFORE pass 1, so the
     # router routes from a pad that has already left the package. Opt-in and
@@ -1544,6 +1622,7 @@ def emit_power_copper(
         via_relocation=relocation_dict,
         net_clearances=clearance_records,
         pinned_widths=pinned_widths,
+        pad_clearance=pad_clearance_record,
         loop_first=loop_first_record,
         fanout=fanout_record,
         keepout=keepout_record,
