@@ -21,8 +21,53 @@ from .roles import (
     is_ui_grid_part,
     pin_net_names,
 )
+from .ratnest import is_plane_net
 from .validator import validate
 from .writer import PlacedPart
+
+# --------------------------------------------------------------------------- #
+# The crossing objective -- metric-validation step 1. OFF by default.
+# --------------------------------------------------------------------------- #
+#: The shipped behaviour, and the default everywhere.
+CROSSING_OBJECTIVE_LEGACY = "legacy"
+#: Plane nets excluded from the crossing count, and the term rescaled so it is
+#: not clipped. ⛔ The two halves are inseparable -- see ``_crossing_term``.
+CROSSING_OBJECTIVE_SIGNAL = "signal"
+CROSSING_OBJECTIVES = (CROSSING_OBJECTIVE_LEGACY, CROSSING_OBJECTIVE_SIGNAL)
+
+#: ⛔⛔ MEASURED 2026-07-30 on the six-board eval set: ``2.0`` saturates the
+#: ``20.0`` ceiling at **10 crossings**, and the star metric reads 101-499 on
+#: every board. The term is therefore a CONSTANT on 12 of 12 board-arms and
+#: contributes **no gradient at all** -- the placer's whole continuous quality
+#: signal is HPWL. Kept exactly as-is so ``legacy`` stays byte-identical.
+_CROSSING_GAIN_LEGACY, _CROSSING_CAP_LEGACY = 2.0, 20.0
+
+#: Signal mode. The gain is DERIVED, not chosen: over all 132 board-instances in
+#: the eval set (6 boards x {hand, auto, 20 random}) plane-free star crossings
+#: run 0-242 with a 90th percentile of 138, so ``20.0 / 138 ~= 0.145`` puts the
+#: ceiling just above that percentile. ⭐ The consequence that matters: **no auto
+#: or hand placement in the corpus reaches the cap** (worst is 88), so the term
+#: is live over the entire range a search actually traverses, while the cap still
+#: stops a pathological scatter from deciding a board on this term alone.
+_CROSSING_GAIN_SIGNAL, _CROSSING_CAP_SIGNAL = 0.15, 20.0
+
+
+def _crossing_term(crossing_count: int, crossing_objective: str) -> float:
+    """The crossing penalty contribution, per objective mode.
+
+    ⛔⛔ **Excluding plane nets and rescaling the term are ONE change, not two.**
+    Filtering alone buys nothing while the term is clipped -- both arms still
+    land on the 20.0 ceiling and the score cannot tell them apart. Rescaling
+    alone amplifies a metric that MISRANKS: on ``lt3844_buck`` the all-nets star
+    count prefers the engine's board (+81.2 %) where MST-over-pads prefers the
+    human's (-61.4 %), because the human's compact board stacks the star's long
+    plane-net spokes on top of each other (``SGND`` 88, ``PGND`` 67, ``VIN`` 64,
+    ``VOUT`` 55 crossings against ``SW`` 13 for the first signal net). Plane-free,
+    the same metric ranks the human's board better on **6 of 6**.
+    """
+    if crossing_objective == CROSSING_OBJECTIVE_SIGNAL:
+        return min(crossing_count * _CROSSING_GAIN_SIGNAL, _CROSSING_CAP_SIGNAL)
+    return min(crossing_count * _CROSSING_GAIN_LEGACY, _CROSSING_CAP_LEGACY)
 
 
 @dataclass
@@ -335,13 +380,29 @@ def _segment_intersects(a1, a2, b1, b2) -> bool:
     return o1 * o2 < 0 and o3 * o4 < 0
 
 
-def _estimate_crossings(placed_parts: list[PlacedPart], circuit, ctx=None) -> int:
+def _estimate_crossings(
+    placed_parts: list[PlacedPart],
+    circuit,
+    ctx=None,
+    *,
+    exclude_plane_nets: bool = False,
+) -> int:
+    """Star-topology crossing estimate over part centroids.
+
+    ``exclude_plane_nets`` drops nets that get POURED rather than routed as
+    tracks, using :func:`ratnest.is_plane_net` so the objective and every judge
+    share one definition of "plane net". ⚠ Roughly half our pins are plane pins,
+    and KRT records its own ``--ignore-nets`` as a *correctness* requirement for
+    an honest airwire objective rather than a refinement.
+    """
     if circuit is None:
         return 0
 
     pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
     segments = []
     for _name, all_refs in _net_ref_lists(circuit, ctx):
+        if exclude_plane_nets and is_plane_net(_name):
+            continue
         refs = [ref for ref in all_refs if ref in pos_by_ref]
         if len(refs) < 2:
             continue
@@ -1068,7 +1129,14 @@ def score_placement(
     clearance_mm: float = 0.5,
     board_layers: int = 2,
     ctx=None,
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
 ) -> LayoutScore:
+    """Full placement score.
+
+    ``crossing_objective`` selects how the crossing term is computed and scaled;
+    see :func:`_crossing_term`. **Default ``"legacy"``, and on that path this
+    function is byte-identical to before the parameter existed.**
+    """
     validation = validate(
         placed_parts,
         circuit,
@@ -1101,7 +1169,12 @@ def score_placement(
     outline_metrics = _outline_utilization_metrics(placed_parts, fp_bboxes, outline)
     total_hpwl = _total_hpwl(placed_parts, circuit, ctx)
     weighted_hpwl = _weighted_hpwl(placed_parts, circuit, ctx)
-    crossing_count = _estimate_crossings(placed_parts, circuit, ctx)
+    crossing_count = _estimate_crossings(
+        placed_parts,
+        circuit,
+        ctx,
+        exclude_plane_nets=(crossing_objective == CROSSING_OBJECTIVE_SIGNAL),
+    )
     pin_escape_score = _pin_escape_congestion(placed_parts, circuit)
     congestion_map = build_congestion_map(
         placed_parts,
@@ -1129,7 +1202,7 @@ def score_placement(
     penalty += len(validation.missing_refs) * 10.0
     penalty += min(total_hpwl / 50.0, 30.0)
     penalty += min(weighted_hpwl / 120.0, 20.0)
-    penalty += min(crossing_count * 2.0, 20.0)
+    penalty += _crossing_term(crossing_count, crossing_objective)
     penalty += min(congestion_score / 8.0, 15.0)
     penalty += min(float(front_panel_trace["span_mm"]) / 12.0, 12.0)
     penalty += _warning_penalty(warnings)

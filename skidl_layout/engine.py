@@ -53,7 +53,13 @@ from .refinement import (
 from .report import PlacementReport, build_placement_report
 from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_ui_grid_part
 from .routability import RoutabilityFeedback
-from .scoring import LayoutScore, score_placement, score_placement_quick
+from .scoring import (
+    CROSSING_OBJECTIVE_LEGACY,
+    CROSSING_OBJECTIVES,
+    LayoutScore,
+    score_placement,
+    score_placement_quick,
+)
 from .grid import choose_grid_columns, points_form_clean_grid
 from .validator import (
     ValidationResult,
@@ -225,6 +231,9 @@ class _FinalizeParams:
     #: Phase 2 Stage B. Defaulted so every existing construction site (and any
     #: pickled worker payload from before it existed) keeps the OFF behavior.
     power_score: bool = False
+    #: Metric-validation step 1. Same defaulting rule and the same reason: this
+    #: crosses the parallel-worker process boundary inside a pickled payload.
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY
 
 
 def _note_move(
@@ -525,6 +534,7 @@ def _finalize_candidate_impl(
         max_movable_refs=32,
         max_pair_swaps=8,
         ctx=ctx,
+        crossing_objective=params.crossing_objective,
         progress=(
             (lambda m, _n=candidate.name: _emit(f"[{_n}] post-anchor {m}"))
             if progress is not None
@@ -671,6 +681,7 @@ def _finalize_candidate_impl(
         clearance_mm=clearance_mm,
         board_layers=board_layers,
         ctx=ctx,
+        crossing_objective=params.crossing_objective,
     )
     edge_score = _apply_edge_intent_score(
         raw_score,
@@ -1670,6 +1681,27 @@ def _resolve_power_score(power_score: bool | None, implied_by: bool = False) -> 
     if env is not None:
         return env.strip().lower() not in ("", "0", "false", "no", "off")
     return bool(implied_by)
+
+
+def _resolve_crossing_objective(crossing_objective: str | None) -> str:
+    """Explicit kwarg > ``SKIDL_LAYOUT_CROSSING_OBJECTIVE`` > default ``legacy``.
+
+    Deliberately the same three-line shape as :func:`_resolve_power_score`.
+    An unknown name raises rather than falling back: a typo that silently
+    selects the shipped objective would make an A/B read as "no effect".
+    """
+    value = crossing_objective
+    if value is None:
+        value = os.environ.get("SKIDL_LAYOUT_CROSSING_OBJECTIVE")
+    if value is None or not str(value).strip():
+        return CROSSING_OBJECTIVE_LEGACY
+    value = str(value).strip().lower()
+    if value not in CROSSING_OBJECTIVES:
+        raise ValueError(
+            f"unknown crossing_objective {value!r}; "
+            f"expected one of {', '.join(CROSSING_OBJECTIVES)}"
+        )
+    return value
 
 
 def _resolve_power_constraints(power_constraints: bool | None) -> bool:
@@ -3850,6 +3882,7 @@ def _refine_candidate_trio(
     board_layers,
     ctx,
     progress,
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
 ):
     """Run the pass-1 refinement trio on one candidate, mutating it in place.
 
@@ -3874,6 +3907,7 @@ def _refine_candidate_trio(
         board_layers=board_layers,
         ctx=ctx,
         progress=progress,
+        crossing_objective=crossing_objective,
     )
     return candidate
 
@@ -3985,6 +4019,7 @@ def _posttrio_candidate_impl(
             clearance_mm=clearance_mm,
             board_layers=board_layers,
             ctx=ctx,
+            crossing_objective=params.crossing_objective,
         )
     edge_score = _apply_edge_intent_score(
         raw_score,
@@ -4284,6 +4319,7 @@ def plan_layout(
     power_escape_room: bool | float | None = None,
     power_escape_constraints: bool | float | None = None,
     power_escape_partial: bool = False,
+    crossing_objective: str | None = None,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
 
@@ -4367,6 +4403,20 @@ def plan_layout(
     the gap again: measured on ``lt3757_sepic``, it raised the baseline
     candidate's *seed* escape gap 1.163 -> 2.055 mm and dropped the *final*
     placement's gap 0.540 -> 0.050 mm. Ships OFF (power-layout Phase 13, E3b).
+
+    ``crossing_objective`` selects the placement objective's crossing term:
+    ``"legacy"`` (the shipped one, and the default) or ``"signal"``.
+    ``SKIDL_LAYOUT_CROSSING_OBJECTIVE`` is the env default; an explicit kwarg
+    wins; an unknown name raises. **Default is a true no-op** — every placement
+    is byte-identical to before the parameter existed.
+
+    ⛔⛔ **Why it exists (MEASURED 2026-07-30, six-board eval set).** The legacy
+    term is ``min(crossings * 2.0, 20.0)``, which saturates at **10** crossings,
+    and the star metric reads 101–499 on every board — so the term is a
+    **constant on 12 of 12 board-arms** and the placer's only live continuous
+    quality signal is HPWL. ``"signal"`` drops poured nets from the count and
+    rescales the term so it is not clipped; see ``scoring._crossing_term`` for
+    why those two halves cannot be separated.
 
     ``parallel_workers`` controls refining the unique candidates' pass-1 trio
     (orientation/decap/placement) and their post-anchor finalize concurrently in
@@ -4461,6 +4511,7 @@ def plan_layout(
     resolved_power_score = _resolve_power_score(
         power_score, implied_by=resolved_power_constraints
     )
+    resolved_crossing_objective = _resolve_crossing_objective(crossing_objective)
     candidate_power_plan = (
         classify_power_roles(circuit) if resolved_power_constraints else None
     )
@@ -4542,6 +4593,7 @@ def plan_layout(
         derive_outline_if_missing=derive_outline_if_missing,
         constraints=constraints,
         power_score=resolved_power_score,
+        crossing_objective=resolved_crossing_objective,
     )
 
     # WS18/WS22: opt-in parallel machinery. The picklable snapshot is built at
@@ -4681,6 +4733,7 @@ def plan_layout(
                     if progress is not None
                     else None
                 ),
+                crossing_objective=resolved_crossing_objective,
             )
         canonical_by_key[seed_key] = candidate
         # Round-8 WS29: the pass-1 post-trio block is now a shared module-level
@@ -4717,6 +4770,7 @@ def plan_layout(
                 clearance_mm=clearance_mm,
                 board_layers=board_layers,
                 ctx=ctx,
+                crossing_objective=resolved_crossing_objective,
             )
             edge_score = _apply_edge_intent_score(
                 raw_score,
@@ -4943,6 +4997,7 @@ def plan_layout(
                             clearance_mm=clearance_mm,
                             board_layers=board_layers,
                             ctx=ctx,
+                            crossing_objective=resolved_crossing_objective,
                         ),
                         placed_parts,
                         resolved_bboxes,

@@ -9,7 +9,12 @@ from .constraints import LayoutConstraints
 from .geometry import FootprintGeometry, PadGeometry, transform_point
 from .placer import _find_clear_position, _overlaps_any
 from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_nc_net, is_ui_grid_part
-from .scoring import LayoutScore, _net_ref_lists, score_placement
+from .scoring import (
+    CROSSING_OBJECTIVE_LEGACY,
+    LayoutScore,
+    _net_ref_lists,
+    score_placement,
+)
 from .validator import _same_physical_side, _through_board_pads_collide, validate
 from .writer import PlacedPart
 
@@ -82,6 +87,7 @@ def _score(
     clearance_mm: float,
     board_layers: int,
     ctx=None,
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
 ) -> LayoutScore:
     return score_placement(
         placed_parts,
@@ -94,6 +100,7 @@ def _score(
         clearance_mm=clearance_mm,
         board_layers=board_layers,
         ctx=ctx,
+        crossing_objective=crossing_objective,
     )
 
 
@@ -1185,6 +1192,7 @@ def _best_single_ref_trial(
     clearance_mm: float,
     board_layers: int,
     ctx=None,
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
     if len(trials) > RANK_LIMIT:
         trials = _rank_and_limit_trials(
@@ -1210,6 +1218,7 @@ def _best_single_ref_trial(
             clearance_mm,
             board_layers,
             ctx,
+            crossing_objective,
         )
         if _is_better(best_score, trial_score):
             best_parts = trial_parts
@@ -1243,6 +1252,7 @@ def _best_pin_gravity_trial(
     clearance_mm: float,
     board_layers: int,
     ctx=None,
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
     current_distance = math.hypot(
         placed.x_mm - target_xy[0],
@@ -1300,6 +1310,7 @@ def _best_pin_gravity_trial(
             clearance_mm,
             board_layers,
             ctx,
+            crossing_objective,
         )
         scored_candidates += 1
         if _hard_violation_key(trial_score) > current_hard:
@@ -1436,6 +1447,7 @@ def _legalize_one_overlap(
     position_locked: set[str],
     degrees: dict[str, int],
     ctx=None,
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
 ) -> tuple[list[PlacedPart], LayoutScore, str, str] | None:
     validation = validate(
         placed_parts,
@@ -1506,6 +1518,7 @@ def _legalize_one_overlap(
                 clearance_mm,
                 board_layers,
                 ctx,
+                crossing_objective,
             )
             if _is_better(current_score, trial_score):
                 other = ref_b if ref == ref_a else ref_a
@@ -1544,8 +1557,14 @@ def refine_placement(
     preanchored_refs: set[str] | None = None,
     ctx=None,
     progress=None,
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
 ) -> RefinementResult:
     """Apply deterministic score-gated local placement adjustments.
+
+    ⭐ ``crossing_objective`` reaches ``score_placement`` on every trial, which
+    is the point: the refiner is where the objective's *gradient* is consumed,
+    so a change made only at candidate-selection time would never steer a move.
+    **Default ``"legacy"``, and on that path this is byte-identical.**
 
     ``progress`` (optional ``callable(str)``) is invoked at per-ref, swap-loop
     and legalization-loop boundaries for observability only. It must never
@@ -1562,6 +1581,7 @@ def refine_placement(
         clearance_mm,
         board_layers,
         ctx,
+        crossing_objective,
     )
     start_score = current_score.score
     start_penalty = current_score.penalty
@@ -1651,6 +1671,7 @@ def refine_placement(
                     clearance_mm,
                     board_layers,
                     ctx,
+                    crossing_objective,
                 )
                 if best is not None:
                     current_parts, current_score, trial = best
@@ -1690,6 +1711,7 @@ def refine_placement(
                     clearance_mm,
                     board_layers,
                     ctx,
+                    crossing_objective,
                 )
                 if best is not None:
                     current_parts, current_score, trial = best
@@ -1721,6 +1743,7 @@ def refine_placement(
                 clearance_mm,
                 board_layers,
                 ctx,
+                crossing_objective,
             )
             if best is not None:
                 current_parts, current_score, trial = best
@@ -1798,6 +1821,7 @@ def refine_placement(
                 position_locked,
                 degrees,
                 ctx,
+                crossing_objective,
             )
             if legalized is None:
                 break
@@ -1832,6 +1856,7 @@ def refine_candidate_placement(
     board_layers: int = 2,
     ctx=None,
     progress=None,
+    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
 ) -> RefinementResult:
     result = refine_placement(
         candidate.placed_parts,
@@ -1844,6 +1869,7 @@ def refine_candidate_placement(
         preanchored_refs=set(candidate.pin_gravity_anchored_refs),
         ctx=ctx,
         progress=progress,
+        crossing_objective=crossing_objective,
     )
     if result.accepted_count == 0:
         return result
