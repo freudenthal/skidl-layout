@@ -292,3 +292,26 @@ def test_refine_worker_payload_tolerates_a_missing_objective():
         refine_candidate_worker(short)
     # It must fail LATER (on the None candidate), not while unpacking the tuple.
     assert "not enough values to unpack" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("rescue", [False, True])
+def test_rescue_blocked_moves_survives_the_worker_boundary(rescue):
+    """⭐ The same boundary check the crossing objective needed. Any opt-in that
+    reaches the scorer must be gated across the process boundary, or a >= 30-part
+    board silently disagrees with a < 30-part one."""
+    seq = plan_layout(_circuit(), fp_bboxes=BBOXES, parallel_workers=1,
+                      rescue_blocked_moves=rescue)
+    msgs: list[str] = []
+    par = plan_layout(_circuit(), fp_bboxes=BBOXES, parallel_workers=2,
+                      rescue_blocked_moves=rescue,
+                      progress=lambda m: msgs.append(m))
+    assert any("in parallel" in m for m in msgs), "parallel path did not engage"
+    assert _sig(par) == _sig(seq)
+    assert par.score.to_dict() == seq.score.to_dict()
+
+
+def test_rescue_blocked_moves_is_off_by_default():
+    """⛔ Default OFF must be a true no-op: byte-identical placement."""
+    off = plan_layout(_circuit(), fp_bboxes=BBOXES, rescue_blocked_moves=False)
+    implicit = plan_layout(_circuit(), fp_bboxes=BBOXES)
+    assert _sig(implicit) == _sig(off)

@@ -119,6 +119,7 @@ def refine_candidate_worker(payload: bytes) -> bytes:
     ) = fields[:6]
     crossing_objective = (fields[6] if len(fields) > 6
                           else DEFAULT_CROSSING_OBJECTIVE)
+    rescue_blocked_moves = fields[7] if len(fields) > 7 else False
 
     from .context import LayoutContext
     from .engine import _refine_candidate_trio
@@ -139,6 +140,7 @@ def refine_candidate_worker(payload: bytes) -> bytes:
         # boards while the small ones look correct. Caught by gate G0 (the legacy
         # control vs the recorded W2 digest) on the two 35/36-part boards.
         crossing_objective=crossing_objective,
+        rescue_blocked_moves=rescue_blocked_moves,
     )
     return pickle.dumps(candidate)
 
@@ -205,6 +207,7 @@ def plan_candidate_worker(payload: bytes) -> bytes:
         # boards while the small ones look correct. Caught by gate G0 (the legacy
         # control vs the recorded W2 digest) on the two 35/36-part boards.
         crossing_objective=params.crossing_objective,
+        rescue_blocked_moves=params.rescue_blocked_moves,
     )
     score, validation = _posttrio_candidate_impl(candidate, snapshot, params, ctx)
     pass1_blob = pickle.dumps(candidate)  # BEFORE finalize mutates it (hazard #3)

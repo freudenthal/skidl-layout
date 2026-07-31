@@ -235,6 +235,9 @@ class _FinalizeParams:
     #: Metric-validation step 1. Same defaulting rule and the same reason: this
     #: crosses the parallel-worker process boundary inside a pickled payload.
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE
+    #: Same defaulting rule, and the same reason: it crosses the
+    #: pickled parallel-worker boundary.
+    rescue_blocked_moves: bool = False
 
 
 def _note_move(
@@ -536,6 +539,7 @@ def _finalize_candidate_impl(
         max_pair_swaps=8,
         ctx=ctx,
         crossing_objective=params.crossing_objective,
+        rescue_blocked_moves=params.rescue_blocked_moves,
         progress=(
             (lambda m, _n=candidate.name: _emit(f"[{_n}] post-anchor {m}"))
             if progress is not None
@@ -1682,6 +1686,16 @@ def _resolve_power_score(power_score: bool | None, implied_by: bool = False) -> 
     if env is not None:
         return env.strip().lower() not in ("", "0", "false", "no", "off")
     return bool(implied_by)
+
+
+def _resolve_rescue_blocked_moves(value: bool | None) -> bool:
+    """Explicit kwarg > ``SKIDL_LAYOUT_RESCUE_BLOCKED_MOVES`` > default OFF."""
+    if value is not None:
+        return bool(value)
+    env = os.environ.get("SKIDL_LAYOUT_RESCUE_BLOCKED_MOVES")
+    if env is not None:
+        return env.strip().lower() not in ("", "0", "false", "no", "off")
+    return False
 
 
 def _resolve_crossing_objective(crossing_objective: str | None) -> str:
@@ -3884,6 +3898,7 @@ def _refine_candidate_trio(
     ctx,
     progress,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    rescue_blocked_moves: bool = False,
 ):
     """Run the pass-1 refinement trio on one candidate, mutating it in place.
 
@@ -3909,6 +3924,7 @@ def _refine_candidate_trio(
         ctx=ctx,
         progress=progress,
         crossing_objective=crossing_objective,
+        rescue_blocked_moves=rescue_blocked_moves,
     )
     return candidate
 
@@ -4106,6 +4122,7 @@ def _prerefine_candidates_parallel(
                     clearance_mm,
                     board_layers,
                     resolved_crossing_objective,
+                    resolved_rescue_blocked,
                 )
             )
             for i in canonical_indices
@@ -4322,6 +4339,7 @@ def plan_layout(
     power_escape_constraints: bool | float | None = None,
     power_escape_partial: bool = False,
     crossing_objective: str | None = None,
+    rescue_blocked_moves: bool | None = None,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
 
@@ -4521,6 +4539,7 @@ def plan_layout(
         power_score, implied_by=resolved_power_constraints
     )
     resolved_crossing_objective = _resolve_crossing_objective(crossing_objective)
+    resolved_rescue_blocked = _resolve_rescue_blocked_moves(rescue_blocked_moves)
     candidate_power_plan = (
         classify_power_roles(circuit) if resolved_power_constraints else None
     )
@@ -4603,6 +4622,7 @@ def plan_layout(
         constraints=constraints,
         power_score=resolved_power_score,
         crossing_objective=resolved_crossing_objective,
+        rescue_blocked_moves=resolved_rescue_blocked,
     )
 
     # WS18/WS22: opt-in parallel machinery. The picklable snapshot is built at
@@ -4743,6 +4763,7 @@ def plan_layout(
                     else None
                 ),
                 crossing_objective=resolved_crossing_objective,
+                rescue_blocked_moves=resolved_rescue_blocked,
             )
         canonical_by_key[seed_key] = candidate
         # Round-8 WS29: the pass-1 post-trio block is now a shared module-level

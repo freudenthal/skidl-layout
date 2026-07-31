@@ -1005,6 +1005,62 @@ def _move_trials(
     return trials
 
 
+def _clear_variants(
+    placed: PlacedPart,
+    trials: list[PlacedPart],
+    placed_parts: list[PlacedPart],
+    fp_bboxes: dict[str, tuple[float, float]],
+    fp_geometries: dict[str, FootprintGeometry] | None,
+    constraints: LayoutConstraints | None,
+    width_mm: float,
+    height_mm: float,
+    bounds,
+) -> list[PlacedPart]:
+    """Nearest LEGAL stand-in for each move trial that lands on a neighbour.
+
+    ⛔⛔ **MEASURED 2026-07-30, and this is the whole reason the function
+    exists.** Instrumenting three real placement runs at the ``_is_better`` seam:
+    of the trials that would have *reduced the MST crossing count*, **107 of 108
+    were rejected for ILLEGALITY, not for being outscored** -- 99 because the
+    part would land on a neighbour, 9 for the board outline, and exactly **one**
+    because another term outweighed the gain.
+
+    ⭐ So the objective and the search agree far more often than the acceptance
+    rate suggests; the moves the objective wants are simply being *discarded*
+    rather than *placed nearby*. ``_targeted_clear_move_trials`` already does
+    exactly this for the pin-gravity path -- it was never wired to the generic
+    neighbour-centroid path, which is where the crossing-driven moves come from.
+
+    ⚠ This ADDS candidates; it never replaces one. Every original trial is still
+    offered, and the scorer still has to prefer the variant on its own merits, so
+    the failure mode is wasted evaluations rather than a worse placement.
+    """
+    occupied = _occupied_without_ref(
+        placed_parts, placed.ref, fp_bboxes, fp_geometries, constraints,
+    )
+    seen = {(round(t.x_mm, 4), round(t.y_mm, 4)) for t in trials}
+    seen.add((round(placed.x_mm, 4), round(placed.y_mm, 4)))
+    out: list[PlacedPart] = []
+    for trial in trials:
+        if not _overlaps_any(trial.x_mm, trial.y_mm, width_mm, height_mm, occupied):
+            continue  # already legal -- nothing to rescue
+        x_mm, y_mm = _find_clear_position(
+            trial.x_mm, trial.y_mm, width_mm, height_mm, occupied,
+            bounds=bounds,
+            # ⭐ Fine step and a SHORT radius on purpose: the point is to keep
+            # the crossing improvement the trial was reaching for, so a rescue
+            # that wanders far has thrown away the reason for the move.
+            step=0.5, max_radius=6.0,
+        )
+        x_mm, y_mm = _clamp_to_bounds(x_mm, y_mm, width_mm, height_mm, bounds)
+        key = (round(x_mm, 4), round(y_mm, 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(replace(placed, x_mm=x_mm, y_mm=y_mm))
+    return out
+
+
 def _targeted_clear_move_trials(
     placed_parts: list[PlacedPart],
     placed: PlacedPart,
@@ -1553,6 +1609,7 @@ def refine_placement(
     ctx=None,
     progress=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    rescue_blocked_moves: bool = False,
 ) -> RefinementResult:
     """Apply deterministic score-gated local placement adjustments.
 
@@ -1560,6 +1617,10 @@ def refine_placement(
     is the point: the refiner is where the objective's *gradient* is consumed,
     so a change made only at candidate-selection time would never steer a move.
     **Default ``"legacy"``, and on that path this is byte-identical.**
+
+    ``rescue_blocked_moves`` offers a nearest-legal stand-in for any generic move
+    trial that lands on a neighbour -- see :func:`_clear_variants` for the
+    measurement that motivates it. **Default OFF and a true no-op off.**
 
     ``progress`` (optional ``callable(str)``) is invoked at per-ref, swap-loop
     and legalization-loop boundaries for observability only. It must never
@@ -1687,13 +1748,26 @@ def refine_placement(
                 else _neighbor_centroid(ref, neighbors, placed_by_ref)
             )
             if centroid is not None:
+                ref_bounds = _bounds_for_ref(ref, constraints)
                 move_trials = _move_trials(
                     placed,
                     centroid,
                     width_mm,
                     height_mm,
-                    _bounds_for_ref(ref, constraints),
+                    ref_bounds,
                 )
+                if rescue_blocked_moves:
+                    move_trials = move_trials + _clear_variants(
+                        placed,
+                        move_trials,
+                        current_parts,
+                        fp_bboxes,
+                        fp_geometries,
+                        constraints,
+                        width_mm,
+                        height_mm,
+                        ref_bounds,
+                    )
                 best = _best_single_ref_trial(
                     current_parts,
                     current_score,
@@ -1853,6 +1927,7 @@ def refine_candidate_placement(
     ctx=None,
     progress=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    rescue_blocked_moves: bool = False,
 ) -> RefinementResult:
     result = refine_placement(
         candidate.placed_parts,
@@ -1866,6 +1941,7 @@ def refine_candidate_placement(
         ctx=ctx,
         progress=progress,
         crossing_objective=crossing_objective,
+        rescue_blocked_moves=rescue_blocked_moves,
     )
     if result.accepted_count == 0:
         return result
