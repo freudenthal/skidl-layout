@@ -43,6 +43,21 @@ CROSSING_OBJECTIVE_MST = "mst"
 CROSSING_OBJECTIVES = (CROSSING_OBJECTIVE_LEGACY, CROSSING_OBJECTIVE_SIGNAL,
                        CROSSING_OBJECTIVE_MST)
 
+#: ⭐⭐⭐ PROMOTED 2026-07-30, from ``legacy`` to ``mst``. Graded on the six-board
+#: eval set: signal crossings better on 6/6 (corpus 144 -> 89 against the human's
+#: 20) and **vias better on 6/6** (115 -> 70 against 30), router effort better on
+#: 5/6. What earned it is gate ``E0`` -- the objective and the judge are the same
+#: number, verified against the written board rather than asserted.
+#:
+#: ⛔ **This moved every placement digest in the repo, deliberately.** The old
+#: baselines are not lost: ``crossing_objective="legacy"`` still reproduces them
+#: byte for byte, pinned by ``tests/test_crossing_objective.py`` and recorded
+#: beside the new ones in ``lt3757_boost/phase0_out/phase0_metrics.json``.
+#: ⭐ Defined HERE rather than in ``engine`` so a direct ``score_placement`` call
+#: grades with the same objective the placer optimised -- two defaults would make
+#: a hand-scored placement silently incomparable with a planned one.
+DEFAULT_CROSSING_OBJECTIVE = CROSSING_OBJECTIVE_MST
+
 #: ⛔⛔ MEASURED 2026-07-30 on the six-board eval set: ``2.0`` saturates the
 #: ``20.0`` ceiling at **10 crossings**, and the star metric reads 101-499 on
 #: every board. The term is therefore a CONSTANT on 12 of 12 board-arms and
@@ -1227,7 +1242,7 @@ def score_placement(
     clearance_mm: float = 0.5,
     board_layers: int = 2,
     ctx=None,
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
 ) -> LayoutScore:
     """Full placement score.
 

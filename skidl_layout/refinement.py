@@ -19,7 +19,7 @@ from .roles import (
     pin_number,
 )
 from .scoring import (
-    CROSSING_OBJECTIVE_LEGACY,
+    DEFAULT_CROSSING_OBJECTIVE,
     LayoutScore,
     _net_ref_lists,
     score_placement,
@@ -96,7 +96,7 @@ def _score(
     clearance_mm: float,
     board_layers: int,
     ctx=None,
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
 ) -> LayoutScore:
     return score_placement(
         placed_parts,
@@ -1187,7 +1187,7 @@ def _best_single_ref_trial(
     clearance_mm: float,
     board_layers: int,
     ctx=None,
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
     if len(trials) > RANK_LIMIT:
         trials = _rank_and_limit_trials(
@@ -1247,7 +1247,7 @@ def _best_pin_gravity_trial(
     clearance_mm: float,
     board_layers: int,
     ctx=None,
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
     current_distance = math.hypot(
         placed.x_mm - target_xy[0],
@@ -1442,7 +1442,7 @@ def _legalize_one_overlap(
     position_locked: set[str],
     degrees: dict[str, int],
     ctx=None,
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
 ) -> tuple[list[PlacedPart], LayoutScore, str, str] | None:
     validation = validate(
         placed_parts,
@@ -1552,7 +1552,7 @@ def refine_placement(
     preanchored_refs: set[str] | None = None,
     ctx=None,
     progress=None,
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
 ) -> RefinementResult:
     """Apply deterministic score-gated local placement adjustments.
 
@@ -1782,6 +1782,7 @@ def refine_placement(
                     clearance_mm,
                     board_layers,
                     ctx,
+                    crossing_objective,
                 )
                 if not _is_better(current_score, trial_score):
                     continue
@@ -1851,7 +1852,7 @@ def refine_candidate_placement(
     board_layers: int = 2,
     ctx=None,
     progress=None,
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
 ) -> RefinementResult:
     result = refine_placement(
         candidate.placed_parts,

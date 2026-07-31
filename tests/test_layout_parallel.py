@@ -242,3 +242,53 @@ def test_combined_fallback_on_error(monkeypatch):
     assert any("combined parallel planning unavailable" in m for m in msgs)
     assert any("parallel refinement unavailable" in m for m in msgs)
     assert any("parallel finalize unavailable" in m for m in msgs)
+
+
+# --- the crossing objective must survive the process boundary ----------------
+
+
+@pytest.mark.parametrize(
+    "objective", ["legacy", "signal", "mst"]
+)
+def test_crossing_objective_survives_the_worker_boundary(objective):
+    """⛔⛔ A REGRESSION TEST FOR A REAL DEFECT (2026-07-30).
+
+    ``refine_candidate_worker``'s payload did not carry ``crossing_objective``
+    and ``plan_candidate_worker`` did not forward ``params.crossing_objective``,
+    so every parallel-refined candidate was scored against the module DEFAULT
+    while the parent had asked for something else.
+
+    ⭐ What made it nasty: **parallelism only engages at >= 30 parts**, so the
+    corruption hit exactly the two largest boards in the eval set and left the
+    four small ones looking perfect. It was invisible while the default and the
+    requested objective happened to agree, and surfaced the moment the default
+    was promoted. Gate ``G0`` (the legacy control against the recorded W2
+    digest) caught it; nothing in this suite would have.
+
+    The invariant: for EVERY objective, parallel must equal sequential.
+    """
+    seq = plan_layout(_circuit(), fp_bboxes=BBOXES, parallel_workers=1,
+                      crossing_objective=objective)
+    msgs: list[str] = []
+    par = plan_layout(
+        _circuit(), fp_bboxes=BBOXES, parallel_workers=2,
+        crossing_objective=objective,
+        progress=lambda m: msgs.append(m),
+    )
+    assert any("in parallel" in m for m in msgs), "parallel path did not engage"
+    assert _sig(par) == _sig(seq)
+    assert par.score.to_dict() == seq.score.to_dict()
+
+
+def test_refine_worker_payload_tolerates_a_missing_objective():
+    """⚠ The field is appended last and unpacked defensively, so a payload
+    pickled before it existed still loads rather than raising ValueError."""
+    import pickle
+
+    from skidl_layout.parallel import refine_candidate_worker
+
+    short = pickle.dumps((None, None, None, None, 0.5, 2))
+    with pytest.raises(Exception) as excinfo:
+        refine_candidate_worker(short)
+    # It must fail LATER (on the None candidate), not while unpacking the tuple.
+    assert "not enough values to unpack" not in str(excinfo.value)

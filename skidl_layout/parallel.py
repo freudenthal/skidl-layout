@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 import pickle
+
+from .scoring import DEFAULT_CROSSING_OBJECTIVE
 import shutil
 import subprocess
 import sys
@@ -104,6 +106,9 @@ def run_payloads(mode: str, payloads: dict, workers: int) -> dict:
 
 
 def refine_candidate_worker(payload: bytes) -> bytes:
+    """⚠ ``crossing_objective`` is appended LAST and unpacked defensively, so a
+    payload pickled before it existed still loads and keeps the old default."""
+    fields = pickle.loads(payload)
     (
         candidate,
         snapshot,
@@ -111,7 +116,9 @@ def refine_candidate_worker(payload: bytes) -> bytes:
         fp_geometries,
         clearance_mm,
         board_layers,
-    ) = pickle.loads(payload)
+    ) = fields[:6]
+    crossing_objective = (fields[6] if len(fields) > 6
+                          else DEFAULT_CROSSING_OBJECTIVE)
 
     from .context import LayoutContext
     from .engine import _refine_candidate_trio
@@ -126,6 +133,12 @@ def refine_candidate_worker(payload: bytes) -> bytes:
         board_layers,
         ctx,
         progress=None,
+        # ⛔⛔ Without this the worker silently refines against the DEFAULT
+        # objective while the parent asked for another one -- and because
+        # parallelism only engages at >= 30 parts, it corrupts exactly the big
+        # boards while the small ones look correct. Caught by gate G0 (the legacy
+        # control vs the recorded W2 digest) on the two 35/36-part boards.
+        crossing_objective=crossing_objective,
     )
     return pickle.dumps(candidate)
 
@@ -186,6 +199,12 @@ def plan_candidate_worker(payload: bytes) -> bytes:
         params.board_layers,
         ctx,
         progress=None,
+        # ⛔⛔ Without this the worker silently refines against the DEFAULT
+        # objective while the parent asked for another one -- and because
+        # parallelism only engages at >= 30 parts, it corrupts exactly the big
+        # boards while the small ones look correct. Caught by gate G0 (the legacy
+        # control vs the recorded W2 digest) on the two 35/36-part boards.
+        crossing_objective=params.crossing_objective,
     )
     score, validation = _posttrio_candidate_impl(candidate, snapshot, params, ctx)
     pass1_blob = pickle.dumps(candidate)  # BEFORE finalize mutates it (hazard #3)

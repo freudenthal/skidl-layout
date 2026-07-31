@@ -54,8 +54,9 @@ from .report import PlacementReport, build_placement_report
 from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_ui_grid_part
 from .routability import RoutabilityFeedback
 from .scoring import (
-    CROSSING_OBJECTIVE_LEGACY,
+    CROSSING_OBJECTIVE_MST,
     CROSSING_OBJECTIVES,
+    DEFAULT_CROSSING_OBJECTIVE,
     LayoutScore,
     score_placement,
     score_placement_quick,
@@ -233,7 +234,7 @@ class _FinalizeParams:
     power_score: bool = False
     #: Metric-validation step 1. Same defaulting rule and the same reason: this
     #: crosses the parallel-worker process boundary inside a pickled payload.
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE
 
 
 def _note_move(
@@ -1684,17 +1685,17 @@ def _resolve_power_score(power_score: bool | None, implied_by: bool = False) -> 
 
 
 def _resolve_crossing_objective(crossing_objective: str | None) -> str:
-    """Explicit kwarg > ``SKIDL_LAYOUT_CROSSING_OBJECTIVE`` > default ``legacy``.
+    """Explicit kwarg > ``SKIDL_LAYOUT_CROSSING_OBJECTIVE`` > ``mst``.
 
     Deliberately the same three-line shape as :func:`_resolve_power_score`.
     An unknown name raises rather than falling back: a typo that silently
-    selects the shipped objective would make an A/B read as "no effect".
+    selects a different objective would make an A/B read as "no effect".
     """
     value = crossing_objective
     if value is None:
         value = os.environ.get("SKIDL_LAYOUT_CROSSING_OBJECTIVE")
     if value is None or not str(value).strip():
-        return CROSSING_OBJECTIVE_LEGACY
+        return DEFAULT_CROSSING_OBJECTIVE
     value = str(value).strip().lower()
     if value not in CROSSING_OBJECTIVES:
         raise ValueError(
@@ -3882,7 +3883,7 @@ def _refine_candidate_trio(
     board_layers,
     ctx,
     progress,
-    crossing_objective: str = CROSSING_OBJECTIVE_LEGACY,
+    crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
 ):
     """Run the pass-1 refinement trio on one candidate, mutating it in place.
 
@@ -4104,6 +4105,7 @@ def _prerefine_candidates_parallel(
                     fp_geometries,
                     clearance_mm,
                     board_layers,
+                    resolved_crossing_objective,
                 )
             )
             for i in canonical_indices

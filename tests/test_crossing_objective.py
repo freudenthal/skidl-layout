@@ -1,22 +1,31 @@
-"""The opt-in signal-net crossing objective (metric-validation step 1).
+"""The crossing objective: legacy -> signal -> mst, and the promotion.
 
 ⛔⛔ **What this exists to protect.** Measured 2026-07-30 on the six-board eval
 set: the shipped crossing term ``min(crossings * 2.0, 20.0)`` saturates at **10**
-crossings while the star metric reads 101-499 on every board, so the term is a
-CONSTANT on 12 of 12 board-arms and contributes no gradient at all. The
-``"signal"`` mode drops poured nets from the count *and* rescales the term; the
-tests below pin both halves, and — first — that the default path did not move.
+crossings while the star metric reads 101-499 on every board, so the term was a
+CONSTANT on 12 of 12 board-arms and contributed no gradient at all.
+
+Three modes now exist and each is pinned here:
+
+- ``legacy`` -- the pre-2026-07-30 default. ⭐⭐ It must stay bit-reproducible
+  forever, because it is the only thing that keeps every historical placement
+  digest in the repo recoverable after the promotion.
+- ``signal`` -- plane-free star, rescaled. GRADED AND PARKED: better on 3/6,
+  worse on 2/6. Kept so the negative stays reproducible.
+- ``mst`` -- plane-free MST over PAD positions. ⭐⭐⭐ **The default since
+  2026-07-30**: crossings and vias both better on 6/6.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from skidl_layout.constraints import BoardOutline
+from skidl_layout.constraints import BoardOutline, LayoutConstraints
 from skidl_layout.engine import _resolve_crossing_objective
 from skidl_layout.geometry import FootprintGeometry, PadGeometry
 from skidl_layout.scoring import (
     CROSSING_OBJECTIVE_LEGACY,
+    DEFAULT_CROSSING_OBJECTIVE,
     CROSSING_OBJECTIVE_MST,
     CROSSING_OBJECTIVE_SIGNAL,
     _CROSSING_CAP_SIGNAL,
@@ -72,19 +81,52 @@ def _crossing_board():
 
 
 # --------------------------------------------------------------------------- #
-# 1. The default did not move
+# 1. ⭐⭐⭐ The default IS mst -- and legacy is still exactly reproducible
 # --------------------------------------------------------------------------- #
-def test_default_is_legacy_and_scores_identically():
+def test_default_is_mst_everywhere_it_is_declared():
+    """⛔ One default, in one place. Two would make a hand-scored placement
+    silently incomparable with a planned one."""
+    import inspect
+
+    from skidl_layout.refinement import refine_candidate_placement, refine_placement
+
+    assert DEFAULT_CROSSING_OBJECTIVE == CROSSING_OBJECTIVE_MST
+    for fn in (score_placement, refine_placement, refine_candidate_placement):
+        assert (inspect.signature(fn).parameters["crossing_objective"].default
+                == CROSSING_OBJECTIVE_MST)
+
+
+def test_implicit_default_scores_as_mst_not_legacy():
+    circuit, placed = _crossing_board()
+    outline = BoardOutline(100.0, 100.0)
+    geometries = _square_pad_geometries()
+
+    implicit = score_placement(placed, circuit, BBOXES, outline=outline,
+                               fp_geometries=geometries)
+    as_mst = score_placement(placed, circuit, BBOXES, outline=outline,
+                             fp_geometries=geometries,
+                             crossing_objective=CROSSING_OBJECTIVE_MST)
+    as_legacy = score_placement(placed, circuit, BBOXES, outline=outline,
+                                fp_geometries=geometries,
+                                crossing_objective=CROSSING_OBJECTIVE_LEGACY)
+    assert implicit.penalty == as_mst.penalty
+    assert implicit.penalty != as_legacy.penalty
+
+
+def test_legacy_remains_bit_reproducible_after_the_promotion():
+    """⭐⭐ The promotion moved every recorded placement digest in the repo. That
+    is only acceptable because the old baselines are still ONE KWARG AWAY -- this
+    pins that ``legacy`` was not disturbed by the swap or the promotion."""
     circuit, placed = _crossing_board()
     outline = BoardOutline(100.0, 100.0)
 
-    implicit = score_placement(placed, circuit, BBOXES, outline=outline)
-    explicit = score_placement(
-        placed, circuit, BBOXES, outline=outline,
-        crossing_objective=CROSSING_OBJECTIVE_LEGACY,
-    )
-    assert implicit.penalty == explicit.penalty
-    assert implicit.score == explicit.score
+    a = score_placement(placed, circuit, BBOXES, outline=outline,
+                        crossing_objective=CROSSING_OBJECTIVE_LEGACY)
+    b = score_placement(placed, circuit, BBOXES, outline=outline,
+                        crossing_objective=CROSSING_OBJECTIVE_LEGACY)
+    assert a.penalty == b.penalty
+    # The legacy term is still the saturated one it always was.
+    assert _crossing_term(101, CROSSING_OBJECTIVE_LEGACY) == 20.0
 
 
 def test_estimate_crossings_default_counts_plane_nets():
@@ -112,7 +154,10 @@ def test_signal_mode_lowers_the_penalty_for_the_same_placement():
     circuit, placed = _crossing_board()
     outline = BoardOutline(100.0, 100.0)
 
-    legacy = score_placement(placed, circuit, BBOXES, outline=outline)
+    legacy = score_placement(
+        placed, circuit, BBOXES, outline=outline,
+        crossing_objective=CROSSING_OBJECTIVE_LEGACY,
+    )
     signal = score_placement(
         placed, circuit, BBOXES, outline=outline,
         crossing_objective=CROSSING_OBJECTIVE_SIGNAL,
@@ -223,7 +268,10 @@ def test_mst_term_caps_only_above_the_corpus_90th_percentile():
 def test_mst_mode_is_selected_by_score_placement():
     circuit, placed = _crossing_board()
     outline = BoardOutline(100.0, 100.0)
-    legacy = score_placement(placed, circuit, BBOXES, outline=outline)
+    legacy = score_placement(
+        placed, circuit, BBOXES, outline=outline,
+        crossing_objective=CROSSING_OBJECTIVE_LEGACY,
+    )
     mst = score_placement(
         placed, circuit, BBOXES, outline=outline,
         fp_geometries=_square_pad_geometries(),
@@ -234,8 +282,11 @@ def test_mst_mode_is_selected_by_score_placement():
 
 def test_resolver_precedence_and_typo_handling(monkeypatch):
     monkeypatch.delenv("SKIDL_LAYOUT_CROSSING_OBJECTIVE", raising=False)
-    assert _resolve_crossing_objective(None) == CROSSING_OBJECTIVE_LEGACY
+    assert _resolve_crossing_objective(None) == CROSSING_OBJECTIVE_MST
     assert _resolve_crossing_objective("signal") == CROSSING_OBJECTIVE_SIGNAL
+    # ⭐ The pre-promotion objective stays reachable, which is what makes every
+    # historical placement digest reproducible.
+    assert _resolve_crossing_objective("legacy") == CROSSING_OBJECTIVE_LEGACY
     assert _resolve_crossing_objective("  SIGNAL ") == CROSSING_OBJECTIVE_SIGNAL
 
     monkeypatch.setenv("SKIDL_LAYOUT_CROSSING_OBJECTIVE", "signal")
@@ -249,13 +300,32 @@ def test_resolver_precedence_and_typo_handling(monkeypatch):
         _resolve_crossing_objective("signl")
 
 
-def test_refiner_accepts_the_objective_and_defaults_to_legacy():
-    """⭐ The refiner is where the gradient is consumed; a change made only at
-    candidate-selection time would never steer a move."""
-    import inspect
+def test_refiner_threads_the_objective_into_every_trial_score(monkeypatch):
+    """⭐⭐ The refiner is where the gradient is consumed, so an objective that
+    reached only candidate selection would never steer a move. This asserts the
+    value arrives at EVERY trial score, not just the first."""
+    from skidl_layout import refinement
 
-    from skidl_layout.refinement import refine_candidate_placement, refine_placement
+    circuit, placed = _crossing_board()
+    seen: list[str] = []
+    real = refinement.score_placement
 
-    for fn in (refine_placement, refine_candidate_placement):
-        param = inspect.signature(fn).parameters["crossing_objective"]
-        assert param.default == CROSSING_OBJECTIVE_LEGACY
+    def _spy(*args, **kwargs):
+        seen.append(kwargs.get("crossing_objective"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(refinement, "score_placement", _spy)
+    refinement.refine_placement(
+        placed, circuit, BBOXES,
+        constraints=LayoutConstraints(outline=BoardOutline(100.0, 100.0)),
+        crossing_objective=CROSSING_OBJECTIVE_LEGACY,
+    )
+    assert seen, "the refiner scored nothing at all"
+    assert set(seen) == {CROSSING_OBJECTIVE_LEGACY}
+
+    seen.clear()
+    refinement.refine_placement(
+        placed, circuit, BBOXES,
+        constraints=LayoutConstraints(outline=BoardOutline(100.0, 100.0)),
+    )
+    assert set(seen) == {CROSSING_OBJECTIVE_MST}, "the default must reach trials"
