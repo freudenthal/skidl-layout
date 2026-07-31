@@ -19,9 +19,10 @@ from .roles import (
     is_nc_net,
     is_bulk_cap,
     is_ui_grid_part,
+    part_pin_nets_by_number,
     pin_net_names,
 )
-from .ratnest import is_plane_net
+from .ratnest import PadPoint, count_crossings, is_plane_net, net_airwires
 from .validator import validate
 from .writer import PlacedPart
 
@@ -32,8 +33,15 @@ from .writer import PlacedPart
 CROSSING_OBJECTIVE_LEGACY = "legacy"
 #: Plane nets excluded from the crossing count, and the term rescaled so it is
 #: not clipped. ⛔ The two halves are inseparable -- see ``_crossing_term``.
+#: ⚠ GRADED AND PARKED: it regressed 2 of 6 boards, because un-saturating the
+#: term gave the STAR PROXY authority where the proxy disagrees with the truth.
+#: Kept only so the negative is reproducible; ``mst`` is its replacement.
 CROSSING_OBJECTIVE_SIGNAL = "signal"
-CROSSING_OBJECTIVES = (CROSSING_OBJECTIVE_LEGACY, CROSSING_OBJECTIVE_SIGNAL)
+#: ⭐⭐ Plane-free MST over PAD positions -- the metric every judge in this repo
+#: already measures (``ratnest.analyse_board``), now computed at placement time.
+CROSSING_OBJECTIVE_MST = "mst"
+CROSSING_OBJECTIVES = (CROSSING_OBJECTIVE_LEGACY, CROSSING_OBJECTIVE_SIGNAL,
+                       CROSSING_OBJECTIVE_MST)
 
 #: ⛔⛔ MEASURED 2026-07-30 on the six-board eval set: ``2.0`` saturates the
 #: ``20.0`` ceiling at **10 crossings**, and the star metric reads 101-499 on
@@ -52,6 +60,94 @@ _CROSSING_GAIN_LEGACY, _CROSSING_CAP_LEGACY = 2.0, 20.0
 _CROSSING_GAIN_SIGNAL, _CROSSING_CAP_SIGNAL = 0.15, 20.0
 
 
+#: MST mode. Derived the same way and from the same 132 board-instances, but
+#: against the MST-over-pads distribution rather than the star one, because the
+#: two are on completely different scales: plane-free MST signal crossings run
+#: **0-136 with a 90th percentile of 85** (the star metric's were 0-242, p90
+#: 138), so ``20.0 / 85 ~= 0.235`` puts the ceiling at the same percentile.
+#: ⭐ The worst AUTO or HAND placement in the corpus is 42 -> a term of 9.9,
+#: less than half the cap, so the term is live across the whole range a search
+#: traverses and only a bad random scatter clips.
+_CROSSING_GAIN_MST, _CROSSING_CAP_MST = 0.235, 20.0
+
+
+def _placement_pad_points(placed_parts, circuit, fp_geometries) -> list[PadPoint]:
+    """Every net-carrying pad of a *planned* placement, in board coordinates.
+
+    ⭐⭐ The point of this function is that the objective and the judge stop
+    measuring different things. ``ratnest.read_pad_points`` does exactly this
+    for a written ``.kicad_pcb``; this does it for a placement that has not been
+    written yet, from the same two sources the writer uses --
+    ``roles.part_pin_nets_by_number`` for pad->net and
+    ``FootprintGeometry.pad_world_centers`` for pad->position.
+
+    ⛔ **Ordering is load-bearing.** ``ratnest.mst_edges`` breaks ties on
+    ``(distance, index)``, so the caller must supply a stable point order or the
+    tree -- and therefore the crossing count -- becomes input-order dependent.
+    This reproduces ``analyse_board``'s order exactly: refs sorted, each ref's
+    pads sorted by ``(ref, pad)`` as STRINGS (so ``"10"`` sorts before ``"2"``,
+    matching ``read_pad_points``).
+
+    ⚠ A part with no footprint geometry falls back to its centroid for every
+    pad. That is the pre-MST behaviour for that part and it is silent: geometry
+    is missing only when the footprint could not be loaded, which
+    ``validate``/``score_placement`` already report on their own terms.
+    """
+    parts_by_ref = {
+        str(getattr(part, "ref", "") or ""): part
+        for part in (getattr(circuit, "parts", []) or [])
+    }
+    pads_by_ref: dict[str, list[PadPoint]] = {}
+    for placed in placed_parts:
+        part = parts_by_ref.get(placed.ref)
+        if part is None:
+            continue
+        pin_nets = part_pin_nets_by_number(part)
+        if not pin_nets:
+            continue
+        geometry = (fp_geometries or {}).get(placed.footprint)
+        centers = geometry.pad_world_centers(placed) if geometry is not None else {}
+        points = []
+        for pad_number, net_name in pin_nets.items():
+            x_mm, y_mm = centers.get(pad_number, (placed.x_mm, placed.y_mm))
+            points.append(PadPoint(ref=placed.ref, pad=pad_number,
+                                   net=net_name, x=x_mm, y=y_mm))
+        if points:
+            pads_by_ref[placed.ref] = sorted(points, key=lambda p: (p.ref, p.pad))
+
+    ordered: list[PadPoint] = []
+    for ref in sorted(pads_by_ref):
+        ordered.extend(pads_by_ref[ref])
+    return ordered
+
+
+def _mst_crossings(placed_parts, circuit, fp_geometries,
+                   *, exclude_plane_nets: bool = True) -> int:
+    """Plane-free MST-over-pads crossings for a planned placement.
+
+    ⭐ Byte-for-byte the number ``RatNest.signal_crossings`` reports for the same
+    placement once written: same pad points, same per-net MST, same
+    ``count_crossings`` predicate (skip same-net, skip shared endpoint).
+    ⭐⭐ That equivalence is the entire justification for the swap, so it is
+    **gated on real boards** rather than on fixtures -- gate ``E0`` of
+    ``skidl-eda/canaries/grade_crossing_objective.py`` places each board and
+    asserts this function against ``analyse_board`` on the ``.kicad_pcb`` it
+    wrote. The unit tests here cover ordering, plane filtering and the fallback.
+    """
+    if circuit is None:
+        return 0
+    by_net: dict[str, list[PadPoint]] = {}
+    for point in _placement_pad_points(placed_parts, circuit, fp_geometries):
+        if exclude_plane_nets and is_plane_net(point.net):
+            continue
+        by_net.setdefault(point.net, []).append(point)
+
+    wires = []
+    for net in sorted(by_net):
+        wires.extend(net_airwires(by_net[net], net))
+    return count_crossings(wires)
+
+
 def _crossing_term(crossing_count: int, crossing_objective: str) -> float:
     """The crossing penalty contribution, per objective mode.
 
@@ -65,6 +161,8 @@ def _crossing_term(crossing_count: int, crossing_objective: str) -> float:
     ``VOUT`` 55 crossings against ``SW`` 13 for the first signal net). Plane-free,
     the same metric ranks the human's board better on **6 of 6**.
     """
+    if crossing_objective == CROSSING_OBJECTIVE_MST:
+        return min(crossing_count * _CROSSING_GAIN_MST, _CROSSING_CAP_MST)
     if crossing_objective == CROSSING_OBJECTIVE_SIGNAL:
         return min(crossing_count * _CROSSING_GAIN_SIGNAL, _CROSSING_CAP_SIGNAL)
     return min(crossing_count * _CROSSING_GAIN_LEGACY, _CROSSING_CAP_LEGACY)
@@ -1169,12 +1267,15 @@ def score_placement(
     outline_metrics = _outline_utilization_metrics(placed_parts, fp_bboxes, outline)
     total_hpwl = _total_hpwl(placed_parts, circuit, ctx)
     weighted_hpwl = _weighted_hpwl(placed_parts, circuit, ctx)
-    crossing_count = _estimate_crossings(
-        placed_parts,
-        circuit,
-        ctx,
-        exclude_plane_nets=(crossing_objective == CROSSING_OBJECTIVE_SIGNAL),
-    )
+    if crossing_objective == CROSSING_OBJECTIVE_MST:
+        crossing_count = _mst_crossings(placed_parts, circuit, fp_geometries)
+    else:
+        crossing_count = _estimate_crossings(
+            placed_parts,
+            circuit,
+            ctx,
+            exclude_plane_nets=(crossing_objective == CROSSING_OBJECTIVE_SIGNAL),
+        )
     pin_escape_score = _pin_escape_congestion(placed_parts, circuit)
     congestion_map = build_congestion_map(
         placed_parts,

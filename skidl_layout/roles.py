@@ -203,6 +203,38 @@ def _pin_count(part) -> int:
         return len(getattr(part, "pins", []) or [])
 
 
+def pin_number(pin, index: int) -> str:
+    """The pad number a pin lands on. ⚠ Moved here from ``refinement`` so
+    ``scoring`` can reach it without importing ``refinement`` (which imports
+    ``scoring``). ``refinement._pin_number`` remains as an alias."""
+    for attr in ("num", "number", "pin_number", "name"):
+        value = getattr(pin, attr, None)
+        if value not in (None, ""):
+            return str(value).strip('"')
+    return str(index + 1)
+
+
+def pin_net_name(pin) -> str | None:
+    net = getattr(pin, "net", None)
+    name = getattr(net, "name", None)
+    return str(name) if name else None
+
+
+def part_pin_nets_by_number(part) -> dict[str, str]:
+    """``{pad_number: net_name}`` for one part.
+
+    ⭐ This is the SAME mapping ``writer.py`` uses to stamp ``(net ...)`` onto
+    pads, so an objective built on it sees the pad/net structure the judge will
+    later read back off the written board.
+    """
+    pin_nets: dict[str, str] = {}
+    for index, pin in enumerate(getattr(part, "pins", []) or []):
+        name = pin_net_name(pin)
+        if name:
+            pin_nets[pin_number(pin, index)] = name
+    return pin_nets
+
+
 def pin_net_names(part) -> list[str]:
     names = []
     for pin in getattr(part, "pins", []) or []:

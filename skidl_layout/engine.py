@@ -4405,7 +4405,7 @@ def plan_layout(
     placement's gap 0.540 -> 0.050 mm. Ships OFF (power-layout Phase 13, E3b).
 
     ``crossing_objective`` selects the placement objective's crossing term:
-    ``"legacy"`` (the shipped one, and the default) or ``"signal"``.
+    ``"legacy"`` (the shipped one, and the default), ``"signal"`` or ``"mst"``.
     ``SKIDL_LAYOUT_CROSSING_OBJECTIVE`` is the env default; an explicit kwarg
     wins; an unknown name raises. **Default is a true no-op** — every placement
     is byte-identical to before the parameter existed.
@@ -4417,6 +4417,13 @@ def plan_layout(
     quality signal is HPWL. ``"signal"`` drops poured nets from the count and
     rescales the term so it is not clipped; see ``scoring._crossing_term`` for
     why those two halves cannot be separated.
+
+    ⚠ **``"signal"`` is graded and PARKED** — it regressed 2 of 6 boards, because
+    un-saturating the term gave the *star* proxy real authority on the boards
+    where that proxy disagrees with the truth. ⭐ **``"mst"`` is its
+    replacement**: the same plane-free, rescaled term, but computed as an MST
+    over real PAD positions — the identical number ``ratnest.analyse_board``
+    reports, so the objective and the judge finally measure one thing.
 
     ``parallel_workers`` controls refining the unique candidates' pass-1 trio
     (orientation/decap/placement) and their post-anchor finalize concurrently in

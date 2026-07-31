@@ -8,7 +8,16 @@ from .candidates import PlacementCandidate
 from .constraints import LayoutConstraints
 from .geometry import FootprintGeometry, PadGeometry, transform_point
 from .placer import _find_clear_position, _overlaps_any
-from .roles import GND_NET_RE, POWER_NET_RE, classify_parts, is_nc_net, is_ui_grid_part
+from .roles import (
+    GND_NET_RE,
+    POWER_NET_RE,
+    classify_parts,
+    is_nc_net,
+    is_ui_grid_part,
+    part_pin_nets_by_number,
+    pin_net_name,
+    pin_number,
+)
 from .scoring import (
     CROSSING_OBJECTIVE_LEGACY,
     LayoutScore,
@@ -220,27 +229,13 @@ def _locked_rotation_refs(constraints: LayoutConstraints | None) -> set[str]:
     return locked
 
 
-def _pin_number(pin, index: int) -> str:
-    for attr in ("num", "number", "pin_number", "name"):
-        value = getattr(pin, attr, None)
-        if value not in (None, ""):
-            return str(value).strip('"')
-    return str(index + 1)
+# Defined in roles.py so scoring can reach them without importing refinement
+# (which imports scoring); kept as module-level aliases for existing callers.
+_pin_number = pin_number
+_pin_net_name = pin_net_name
 
 
-def _pin_net_name(pin) -> str | None:
-    net = getattr(pin, "net", None)
-    name = getattr(net, "name", None)
-    return str(name) if name else None
-
-
-def _part_pin_nets_by_number(part) -> dict[str, str]:
-    pin_nets: dict[str, str] = {}
-    for index, pin in enumerate(getattr(part, "pins", []) or []):
-        net_name = _pin_net_name(pin)
-        if net_name:
-            pin_nets[_pin_number(pin, index)] = net_name
-    return pin_nets
+_part_pin_nets_by_number = part_pin_nets_by_number
 
 
 def _part_net_names(part) -> set[str]:
