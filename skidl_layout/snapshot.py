@@ -157,7 +157,15 @@ def _decouples_target(part):
 
 #: The ``Part.fields`` keys the layout engine reads. Kept to a named allowlist
 #: so a board with a hundred BOM fields does not bloat every pickled snapshot.
-_SNAPSHOT_FIELDS = ("escape_room",)
+#:
+#: ⛔⛔ ``layout_cell`` (``cells_place.CELL_FIELD``, the ``mark_cell``
+#: declaration) is here for the SAME reason ``escape_room`` is, and the cost of
+#: forgetting it is worse: a worker rebuilds its context from a snapshot, so an
+#: untracked field is silently lost, and **parallelism engages only at >= 30
+#: parts** -- a missing entry would corrupt exactly the two biggest boards and
+#: leave the four small ones perfect. That is the precise shape of the
+#: ``crossing_objective`` worker defect 1100 tests did not catch.
+_SNAPSHOT_FIELDS = ("escape_room", "layout_cell")
 
 
 def _layout_fields(part):

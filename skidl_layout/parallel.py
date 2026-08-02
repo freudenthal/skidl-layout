@@ -17,7 +17,13 @@ from __future__ import annotations
 import os
 import pickle
 
-from .scoring import DEFAULT_CROSSING_OBJECTIVE
+from .scoring import (
+    DEFAULT_CROSSING_OBJECTIVE,
+    DEFAULT_HPWL_NETS,
+    DEFAULT_HPWL_OBJECTIVE,
+    DEFAULT_HPWL_WEIGHTS,
+    DEFAULT_OVERLAP_OBJECTIVE,
+)
 import shutil
 import subprocess
 import sys
@@ -106,8 +112,11 @@ def run_payloads(mode: str, payloads: dict, workers: int) -> dict:
 
 
 def refine_candidate_worker(payload: bytes) -> bytes:
-    """⚠ ``crossing_objective`` is appended LAST and unpacked defensively, so a
-    payload pickled before it existed still loads and keeps the old default."""
+    """⚠ ``crossing_objective``, then ``rescue_blocked_moves``, then
+    ``hpwl_objective``, then ``hpwl_nets``, then ``hpwl_weights``, then
+    ``overlap_objective`` are appended LAST and unpacked defensively, so a
+    payload pickled before any of them existed still loads and keeps the old
+    default."""
     fields = pickle.loads(payload)
     (
         candidate,
@@ -120,6 +129,12 @@ def refine_candidate_worker(payload: bytes) -> bytes:
     crossing_objective = (fields[6] if len(fields) > 6
                           else DEFAULT_CROSSING_OBJECTIVE)
     rescue_blocked_moves = fields[7] if len(fields) > 7 else False
+    hpwl_objective = (fields[8] if len(fields) > 8
+                      else DEFAULT_HPWL_OBJECTIVE)
+    hpwl_nets = fields[9] if len(fields) > 9 else DEFAULT_HPWL_NETS
+    hpwl_weights = fields[10] if len(fields) > 10 else DEFAULT_HPWL_WEIGHTS
+    overlap_objective = (fields[11] if len(fields) > 11
+                         else DEFAULT_OVERLAP_OBJECTIVE)
 
     from .context import LayoutContext
     from .engine import _refine_candidate_trio
@@ -141,6 +156,10 @@ def refine_candidate_worker(payload: bytes) -> bytes:
         # control vs the recorded W2 digest) on the two 35/36-part boards.
         crossing_objective=crossing_objective,
         rescue_blocked_moves=rescue_blocked_moves,
+        hpwl_objective=hpwl_objective,
+        hpwl_nets=hpwl_nets,
+        hpwl_weights=hpwl_weights,
+        overlap_objective=overlap_objective,
     )
     return pickle.dumps(candidate)
 
@@ -208,6 +227,10 @@ def plan_candidate_worker(payload: bytes) -> bytes:
         # control vs the recorded W2 digest) on the two 35/36-part boards.
         crossing_objective=params.crossing_objective,
         rescue_blocked_moves=params.rescue_blocked_moves,
+        hpwl_objective=params.hpwl_objective,
+        hpwl_nets=params.hpwl_nets,
+        hpwl_weights=params.hpwl_weights,
+        overlap_objective=params.overlap_objective,
     )
     score, validation = _posttrio_candidate_impl(candidate, snapshot, params, ctx)
     pass1_blob = pickle.dumps(candidate)  # BEFORE finalize mutates it (hazard #3)

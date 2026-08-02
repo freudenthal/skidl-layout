@@ -86,6 +86,275 @@ _CROSSING_GAIN_SIGNAL, _CROSSING_CAP_SIGNAL = 0.15, 20.0
 _CROSSING_GAIN_MST, _CROSSING_CAP_MST = 0.235, 20.0
 
 
+# --------------------------------------------------------------------------- #
+# The HPWL objective -- metric-validation step 2. OFF by default.
+# --------------------------------------------------------------------------- #
+#: The shipped behaviour: each net's bounding box is taken over the **centres**
+#: of the parts it touches.
+HPWL_OBJECTIVE_CENTROID = "centroid"
+#: ⭐⭐ The same bounding box taken over **pad positions** -- the points
+#: ``_placement_pad_points`` already produces for the MST crossing objective and
+#: ``ratnest.read_pad_points`` reads back off a written board.
+HPWL_OBJECTIVE_PADS = "pads"
+HPWL_OBJECTIVES = (HPWL_OBJECTIVE_CENTROID, HPWL_OBJECTIVE_PADS)
+
+#: ⛔ **Default unchanged, and on this path every HPWL number is byte-identical
+#: to before the parameter existed.** Defined HERE rather than in ``engine`` for
+#: the same reason ``DEFAULT_CROSSING_OBJECTIVE`` is: two defaults would make a
+#: directly-scored placement silently incomparable with a planned one.
+DEFAULT_HPWL_OBJECTIVE = HPWL_OBJECTIVE_CENTROID
+
+
+# --------------------------------------------------------------------------- #
+# The HPWL net SET -- metric-validation step 3. OFF by default.
+# --------------------------------------------------------------------------- #
+#: The shipped behaviour: **every** net contributes to both HPWL terms.
+HPWL_NETS_ALL = "all"
+#: ⭐⭐ Nets this stack **pours** rather than routes leave the term, using the
+#: same :func:`ratnest.is_plane_net` predicate ``_mst_crossings`` already
+#: consumes. ⛔⛔ **The two terms had different net vocabularies and nobody had
+#: named it:** the MST promotion made the crossing term plane-free over pads and
+#: left HPWL all-nets -- and HPWL is the term with all the gradient. Measured on
+#: the six frozen control placements 2026-08-01: plane nets carry **37-68 % of
+#: the *weighted* HPWL** (``_net_weight`` gives GND 2.0, POWER 1.6, and a plane
+#: net touches nearly every part), so on 3 of 6 boards the placer's only
+#: continuous quality signal is majority-plane -- compaction of copper that gets
+#: **poured, not routed**.
+HPWL_NETS_PLANE_FREE = "plane_free"
+HPWL_NET_SETS = (HPWL_NETS_ALL, HPWL_NETS_PLANE_FREE)
+
+#: ⛔ Same defaulting discipline as the two objectives above, and for the same
+#: reason: a second default would make a directly-scored placement silently
+#: incomparable with a planned one.
+DEFAULT_HPWL_NETS = HPWL_NETS_ALL
+
+
+# --------------------------------------------------------------------------- #
+# The plane-net WEIGHT -- metric-validation step 4. OFF by default.
+# --------------------------------------------------------------------------- #
+#: ⭐⭐ **The same axis as ``hpwl_nets``, at a smaller dose**, and that is the
+#: whole point. Measured 2026-08-01 on nine frozen control placements:
+#: ``hpwl_nets="plane_free"`` makes :func:`_weighted_hpwl` a **byte-identical
+#: duplicate** of :func:`_total_hpwl` on 9 of 9 boards, because the only weights
+#: :func:`_net_weight` ever returns above 1.0 on this corpus are the two plane
+#: ones (a power-converter board carries no USB, clock or crystal net). So
+#: ``_net_weight`` **IS** the plane predicate wearing different clothes, "keep"
+#: and "drop" are the mildest and most extreme dose of ONE lever, and the
+#: interesting doses are the ones in between.
+#:
+#: ⭐⭐ **And the two numbers can move independently, which removal cannot
+#: express.** ``power._strategy`` gives ground ``pour``/``plane`` and gives a
+#: supply rail ``trunk``/``wide_trunk``, so ``VIN``/``VOUT``/``VCC`` are named
+#: plane nets that get **routed as tracks**; on ``lt3844_buck``
+#: ``ratnest.is_plane_net`` covers 55.9 % of pins where the poured set covers
+#: 32.4 %. ``trace_aware`` is that finding as a dose: the *poured* ground stops
+#: being optimised, the *trunked* supply keeps its weight.
+#:
+#: ⛔ **Only the two plane coefficients move.** The 1.5 signal-token weight
+#: matches nothing on this corpus, so changing it would be risk with no
+#: measurable effect.
+HPWL_WEIGHTS: dict[str, tuple[float, float]] = {
+    # dose            (GND, POWER)
+    "legacy": (2.0, 1.6),        # today, and the control
+    "light": (1.0, 1.0),         # a plane net counts, but no more than a signal
+    "quarter": (0.5, 0.5),       # planes present but not dominant
+    "trace_aware": (0.5, 1.6),   # poured ground down, trunked supply unchanged
+}
+HPWL_WEIGHT_DOSES = tuple(HPWL_WEIGHTS)
+
+#: ⛔ Fifth application of the same defaulting discipline, and the fifth
+#: identical reason: two defaults would make a directly-scored placement
+#: silently incomparable with a planned one.
+DEFAULT_HPWL_WEIGHTS = "legacy"
+
+
+#: The shipped behaviour: a COUNT of overlapping pairs at 25.0 points each.
+OVERLAP_OBJECTIVE_COUNT = "count"
+#: ⭐ Depth-graded: **equal to the binary term at full penetration** and
+#: continuous below it, so the barrier is never weakened -- only the *way in* to
+#: it acquires a gradient.
+OVERLAP_OBJECTIVE_AREA = "area"
+OVERLAP_OBJECTIVES = (OVERLAP_OBJECTIVE_COUNT, OVERLAP_OBJECTIVE_AREA)
+
+#: ⛔ Sixth application of the same defaulting discipline, declared **in
+#: ``scoring``** rather than ``engine`` for the same reason
+#: :data:`DEFAULT_HPWL_NETS` is: two defaults would make a directly-scored
+#: placement silently incomparable with a planned one.
+DEFAULT_OVERLAP_OBJECTIVE = OVERLAP_OBJECTIVE_COUNT
+
+#: The points one fully-interpenetrating pair costs, under **both** objectives.
+#: ⛔ Pulled out of the two ``penalty`` lines so the equality at ``unit == 1``
+#: is a shared constant rather than two literals that could drift apart.
+OVERLAP_PAIR_PENALTY = 25.0
+
+
+def _overlap_term(
+    validation,
+    clearance_mm: float,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
+) -> float:
+    """The overlap contribution to ``penalty``. Default = the shipped count.
+
+    ``"count"`` is ``len(validation.overlaps) * 25.0`` -- byte-identical to the
+    line it replaces, and the arithmetic is deliberately the *same expression*
+    rather than a re-derivation.
+
+    ``"area"`` grades each overlapping pair by how far it has penetrated::
+
+        depth(a, b) = max(0.0, clearance_mm - _pair_gap(a, b))   # 0 at threshold
+        unit(a, b)  = min(depth(a, b) / clearance_mm, 1.0)       # 0..1
+        term        = 25.0 * SUM over overlapping pairs of unit(a, b)
+
+    ⭐⭐⭐ **Why this shape and not a bigger one.** ``unit`` saturates at 1.0, so
+    a fully-interpenetrating pair costs **exactly** what it costs today. The
+    change is strictly a *refinement below* the existing cost: it can never make
+    an illegal placement cheaper than the count already made it, only
+    distinguish a 0.01 mm graze from a 3 mm interpenetration on the way out.
+
+    ⛔⛔ **A pair with no AABB gap is charged the FULL 1.0.**
+    :func:`~skidl_layout.validator.overlap_gaps` returns ``None`` for
+    through-board pad collisions (which live on *opposite* sides of the board,
+    where a signed AABB separation is meaningless) and for a hand-built
+    ``ValidationResult`` with no index. Charging those less would make a real
+    pad collision cheaper than it is today, which is the one thing this term is
+    forbidden to do.
+
+    ⛔⛔ **This does not touch ``ok``.** Both :attr:`ValidationResult.ok` and
+    :attr:`LayoutScore.ok` stay boolean and stay keyed off ``overlaps`` being
+    non-empty. A depth grader must never make an illegal board *legal*; it may
+    only change which illegal board the search prefers on the way out of
+    illegality.
+
+    ⚠ **And it is very likely NOT the whole story, which is measured rather than
+    guessed.** ``penalty`` is the LAST thing the search consults --
+    ``refinement._is_better`` is lexicographic on ``_hard_count`` and reaches
+    the penalty comparison on only 48.9-61.3 % of its calls (WS-Z1, six power
+    boards), of which 26.0-48.1 % have an illegal side. That fraction is this
+    term's entire reachable surface.
+    """
+    pairs = validation.overlaps
+    if overlap_objective != OVERLAP_OBJECTIVE_AREA:
+        return len(pairs) * OVERLAP_PAIR_PENALTY
+    if not pairs:
+        return 0.0
+
+    from .validator import overlap_gaps
+
+    if clearance_mm <= 0.0:
+        return len(pairs) * OVERLAP_PAIR_PENALTY
+    total = 0.0
+    for _ref_a, _ref_b, gap in overlap_gaps(validation):
+        if gap is None:
+            total += 1.0
+            continue
+        total += min(max(0.0, clearance_mm - gap) / clearance_mm, 1.0)
+    return total * OVERLAP_PAIR_PENALTY
+
+
+def _weight_pair(hpwl_weights) -> tuple[float, float]:
+    """``(gnd, power)`` from a dose NAME or an already-resolved pair.
+
+    ⭐ Accepting both is what lets :func:`_weighted_hpwl` resolve once and hand
+    the pair down its inner loop without re-hashing a dict per net, while every
+    caller that has only the name (and every existing one-argument call to
+    :func:`_net_weight`) keeps working unchanged.
+    """
+    if isinstance(hpwl_weights, str):
+        pair = HPWL_WEIGHTS.get(hpwl_weights)
+        if pair is None:
+            raise ValueError(
+                f"unknown hpwl_weights {hpwl_weights!r}; "
+                f"expected one of {', '.join(HPWL_WEIGHT_DOSES)}"
+            )
+        return pair
+    gnd, power = hpwl_weights
+    return (float(gnd), float(power))
+
+
+def _net_pad_extents(pad_points) -> dict[str, list]:
+    """``{net: [min_x, max_x, min_y, max_y, {refs}]}`` over pad points.
+
+    ⭐ One pass, shared by both HPWL terms. ``refs`` is carried because the
+    centroid terms require a net to touch **two distinct placed parts** before
+    it contributes, and dropping that condition would smuggle a second change
+    (a wider net set) into a plan that is allowed exactly one.
+    """
+    extents: dict[str, list] = {}
+    for point in pad_points:
+        entry = extents.get(point.net)
+        if entry is None:
+            extents[point.net] = [point.x, point.x, point.y, point.y,
+                                  {point.ref}]
+            continue
+        if point.x < entry[0]:
+            entry[0] = point.x
+        if point.x > entry[1]:
+            entry[1] = point.x
+        if point.y < entry[2]:
+            entry[2] = point.y
+        if point.y > entry[3]:
+            entry[3] = point.y
+        entry[4].add(point.ref)
+    return extents
+
+
+def _hpwl_by_net(
+    placed_parts: list[PlacedPart],
+    circuit,
+    ctx=None,
+    *,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    pad_extents: dict[str, list] | None = None,
+) -> list[tuple[str, float]]:
+    """``(net, half-perimeter)`` for every net that contributes, per mode.
+
+    ⭐ **The single source of truth for both HPWL terms.** ``_total_hpwl`` and
+    ``_weighted_hpwl`` differ only in the per-net weight, and having them walk
+    the connectivity twice was already wasteful; in ``"pads"`` mode it would
+    also mean building the pad-extent map twice per score call.
+
+    ⛔ **``hpwl_objective`` changes the POINTS; ``hpwl_nets`` changes the SET.**
+    They are orthogonal and compose, which is why they are two parameters and
+    not one enum: the pads arm was graded and parked with the plane nets still
+    in, and its own measured mechanism was that plane-exactness grows the plane
+    box. Under ``"plane_free"`` the *membership* rule is otherwise unchanged --
+    ``_net_ref_lists``' "at least two distinct placed refs" still applies, and a
+    net whose pins all land on one part still contributes nothing.
+    """
+    if circuit is None:
+        return []
+
+    nets = _net_ref_lists(circuit, ctx)
+    plane_free = hpwl_nets == HPWL_NETS_PLANE_FREE
+    if hpwl_objective == HPWL_OBJECTIVE_PADS:
+        extents = pad_extents or {}
+        result = []
+        for name, _refs in nets:
+            if plane_free and is_plane_net(name):
+                continue
+            entry = extents.get(name)
+            if entry is None or len(entry[4]) < 2:
+                continue
+            result.append((name, (entry[1] - entry[0]) + (entry[3] - entry[2])))
+        return result
+
+    pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
+    result = []
+    for name, refs in nets:
+        if plane_free and is_plane_net(name):
+            continue
+        xs, ys = [], []
+        for ref in refs:
+            pos = pos_by_ref.get(ref)
+            if pos is not None:
+                xs.append(pos[0])
+                ys.append(pos[1])
+        if len(xs) >= 2:
+            result.append((name, (max(xs) - min(xs)) + (max(ys) - min(ys))))
+    return result
+
+
 def _placement_pad_points(placed_parts, circuit, fp_geometries) -> list[PadPoint]:
     """Every net-carrying pad of a *planned* placement, in board coordinates.
 
@@ -137,7 +406,8 @@ def _placement_pad_points(placed_parts, circuit, fp_geometries) -> list[PadPoint
 
 
 def _mst_crossings(placed_parts, circuit, fp_geometries,
-                   *, exclude_plane_nets: bool = True) -> int:
+                   *, exclude_plane_nets: bool = True,
+                   pad_points: list[PadPoint] | None = None) -> int:
     """Plane-free MST-over-pads crossings for a planned placement.
 
     ⭐ Byte-for-byte the number ``RatNest.signal_crossings`` reports for the same
@@ -151,8 +421,10 @@ def _mst_crossings(placed_parts, circuit, fp_geometries,
     """
     if circuit is None:
         return 0
+    if pad_points is None:
+        pad_points = _placement_pad_points(placed_parts, circuit, fp_geometries)
     by_net: dict[str, list[PadPoint]] = {}
-    for point in _placement_pad_points(placed_parts, circuit, fp_geometries):
+    for point in pad_points:
         if exclude_plane_nets and is_plane_net(point.net):
             continue
         by_net.setdefault(point.net, []).append(point)
@@ -324,29 +596,37 @@ def _net_ref_lists(circuit, ctx=None) -> list[tuple[str, list[str]]]:
     return result
 
 
-def _total_hpwl(placed_parts: list[PlacedPart], circuit, ctx=None) -> float:
-    if circuit is None:
-        return 0.0
-
-    pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
-    total = 0.0
-    for _name, refs in _net_ref_lists(circuit, ctx):
-        xs, ys = [], []
-        for ref in refs:
-            pos = pos_by_ref.get(ref)
-            if pos is not None:
-                xs.append(pos[0])
-                ys.append(pos[1])
-        if len(xs) >= 2:
-            total += (max(xs) - min(xs)) + (max(ys) - min(ys))
-    return total
+def _total_hpwl(
+    placed_parts: list[PlacedPart],
+    circuit,
+    ctx=None,
+    *,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    pad_extents: dict[str, list] | None = None,
+) -> float:
+    return sum(hpwl for _name, hpwl in _hpwl_by_net(
+        placed_parts, circuit, ctx,
+        hpwl_objective=hpwl_objective, hpwl_nets=hpwl_nets,
+        pad_extents=pad_extents))
 
 
-def _net_weight(name: str) -> float:
+def _net_weight(name: str, hpwl_weights=DEFAULT_HPWL_WEIGHTS) -> float:
+    """The per-net multiplier :func:`_weighted_hpwl` applies.
+
+    ⛔ **There are FOUR ``_net_weight`` functions in this package** --
+    ``refinement`` (GND 2.0 / POWER 1.7, feeding the move generator's neighbour
+    centroid), ``congestion`` (1.8 / 1.5) and ``orientation`` (2.4 / 2.0) each
+    carry their own, with four different sets of numbers and no shared
+    definition. **This one, and only this one, is the objective's.** The others
+    are separate consumers with separate jobs and are deliberately untouched;
+    see :data:`HPWL_WEIGHTS`.
+    """
+    gnd_weight, power_weight = _weight_pair(hpwl_weights)
     if GND_NET_RE.match(name):
-        return 2.0
+        return gnd_weight
     if POWER_NET_RE.match(name):
-        return 1.6
+        return power_weight
     if any(token in name.upper() for token in ("USB", "D+", "D-", "CLK", "XTAL")):
         return 1.5
     return 1.0
@@ -463,23 +743,23 @@ def _select_primary_owner_ref(
     return min(candidates)[-1]
 
 
-def _weighted_hpwl(placed_parts: list[PlacedPart], circuit, ctx=None) -> float:
-    if circuit is None:
-        return 0.0
-
-    pos_by_ref = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
-    total = 0.0
-    for name, refs in _net_ref_lists(circuit, ctx):
-        xs, ys = [], []
-        for ref in refs:
-            pos = pos_by_ref.get(ref)
-            if pos is not None:
-                xs.append(pos[0])
-                ys.append(pos[1])
-        if len(xs) >= 2:
-            hpwl = (max(xs) - min(xs)) + (max(ys) - min(ys))
-            total += hpwl * _net_weight(name)
-    return total
+def _weighted_hpwl(
+    placed_parts: list[PlacedPart],
+    circuit,
+    ctx=None,
+    *,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights=DEFAULT_HPWL_WEIGHTS,
+    pad_extents: dict[str, list] | None = None,
+) -> float:
+    # ⭐ Resolved ONCE, not per net: the dose is a constant for the whole call
+    # and this loop runs on every score of every trial.
+    weights = _weight_pair(hpwl_weights)
+    return sum(hpwl * _net_weight(name, weights) for name, hpwl in _hpwl_by_net(
+        placed_parts, circuit, ctx,
+        hpwl_objective=hpwl_objective, hpwl_nets=hpwl_nets,
+        pad_extents=pad_extents))
 
 
 def _segment_intersects(a1, a2, b1, b2) -> bool:
@@ -1165,11 +1445,40 @@ def score_placement_quick(
     fp_geometries: dict[str, FootprintGeometry] | None = None,
     clearance_mm: float = 0.5,
     ctx=None,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
 ) -> LayoutScore:
     """Cheap scorer for candidates with known violations.
 
     Runs only validate + HPWL + penalty. Skips congestion, crossings, and
     power corridor analysis.
+
+    ⛔⛔ **``hpwl_nets`` reaches here and ``crossing_objective`` does not, and
+    that asymmetry is deliberate.** This function skips crossings entirely, so
+    the crossing objective is genuinely irrelevant to it; HPWL is the only
+    quality term it has. A net-set change moves that term by **24-52 %**, so an
+    unthreaded quick scorer would rank an illegal candidate against a legal one
+    on two different scales -- the same class of defect as the parallel-worker
+    one, in the candidate PRE-FILTER rather than in the worker.
+    ⚠ ``hpwl_objective`` is still not threaded here (it was not when that plan
+    shipped either). It changes the same term's *points* rather than its scale,
+    and converting it is that plan's call, not this one's.
+
+    ⛔ **``hpwl_weights`` does not reach here either, and that is a fact about
+    this function rather than a decision.** It has **no weighted term at all**
+    -- its only HPWL contribution is ``min(total_hpwl / 50.0, 30.0)``, and
+    ``total_hpwl`` is a dose invariant by construction. Threading the knob here
+    would be dead code, so it is named here instead of added.
+
+    ⭐⭐ **``overlap_objective`` DOES reach here, and the asymmetry with
+    ``hpwl_weights`` is deliberate rather than inconsistent.** This function
+    carries its own ``len(validation.overlaps) * 25.0``, so leaving it binary
+    would rank pre-filter candidates on a different overlap scale from the full
+    scorer -- the same defect shape ``hpwl_nets`` was threaded here to avoid.
+    ⚠ See :func:`score_placement`'s note: this is the pre-filter at
+    ``engine.py:918``, whose ``(not ok, penalty, name)`` sort puts every legal
+    candidate above every illegal one regardless of penalty, so the knob's
+    effect here is confined to ordering *within* the illegal group.
     """
     validation = validate(
         placed_parts,
@@ -1195,10 +1504,10 @@ def score_placement_quick(
     front_panel_trace = _front_panel_trace_metrics(placed_parts, circuit, roles)
     warnings.extend(front_panel_trace["warnings"])
     outline_metrics = _outline_utilization_metrics(placed_parts, fp_bboxes, outline)
-    total_hpwl = _total_hpwl(placed_parts, circuit, ctx)
+    total_hpwl = _total_hpwl(placed_parts, circuit, ctx, hpwl_nets=hpwl_nets)
 
     penalty = 0.0
-    penalty += len(validation.overlaps) * 25.0
+    penalty += _overlap_term(validation, clearance_mm, overlap_objective)
     penalty += len(validation.outline_violations) * 20.0
     penalty += len(validation.keepout_violations) * 25.0
     penalty += len(validation.cutout_violations) * 30.0
@@ -1243,13 +1552,66 @@ def score_placement(
     board_layers: int = 2,
     ctx=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights=DEFAULT_HPWL_WEIGHTS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
 ) -> LayoutScore:
     """Full placement score.
 
     ``crossing_objective`` selects how the crossing term is computed and scaled;
     see :func:`_crossing_term`. **Default ``"legacy"``, and on that path this
     function is byte-identical to before the parameter existed.**
+
+    ``hpwl_objective`` selects whether the two HPWL terms measure over part
+    centroids (``"centroid"``, the default and the shipped behaviour) or over
+    pad positions (``"pads"``).
+
+    ``hpwl_nets`` selects which nets the two HPWL terms measure over: ``"all"``
+    (the default and the shipped behaviour) or ``"plane_free"``, which drops the
+    nets this stack pours. ⭐ It is the *set*, where ``hpwl_objective`` is the
+    *points*; the two compose.
+
+    ``hpwl_weights`` selects the plane-net coefficients :func:`_net_weight`
+    applies inside the **weighted** term -- ``"legacy"`` (the default and the
+    shipped behaviour, GND 2.0 / POWER 1.6) or a lighter dose from
+    :data:`HPWL_WEIGHTS`. ⭐ It is the *dose* on the same axis ``hpwl_nets``
+    sets to zero; see :data:`HPWL_WEIGHTS` for why that is one lever and not
+    two. ⚠ It reaches the **weighted** term only -- ``total_hpwl`` is an
+    invariant of the dose by construction, which is what makes the two terms
+    separable in a decomposition.
+
+    ``overlap_objective`` selects how the overlap penalty is computed:
+    ``"count"`` (the default and the shipped behaviour,
+    ``len(overlaps) * 25.0``) or ``"area"``, which grades each overlapping pair
+    by its penetration depth against ``clearance_mm``. See
+    :func:`_overlap_term`.
+
+    ⛔⛔⛔ **What ``"area"`` can and cannot do, measured before it was built
+    (WS-Z1, six power boards).** The overlap term is **0 at every placement this
+    engine ships** -- zero overlaps on 12 of 12 board-arms -- but non-zero on
+    **60-90 % of scored trials**, so the only mechanism available to it is the
+    search *trajectory*. And ``penalty`` is the LAST thing the search consults:
+    ``refinement._is_better`` is lexicographic on ``_hard_count`` and reaches
+    the penalty comparison on **48.9-61.3 %** of its calls, of which
+    **26.0-48.1 %** have an illegal side. That last figure is this knob's entire
+    reachable surface -- large enough to matter, and **not** 100 %.
+    ⭐ Grade it on whether the search reaches a different FIXED POINT (the
+    placement digest), never on the term's own value at the answer: that value
+    is 0 on both arms by construction.
     """
+    # ⭐ Computed ONCE and fed to every consumer -- the HPWL terms, the MST
+    # crossing term and the validator's worst-net report. Under the ``mst``
+    # default the marginal geometry cost of pad-HPWL is therefore ~zero, and
+    # the objective and the report cannot disagree about where a pad is.
+    pad_points = None
+    if circuit is not None and (hpwl_objective == HPWL_OBJECTIVE_PADS
+                                or crossing_objective == CROSSING_OBJECTIVE_MST):
+        pad_points = _placement_pad_points(placed_parts, circuit, fp_geometries)
+    pad_extents = (_net_pad_extents(pad_points)
+                   if (pad_points is not None
+                       and hpwl_objective == HPWL_OBJECTIVE_PADS) else None)
+
     validation = validate(
         placed_parts,
         circuit,
@@ -1260,6 +1622,9 @@ def score_placement(
         cutouts=cutouts,
         fp_geometries=fp_geometries,
         ctx=ctx,
+        hpwl_objective=hpwl_objective,
+        hpwl_nets=hpwl_nets,
+        pad_points=pad_points,
     )
     roles = ctx.roles if ctx is not None else (classify_parts(circuit) if circuit is not None else {})
     warnings = _role_warnings(
@@ -1280,10 +1645,18 @@ def score_placement(
         )
         warnings.extend(power_plan.warnings)
     outline_metrics = _outline_utilization_metrics(placed_parts, fp_bboxes, outline)
-    total_hpwl = _total_hpwl(placed_parts, circuit, ctx)
-    weighted_hpwl = _weighted_hpwl(placed_parts, circuit, ctx)
+    total_hpwl = _total_hpwl(placed_parts, circuit, ctx,
+                             hpwl_objective=hpwl_objective,
+                             hpwl_nets=hpwl_nets,
+                             pad_extents=pad_extents)
+    weighted_hpwl = _weighted_hpwl(placed_parts, circuit, ctx,
+                                   hpwl_objective=hpwl_objective,
+                                   hpwl_nets=hpwl_nets,
+                                   hpwl_weights=hpwl_weights,
+                                   pad_extents=pad_extents)
     if crossing_objective == CROSSING_OBJECTIVE_MST:
-        crossing_count = _mst_crossings(placed_parts, circuit, fp_geometries)
+        crossing_count = _mst_crossings(placed_parts, circuit, fp_geometries,
+                                        pad_points=pad_points)
     else:
         crossing_count = _estimate_crossings(
             placed_parts,
@@ -1311,7 +1684,7 @@ def score_placement(
     ]
 
     penalty = 0.0
-    penalty += len(validation.overlaps) * 25.0
+    penalty += _overlap_term(validation, clearance_mm, overlap_objective)
     penalty += len(validation.outline_violations) * 20.0
     penalty += len(validation.keepout_violations) * 25.0
     penalty += len(validation.cutout_violations) * 30.0

@@ -57,7 +57,15 @@ from .scoring import (
     CROSSING_OBJECTIVE_MST,
     CROSSING_OBJECTIVES,
     DEFAULT_CROSSING_OBJECTIVE,
+    DEFAULT_HPWL_NETS,
+    DEFAULT_HPWL_OBJECTIVE,
+    DEFAULT_HPWL_WEIGHTS,
+    DEFAULT_OVERLAP_OBJECTIVE,
+    HPWL_NET_SETS,
+    HPWL_OBJECTIVES,
+    HPWL_WEIGHT_DOSES,
     LayoutScore,
+    OVERLAP_OBJECTIVES,
     score_placement,
     score_placement_quick,
 )
@@ -238,6 +246,26 @@ class _FinalizeParams:
     #: Same defaulting rule, and the same reason: it crosses the
     #: pickled parallel-worker boundary.
     rescue_blocked_moves: bool = False
+    #: Metric-validation step 2 (HPWL over pad points). Defaulted for the third
+    #: time for the third identical reason -- it reaches ``score_placement``,
+    #: so it must reach the WORKER's ``score_placement`` too.
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE
+    #: Metric-validation step 3 (plane-free HPWL). Fourth application of the
+    #: same rule, and the `crossing_objective` defect's fourth home.
+    hpwl_nets: str = DEFAULT_HPWL_NETS
+    #: Metric-validation step 4 (the plane-net weight DOSE). Fifth application
+    #: of the same rule, for the fifth identical reason: it reaches
+    #: ``score_placement``, so it must reach the WORKER's ``score_placement``
+    #: too. ⛔ NOT on ``snapshot._SNAPSHOT_FIELDS`` -- that is for *circuit*
+    #: fields, and neither ``hpwl_objective`` nor ``hpwl_nets`` is there either.
+    hpwl_weights: str = DEFAULT_HPWL_WEIGHTS
+    #: The overlap-DEPTH objective. Sixth application of the same rule, and the
+    #: first one that reaches ``score_placement_quick`` as well -- so an
+    #: unthreaded worker would rank a >= 30-part board's illegal trials on a
+    #: different scale from a < 30-part board's, in **two** places rather than
+    #: one. ⛔ NOT on ``snapshot._SNAPSHOT_FIELDS``: that is for *circuit*
+    #: fields.
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE
 
 
 def _note_move(
@@ -539,6 +567,10 @@ def _finalize_candidate_impl(
         max_pair_swaps=8,
         ctx=ctx,
         crossing_objective=params.crossing_objective,
+        hpwl_objective=params.hpwl_objective,
+        hpwl_nets=params.hpwl_nets,
+        hpwl_weights=params.hpwl_weights,
+        overlap_objective=params.overlap_objective,
         rescue_blocked_moves=params.rescue_blocked_moves,
         progress=(
             (lambda m, _n=candidate.name: _emit(f"[{_n}] post-anchor {m}"))
@@ -687,6 +719,10 @@ def _finalize_candidate_impl(
         board_layers=board_layers,
         ctx=ctx,
         crossing_objective=params.crossing_objective,
+        hpwl_objective=params.hpwl_objective,
+        hpwl_nets=params.hpwl_nets,
+        hpwl_weights=params.hpwl_weights,
+        overlap_objective=params.overlap_objective,
     )
     edge_score = _apply_edge_intent_score(
         raw_score,
@@ -864,6 +900,8 @@ def _prune_candidates(
     fp_geometries,
     clearance_mm: float,
     ctx,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
 ) -> list[PlacementCandidate]:
     """Keep only the top ``max_candidates`` by a cheap seed quick-score.
 
@@ -886,6 +924,8 @@ def _prune_candidates(
             fp_geometries=fp_geometries,
             clearance_mm=clearance_mm,
             ctx=ctx,
+            hpwl_nets=hpwl_nets,
+            overlap_objective=overlap_objective,
         )
         scored.append((candidate, seed_score))
     scored.sort(key=lambda item: (not item[1].ok, item[1].penalty, item[0].name))
@@ -1715,6 +1755,95 @@ def _resolve_crossing_objective(crossing_objective: str | None) -> str:
         raise ValueError(
             f"unknown crossing_objective {value!r}; "
             f"expected one of {', '.join(CROSSING_OBJECTIVES)}"
+        )
+    return value
+
+
+def _resolve_hpwl_objective(hpwl_objective: str | None) -> str:
+    """Explicit kwarg > ``SKIDL_LAYOUT_HPWL_OBJECTIVE`` > ``centroid``.
+
+    Deliberately the same three-line shape as
+    :func:`_resolve_crossing_objective`, and it raises on an unknown name for
+    the same reason: a typo that silently selected the shipped objective would
+    make an A/B read as "no effect", which is the one failure mode a graded
+    lever cannot survive.
+    """
+    value = hpwl_objective
+    if value is None:
+        value = os.environ.get("SKIDL_LAYOUT_HPWL_OBJECTIVE")
+    if value is None or not str(value).strip():
+        return DEFAULT_HPWL_OBJECTIVE
+    value = str(value).strip().lower()
+    if value not in HPWL_OBJECTIVES:
+        raise ValueError(
+            f"unknown hpwl_objective {value!r}; "
+            f"expected one of {', '.join(HPWL_OBJECTIVES)}"
+        )
+    return value
+
+
+def _resolve_hpwl_nets(hpwl_nets: str | None) -> str:
+    """Explicit kwarg > ``SKIDL_LAYOUT_HPWL_NETS`` > ``all``.
+
+    The fourth resolver of this exact shape, and it raises on an unknown name
+    for the fourth identical reason: a typo that silently selected the shipped
+    net set would make an A/B read as "no effect", which is the one failure mode
+    a graded lever cannot survive.
+    """
+    value = hpwl_nets
+    if value is None:
+        value = os.environ.get("SKIDL_LAYOUT_HPWL_NETS")
+    if value is None or not str(value).strip():
+        return DEFAULT_HPWL_NETS
+    value = str(value).strip().lower()
+    if value not in HPWL_NET_SETS:
+        raise ValueError(
+            f"unknown hpwl_nets {value!r}; "
+            f"expected one of {', '.join(HPWL_NET_SETS)}"
+        )
+    return value
+
+
+def _resolve_hpwl_weights(hpwl_weights: str | None) -> str:
+    """Explicit kwarg > ``SKIDL_LAYOUT_HPWL_WEIGHTS`` > ``legacy``.
+
+    The fifth resolver of this exact shape, and it raises on an unknown name
+    for the fifth identical reason: a typo that silently selected the shipped
+    dose would make an A/B read as "no effect", which is the one failure mode a
+    graded lever cannot survive.
+    """
+    value = hpwl_weights
+    if value is None:
+        value = os.environ.get("SKIDL_LAYOUT_HPWL_WEIGHTS")
+    if value is None or not str(value).strip():
+        return DEFAULT_HPWL_WEIGHTS
+    value = str(value).strip().lower()
+    if value not in HPWL_WEIGHT_DOSES:
+        raise ValueError(
+            f"unknown hpwl_weights {value!r}; "
+            f"expected one of {', '.join(HPWL_WEIGHT_DOSES)}"
+        )
+    return value
+
+
+def _resolve_overlap_objective(overlap_objective: str | None) -> str:
+    """Explicit kwarg > ``SKIDL_LAYOUT_OVERLAP_OBJECTIVE`` > ``count``.
+
+    The sixth resolver of this exact shape, and it raises on an unknown name
+    for the sixth identical reason: a typo that silently selected the shipped
+    objective would make an A/B read as "no effect", which is the one failure
+    mode a graded lever cannot survive.
+    """
+    value = overlap_objective
+    if value is None:
+        value = os.environ.get("SKIDL_LAYOUT_OVERLAP_OBJECTIVE")
+    if value is None or not str(value).strip():
+        return DEFAULT_OVERLAP_OBJECTIVE
+    value = str(value).strip().lower()
+    if value not in OVERLAP_OBJECTIVES:
+        raise ValueError(
+            f"unknown overlap_objective {value!r}; "
+            f"expected one of {', '.join(OVERLAP_OBJECTIVES)}"
         )
     return value
 
@@ -3899,6 +4028,10 @@ def _refine_candidate_trio(
     progress,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
     rescue_blocked_moves: bool = False,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights: str = DEFAULT_HPWL_WEIGHTS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
 ):
     """Run the pass-1 refinement trio on one candidate, mutating it in place.
 
@@ -3925,6 +4058,10 @@ def _refine_candidate_trio(
         progress=progress,
         crossing_objective=crossing_objective,
         rescue_blocked_moves=rescue_blocked_moves,
+        hpwl_objective=hpwl_objective,
+        hpwl_nets=hpwl_nets,
+        hpwl_weights=hpwl_weights,
+        overlap_objective=overlap_objective,
     )
     return candidate
 
@@ -4023,6 +4160,8 @@ def _posttrio_candidate_impl(
             fp_geometries=fp_geometries,
             clearance_mm=clearance_mm,
             ctx=ctx,
+            hpwl_nets=params.hpwl_nets,
+            overlap_objective=params.overlap_objective,
         )
     else:
         raw_score = score_placement(
@@ -4037,6 +4176,10 @@ def _posttrio_candidate_impl(
             board_layers=board_layers,
             ctx=ctx,
             crossing_objective=params.crossing_objective,
+            hpwl_objective=params.hpwl_objective,
+            hpwl_nets=params.hpwl_nets,
+            hpwl_weights=params.hpwl_weights,
+            overlap_objective=params.overlap_objective,
         )
     edge_score = _apply_edge_intent_score(
         raw_score,
@@ -4123,6 +4266,28 @@ def _prerefine_candidates_parallel(
                     board_layers,
                     resolved_crossing_objective,
                     resolved_rescue_blocked,
+                    # ⛔ APPENDED LAST, and unpacked defensively on the other
+                    # side, for the same reason ``crossing_objective`` was: a
+                    # payload pickled by an older parent must still load.
+                    resolved_hpwl_objective,
+                    # ⛔ Slot 9, same rule. This is the FOURTH parameter to
+                    # cross this boundary and the reason has not changed:
+                    # parallelism engages at >= 30 parts, so an unthreaded knob
+                    # corrupts exactly the two biggest boards and leaves the
+                    # small ones looking perfect.
+                    resolved_hpwl_nets,
+                    # ⛔ Slot 10, same rule, FIFTH parameter. Unchanged reason,
+                    # and by now it is a measured one: the ``crossing_objective``
+                    # promotion shipped a worker scoring against the module
+                    # default while the parent asked for another objective, and
+                    # 1100 tests missed it because only the >= 30-part boards
+                    # engage parallelism.
+                    resolved_hpwl_weights,
+                    # ⛔ Slot 11, same rule, SIXTH parameter -- and this one
+                    # reaches ``score_placement`` AND ``score_placement_quick``,
+                    # so an unthreaded worker would rank the two biggest boards'
+                    # illegal trials on a different overlap scale from the rest.
+                    resolved_overlap_objective,
                 )
             )
             for i in canonical_indices
@@ -4314,6 +4479,23 @@ def _finalize_candidates_parallel(
     return finalized_by_name
 
 
+def _resolve_cells(circuit, cells):
+    """``(instances, unresolved)`` for ``plan_layout(cells=...)``.
+
+    ⭐ A module-level function rather than an inline block so the no-cells path
+    is one ``if not cells: return (), ()`` and cannot pay an import: with
+    ``cells=None`` -- every historical call -- ``cells_place`` is never even
+    imported, which is what makes the default a *true* no-op rather than an
+    inert one.
+    """
+    if not cells:
+        return (), ()
+    from .cells_place import resolve_cell_instances
+
+    instances, unresolved = resolve_cell_instances(circuit, cells)
+    return tuple(instances), list(unresolved)
+
+
 def plan_layout(
     circuit,
     fp_bboxes: dict[str, tuple[float, float]] | None = None,
@@ -4339,7 +4521,13 @@ def plan_layout(
     power_escape_constraints: bool | float | None = None,
     power_escape_partial: bool = False,
     crossing_objective: str | None = None,
+    hpwl_objective: str | None = None,
+    hpwl_nets: str | None = None,
+    hpwl_weights: str | None = None,
+    overlap_objective: str | None = None,
     rescue_blocked_moves: bool | None = None,
+    extra_fp_geometries: dict[str, FootprintGeometry] | None = None,
+    cells=None,
 ) -> LayoutResult:
     """Place and score a board attempt without writing copper geometry.
 
@@ -4445,6 +4633,110 @@ def plan_layout(
     over real PAD positions — the identical number ``ratnest.analyse_board``
     reports, so the objective and the judge finally measure one thing.
 
+    ``hpwl_objective`` selects what the two HPWL terms measure over:
+    ``"centroid"`` (the shipped one, and the default) or ``"pads"``.
+    ``SKIDL_LAYOUT_HPWL_OBJECTIVE`` is the env default; an explicit kwarg wins;
+    an unknown name raises. **Default is a true no-op.**
+
+    ⛔ **Why it exists.** With the crossing term MST-based, HPWL is still the
+    placer's only *continuous* quality signal, and it was measuring part
+    **centres** — so it is blind to the rotation of anything whose pads matter
+    more than its body centre (a TSSOP's pin 1 and pin 20 are ~6 mm apart, and a
+    layout **cell** presents a single centroid for every net it touches). KRT's
+    placement objective has no centroid anywhere; ours was the outlier.
+    ⚠ **Expect small magnitudes.** KRT measured the four rotations of a part
+    differing by 0.500 mm across a 19.8 mm net — *"the directional signal is
+    present and drowned"* — so this change makes rotation **visible**, not
+    dominant. ``"pads"`` reuses ``_placement_pad_points``, the same points the
+    ``"mst"`` crossing objective consumes, computed once per score call.
+    ⚠ **Graded and PARKED 2026-08-01** — corpus signal crossings 81 → 98 and
+    vias 76 → 100. Kept, tested and one kwarg away so the negative stays
+    reproducible and retestable under ``hpwl_nets="plane_free"``.
+
+    ``hpwl_nets`` selects which nets the two HPWL terms measure over: ``"all"``
+    (the shipped one, and the default) or ``"plane_free"``.
+    ``SKIDL_LAYOUT_HPWL_NETS`` is the env default; an explicit kwarg wins; an
+    unknown name raises. **Default is a true no-op.**
+
+    ⛔⛔ **Why it exists.** ``hpwl_objective`` changes the *points*; this changes
+    the *set*, and they are orthogonal. The MST promotion made the crossing term
+    plane-free over pads and left both HPWL terms all-nets — **one objective,
+    two net vocabularies, and HPWL is the term with all the gradient.** Measured
+    on the six frozen control placements: plane nets carry **37–68 % of the
+    weighted HPWL**, so on 3 of 6 boards the placer's only continuous quality
+    signal is majority-plane. The engine already beats a random scatter on
+    *total* length while sitting in the worse half on *signal* crossings — it is
+    buying compaction of copper that gets **poured, not routed**.
+    ⚠ ``_net_weight``'s GND 2.0 exists because somebody wanted grounds short,
+    and a plane-free HPWL says nothing about them; what still holds supply
+    geometry together is ``refine_candidate_decaps``, ``power.py``'s
+    >80 mm supply-span warning (which carries penalty), the power-corridor terms
+    and the outline/congestion terms.
+    ⚠ **Graded and PARKED 2026-08-01** — byte-identical to the control on 4 of
+    6 boards, corpus signal crossings 81 → 85. Its successor is
+    ``hpwl_weights``, below.
+
+    ``hpwl_weights`` selects the plane-net **dose** the weighted HPWL term
+    applies: ``"legacy"`` (the shipped one, and the default: GND 2.0 /
+    POWER 1.6), ``"light"`` (1.0/1.0), ``"quarter"`` (0.5/0.5) or
+    ``"trace_aware"`` (0.5/1.6). ``SKIDL_LAYOUT_HPWL_WEIGHTS`` is the env
+    default; an explicit kwarg wins; an unknown name raises. **Default is a true
+    no-op.**
+
+    ⛔⛔ **Why it exists, and why it is not a new axis.** Measured on nine frozen
+    control placements 2026-08-01: ``hpwl_nets="plane_free"`` makes the weighted
+    HPWL term a **byte-identical duplicate** of the raw one on 9 of 9 boards,
+    because the only weights ``scoring._net_weight`` ever returns above 1.0 on
+    this corpus are the two plane ones. So ``_net_weight`` **is** the plane
+    predicate wearing different clothes, and "keep the planes" / "drop the
+    planes" are the mildest and the most extreme dose of **one** lever — the
+    extreme dose additionally collapsing two differently-shaped terms (``÷50``
+    cap 30, ``÷120`` cap 20) into one number scored twice.
+    ⭐⭐ **And re-weighting can say something removal cannot.**
+    ``ratnest.is_plane_net`` names ``VIN``/``VOUT``/``VCC``, which
+    ``power._strategy`` **trunks** rather than pours (on ``lt3844_buck`` the
+    named set covers 55.9 % of pins where the poured set covers 32.4 %), so a
+    poured ground and a trunked supply want *different* coefficients —
+    ``"trace_aware"`` is exactly that, and neither ``"all"`` nor
+    ``"plane_free"`` can express it.
+    ⚠ It reaches the **weighted** term only; ``total_hpwl`` is a dose invariant
+    by construction. ⛔ It does **not** reach ``score_placement_quick`` (which
+    has no weighted term at all) or ``validator._compute_hpwl`` (which ranks by
+    *unweighted* HPWL) — both named in those functions' docstrings so the
+    asymmetry is not later read as an omission.
+
+    ``overlap_objective`` selects how the **overlap** penalty is computed:
+    ``"count"`` (the shipped one, and the default: ``len(overlaps) * 25.0``) or
+    ``"area"``, which grades each overlapping pair by how far it has penetrated
+    the ``clearance_mm`` threshold. ``SKIDL_LAYOUT_OVERLAP_OBJECTIVE`` is the
+    env default; an explicit kwarg wins; an unknown name raises. **Default is a
+    true no-op.**
+
+    ⛔⛔⛔ **Why it exists, and the measurement that shaped it (WS-Z1, six power
+    boards, 2026-08-02).** The overlap term is **0 at every placement this
+    engine ships** — zero overlaps on 12 of 12 board-arms — so it cannot move
+    the answer directly. But it is non-zero on **60–90 % of scored trials**: the
+    search spends most of its life in illegal space, steered by a *count* that
+    cannot tell a 0.01 mm graze from a 3 mm interpenetration. This knob makes
+    that signal continuous.
+    ⛔⛔ **And ``penalty`` is the LAST thing the search consults.**
+    ``refinement._is_better`` is lexicographic on ``_hard_count`` and reaches
+    the penalty comparison on **48.9–61.3 %** of its calls, of which
+    **26.0–48.1 %** have an illegal side — that is this knob's entire reachable
+    surface, measured before it was built. The other three count-based gates
+    §1.2 named are *inert on this corpus*: ``_hard_violation_key`` rejected
+    **0** of 253–656 comparisons on 6 of 6 boards, and the candidate sort never
+    saw an all-illegal field.
+    ⭐ **Grade it on whether the search reaches a different FIXED POINT** (the
+    placement digest), never on the term's own value at the answer — that value
+    is 0 on both arms by construction.
+    ⚠ It reaches ``score_placement`` **and** ``score_placement_quick``: the
+    quick scorer carries its own overlap line, and leaving it binary would rank
+    pre-filter candidates on a different overlap scale. It does **not** reach
+    ``refinement._rank_and_limit_trials`` (which computes no penalty) or the
+    ordering keys ``_hard_count`` / ``_hard_violation_key`` — those are a
+    separate, larger change and are named in their docstrings.
+
     ``parallel_workers`` controls refining the unique candidates' pass-1 trio
     (orientation/decap/placement) and their post-anchor finalize concurrently in
     plain subprocess workers. **Parallelism is the DEFAULT on boards >= 30
@@ -4468,6 +4760,29 @@ def plan_layout(
     mutates the passed circuit (skidl ``rmv_parts`` disconnects their pins
     first). Leave it ``False`` for a pure placement of an as-built circuit.
 
+    ``extra_fp_geometries`` (layout-templates plan, WS-T3; default ``None`` ->
+    a true no-op) merges synthetic entries into the footprint-geometry map
+    before bboxes are derived from it. ⭐ Its one intended caller is
+    :mod:`skidl_layout.cells_place`, whose ``cell_fp_geometries`` returns a box
+    geometry per placed **layout cell** so the cell can masquerade as a
+    footprint and be placed as one rigid body. The matching pseudo-part must be
+    in ``circuit`` (use ``cells_place.substitute_cells``), and the resulting
+    placement must be run through ``cells_place.expand_cell_placements``
+    **before** it is written or digested.
+
+    ``cells`` (cell-toolchain plan, WS-U6; default ``None`` -> a true no-op) is
+    the same capability with the bookkeeping done here instead of by the caller:
+    pass explicit ``CellInstance`` objects, or ``True`` / a
+    :class:`~skidl_layout.cells.CellCache` / a cache directory to read the
+    circuit's own ``cells_place.mark_cell`` declarations. Substitution happens
+    before geometry resolution and expansion after selection, so the returned
+    ``placed_parts`` carry **real refs** and the digest is comparable to every
+    recorded golden. ⭐ Gate ``U6`` asserts the two routes -- explicit binding
+    and declaration -- produce byte-identical placement digests at
+    ``parallel_workers`` 1 **and** 4. ⛔ With ``cells=None`` -- every historical
+    call -- ``_resolve_cells`` returns before importing anything and no
+    placement moves.
+
     ``fp_lib_dirs`` defaults to :data:`FP_LIB_DIRS_AUTO`, which discovers the
     installed KiCad footprint root so placement runs on **real footprint
     geometry**. Pass an explicit list to pin the search, or an explicit ``None``
@@ -4489,7 +4804,41 @@ def plan_layout(
         if stripped:
             _emit(f"stripped {len(stripped)} sim-only part(s): "
                   f"{', '.join(getattr(p, 'ref', '?') for p in stripped)}")
+    # Layout-cell BINDING (plan: cell-toolchain, WS-U6), opt-in, default None ->
+    # a true no-op. ⭐ This is the seam a ``mark_cell`` declaration reaches: it
+    # substitutes the circuit view and registers the synthetic geometries here,
+    # and expands the members back out just before the result is built, so a
+    # caller never has to know the pseudo-parts existed. ``cells=`` accepts
+    # explicit ``CellInstance`` objects (the executed plan's binding, unchanged)
+    # or ``True`` / a ``CellCache`` / a cache path (read the declarations).
+    # ⛔ ``cell_unresolved`` is carried rather than raised: a declaration the
+    # library cannot honour must be visible, and a board that declares a
+    # template it does not get must not look like one that never declared it.
+    cell_instances, cell_unresolved = _resolve_cells(circuit, cells)
+    if cell_instances:
+        from .cells_place import cell_fp_geometries, substitute_cells
+
+        extra_fp_geometries = {**(extra_fp_geometries or {}),
+                               **cell_fp_geometries(cell_instances)}
+        circuit = substitute_cells(circuit, cell_instances)
+    if cell_unresolved:
+        _emit(f"cells: {len(cell_unresolved)} declaration(s) unresolved: "
+              + "; ".join(cell_unresolved))
     fp_geometries = _resolve_geometries(circuit, fp_lib_dirs)
+    # Layout cells (plan: layout-templates, WS-T3), opt-in, default None -> a
+    # true no-op. ⭐⭐ This one line is the whole engine-side cost of the
+    # footprint masquerade: ``fp_geometries`` is a plain string-keyed dict all
+    # the way down to the scorer, so a synthetic entry gets rigid-body
+    # placement, AABB validation, outline containment, orientation trials and
+    # MST-over-pad crossings with no change to the refinement hot loop. The
+    # matching pseudo-part lives in the CIRCUIT the caller passes
+    # (``cells_place.substitute_cells``), which is why nothing else here moves.
+    # ⛔ Inserted BEFORE ``geometry_bboxes`` below so the synthetic box reaches
+    # ``resolved_bboxes`` on both the ``fp_bboxes is None`` and the explicit
+    # path -- a cell with a geometry but no bbox would be validated against a
+    # 2 x 2 mm fallback by every code path that reads bboxes instead.
+    if extra_fp_geometries:
+        fp_geometries = {**fp_geometries, **extra_fp_geometries}
     resolved_bboxes = _resolve_bboxes(circuit, fp_bboxes, fp_lib_dirs)
     geometry_boxes = geometry_bboxes(fp_geometries)
     if fp_bboxes is None:
@@ -4539,6 +4888,10 @@ def plan_layout(
         power_score, implied_by=resolved_power_constraints
     )
     resolved_crossing_objective = _resolve_crossing_objective(crossing_objective)
+    resolved_hpwl_objective = _resolve_hpwl_objective(hpwl_objective)
+    resolved_hpwl_nets = _resolve_hpwl_nets(hpwl_nets)
+    resolved_hpwl_weights = _resolve_hpwl_weights(hpwl_weights)
+    resolved_overlap_objective = _resolve_overlap_objective(overlap_objective)
     resolved_rescue_blocked = _resolve_rescue_blocked_moves(rescue_blocked_moves)
     candidate_power_plan = (
         classify_power_roles(circuit) if resolved_power_constraints else None
@@ -4586,6 +4939,8 @@ def plan_layout(
             fp_geometries,
             clearance_mm,
             ctx,
+            hpwl_nets=resolved_hpwl_nets,
+            overlap_objective=resolved_overlap_objective,
         )
         _emit(
             f"pruned {len(candidates)} -> {len(pruned)} candidate(s) by seed "
@@ -4622,6 +4977,10 @@ def plan_layout(
         constraints=constraints,
         power_score=resolved_power_score,
         crossing_objective=resolved_crossing_objective,
+        hpwl_objective=resolved_hpwl_objective,
+        hpwl_nets=resolved_hpwl_nets,
+        hpwl_weights=resolved_hpwl_weights,
+        overlap_objective=resolved_overlap_objective,
         rescue_blocked_moves=resolved_rescue_blocked,
     )
 
@@ -4763,6 +5122,10 @@ def plan_layout(
                     else None
                 ),
                 crossing_objective=resolved_crossing_objective,
+                hpwl_objective=resolved_hpwl_objective,
+                hpwl_nets=resolved_hpwl_nets,
+                hpwl_weights=resolved_hpwl_weights,
+                overlap_objective=resolved_overlap_objective,
                 rescue_blocked_moves=resolved_rescue_blocked,
             )
         canonical_by_key[seed_key] = candidate
@@ -4801,6 +5164,10 @@ def plan_layout(
                 board_layers=board_layers,
                 ctx=ctx,
                 crossing_objective=resolved_crossing_objective,
+                hpwl_objective=resolved_hpwl_objective,
+                hpwl_nets=resolved_hpwl_nets,
+                hpwl_weights=resolved_hpwl_weights,
+                overlap_objective=resolved_overlap_objective,
             )
             edge_score = _apply_edge_intent_score(
                 raw_score,
@@ -5028,6 +5395,10 @@ def plan_layout(
                             board_layers=board_layers,
                             ctx=ctx,
                             crossing_objective=resolved_crossing_objective,
+                            hpwl_objective=resolved_hpwl_objective,
+                            hpwl_nets=resolved_hpwl_nets,
+                            hpwl_weights=resolved_hpwl_weights,
+                            overlap_objective=resolved_overlap_objective,
                         ),
                         placed_parts,
                         resolved_bboxes,
@@ -5090,6 +5461,17 @@ def plan_layout(
         routability=routability,
         intent_warnings=intent_plan.warnings if intent_plan is not None else None,
     )
+
+    # ⛔ Expansion is the LAST thing that happens, and it must be: the canonical
+    # placement digest feeds on ``ref, x, y, rot, side``, so a digest over
+    # pseudo-parts is not comparable to the recorded goldens. Everything above
+    # (validation, scoring, the report, the power judges) sees the substituted
+    # view, which is exactly what the executed plan's external binding did --
+    # the two paths are the same computation, gated digest-for-digest by U6.
+    if cell_instances:
+        from .cells_place import expand_cell_placements
+
+        placed_parts = expand_cell_placements(placed_parts, cell_instances)
 
     return LayoutResult(
         placed_parts=placed_parts,

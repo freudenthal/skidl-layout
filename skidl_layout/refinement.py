@@ -22,6 +22,12 @@ from .scoring import (
     DEFAULT_CROSSING_OBJECTIVE,
     LayoutScore,
     _net_ref_lists,
+    DEFAULT_HPWL_NETS,
+    DEFAULT_HPWL_OBJECTIVE,
+    DEFAULT_HPWL_WEIGHTS,
+    DEFAULT_OVERLAP_OBJECTIVE,
+    HPWL_NETS_PLANE_FREE,
+    is_plane_net,
     score_placement,
 )
 from .validator import _same_physical_side, _through_board_pads_collide, validate
@@ -97,6 +103,10 @@ def _score(
     board_layers: int,
     ctx=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights: str = DEFAULT_HPWL_WEIGHTS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
 ) -> LayoutScore:
     return score_placement(
         placed_parts,
@@ -110,6 +120,10 @@ def _score(
         board_layers=board_layers,
         ctx=ctx,
         crossing_objective=crossing_objective,
+        hpwl_objective=hpwl_objective,
+        hpwl_nets=hpwl_nets,
+        hpwl_weights=hpwl_weights,
+        overlap_objective=overlap_objective,
     )
 
 
@@ -901,6 +915,20 @@ def _composed_passive_pin_gravity_targets(
 
 
 def _net_weight(name: str) -> float:
+    """The MOVE GENERATOR's plane weighting -- ⛔ **not the objective's.**
+
+    ⭐⭐ One of **four** private ``_net_weight`` functions in this package, with
+    four different sets of numbers and no shared definition:
+    ``scoring`` 2.0/1.6 (the objective), this one 2.0/**1.7**,
+    ``congestion`` 1.8/1.5, ``orientation`` 2.4/2.0. This one feeds
+    :func:`_ref_neighbors`, i.e. the weighted neighbour centroid the
+    crossing-driven move trials **aim at**.
+    ⚠ So ``scoring.hpwl_weights`` re-weights what a placement is *scored* on and
+    leaves what the search *aims at* alone -- the same "two net vocabularies"
+    inconsistency the plane-free plan was about, one layer down in the move
+    generator. That is deliberate (one change at a time); it is measured as a
+    report-only arm and is **not** a shipped knob.
+    """
     if GND_NET_RE.match(name):
         return 2.0
     if POWER_NET_RE.match(name):
@@ -1197,8 +1225,36 @@ def _rank_and_limit_trials(
     fp_bboxes: dict[str, tuple[float, float]],
     fp_geometries: dict[str, FootprintGeometry] | None,
     ctx,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
 ) -> list[PlacedPart]:
-    """Keep the RANK_LIMIT cheapest-ranked trials, stable by original index."""
+    """Keep the RANK_LIMIT cheapest-ranked trials, stable by original index.
+
+    ⭐⭐ **``hpwl_nets`` reaches HERE, and the pads plan's reason for leaving
+    this seam alone does not carry over.** That plan deliberately left
+    ``_rank_trial`` on centroid HPWL and said so in writing, on a measured
+    argument: every trial it sees is a pure *translation*, which moves all of a
+    part's pads by the same vector, so centroid and pad rankings agree almost
+    everywhere. ⛔ **Dropping a net from the SET is not a translation.** A ref
+    whose only long net is ``GND`` ranks its nine trial positions entirely on
+    plane geometry, so an all-nets pre-filter can discard exactly the trial a
+    plane-free objective would have accepted -- and the objective would never
+    see it, because the pre-filter runs first. Filtering here is part of the one
+    change, not a second one.
+
+    ⛔ **``hpwl_weights`` deliberately does NOT reach here, and unlike
+    ``hpwl_nets`` that is not a judgement call.** :func:`_rank_trial` sums
+    *unweighted* half-perimeters -- ``scoring._net_weight`` has never entered
+    this seam -- so a plane-net dose has nothing here to change. Dropping a net
+    from the SET removes a term from this sum; re-weighting one does not.
+
+    ⛔ **``overlap_objective`` does not reach here either, and for the same kind
+    of reason.** This pre-filter ranks on wire length and a *boolean*
+    box-intersection test of its own; it computes no penalty and calls no
+    scorer, so there is no overlap term here to grade. ⚠ Its box test is
+    therefore still binary, and that is a **named limitation of the depth
+    lever**: a deep interpenetration and a graze are equally likely to survive
+    into the trial list the objective then sees.
+    """
     pos_base = {pp.ref: (pp.x_mm, pp.y_mm) for pp in placed_parts}
     other_boxes: list[tuple[float, float, float, float]] = []
     for pp in placed_parts:
@@ -1208,10 +1264,11 @@ def _rank_and_limit_trials(
         other_boxes.append(
             (pp.x_mm - w / 2, pp.y_mm - h / 2, pp.x_mm + w / 2, pp.y_mm + h / 2)
         )
+    plane_free = hpwl_nets == HPWL_NETS_PLANE_FREE
     touching_nets = [
         (name, refs)
         for name, refs in _net_ref_lists(circuit, ctx)
-        if ref in refs
+        if ref in refs and not (plane_free and is_plane_net(name))
     ]
     ranked = sorted(
         enumerate(trials),
@@ -1244,6 +1301,10 @@ def _best_single_ref_trial(
     board_layers: int,
     ctx=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights: str = DEFAULT_HPWL_WEIGHTS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
     if len(trials) > RANK_LIMIT:
         trials = _rank_and_limit_trials(
@@ -1254,6 +1315,7 @@ def _best_single_ref_trial(
             fp_bboxes,
             fp_geometries,
             ctx,
+            hpwl_nets=hpwl_nets,
         )
     best_parts = None
     best_score = current_score
@@ -1270,6 +1332,10 @@ def _best_single_ref_trial(
             board_layers,
             ctx,
             crossing_objective,
+            hpwl_objective=hpwl_objective,
+            hpwl_nets=hpwl_nets,
+            hpwl_weights=hpwl_weights,
+            overlap_objective=overlap_objective,
         )
         if _is_better(best_score, trial_score):
             best_parts = trial_parts
@@ -1304,6 +1370,10 @@ def _best_pin_gravity_trial(
     board_layers: int,
     ctx=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights: str = DEFAULT_HPWL_WEIGHTS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
 ) -> tuple[list[PlacedPart], LayoutScore, PlacedPart] | None:
     current_distance = math.hypot(
         placed.x_mm - target_xy[0],
@@ -1362,6 +1432,10 @@ def _best_pin_gravity_trial(
             board_layers,
             ctx,
             crossing_objective,
+            hpwl_objective=hpwl_objective,
+            hpwl_nets=hpwl_nets,
+            hpwl_weights=hpwl_weights,
+            overlap_objective=overlap_objective,
         )
         scored_candidates += 1
         if _hard_violation_key(trial_score) > current_hard:
@@ -1499,6 +1573,10 @@ def _legalize_one_overlap(
     degrees: dict[str, int],
     ctx=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights: str = DEFAULT_HPWL_WEIGHTS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
 ) -> tuple[list[PlacedPart], LayoutScore, str, str] | None:
     validation = validate(
         placed_parts,
@@ -1570,6 +1648,10 @@ def _legalize_one_overlap(
                 board_layers,
                 ctx,
                 crossing_objective,
+                hpwl_objective=hpwl_objective,
+                hpwl_nets=hpwl_nets,
+                hpwl_weights=hpwl_weights,
+                overlap_objective=overlap_objective,
             )
             if _is_better(current_score, trial_score):
                 other = ref_b if ref == ref_a else ref_a
@@ -1609,6 +1691,10 @@ def refine_placement(
     ctx=None,
     progress=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights: str = DEFAULT_HPWL_WEIGHTS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
     rescue_blocked_moves: bool = False,
 ) -> RefinementResult:
     """Apply deterministic score-gated local placement adjustments.
@@ -1638,6 +1724,10 @@ def refine_placement(
         board_layers,
         ctx,
         crossing_objective,
+        hpwl_objective=hpwl_objective,
+        hpwl_nets=hpwl_nets,
+        hpwl_weights=hpwl_weights,
+        overlap_objective=overlap_objective,
     )
     start_score = current_score.score
     start_penalty = current_score.penalty
@@ -1728,6 +1818,10 @@ def refine_placement(
                     board_layers,
                     ctx,
                     crossing_objective,
+                    hpwl_objective=hpwl_objective,
+                    hpwl_nets=hpwl_nets,
+                    hpwl_weights=hpwl_weights,
+                    overlap_objective=overlap_objective,
                 )
                 if best is not None:
                     current_parts, current_score, trial = best
@@ -1781,6 +1875,10 @@ def refine_placement(
                     board_layers,
                     ctx,
                     crossing_objective,
+                    hpwl_objective=hpwl_objective,
+                    hpwl_nets=hpwl_nets,
+                    hpwl_weights=hpwl_weights,
+                    overlap_objective=overlap_objective,
                 )
                 if best is not None:
                     current_parts, current_score, trial = best
@@ -1813,6 +1911,10 @@ def refine_placement(
                 board_layers,
                 ctx,
                 crossing_objective,
+                hpwl_objective=hpwl_objective,
+                hpwl_nets=hpwl_nets,
+                hpwl_weights=hpwl_weights,
+                overlap_objective=overlap_objective,
             )
             if best is not None:
                 current_parts, current_score, trial = best
@@ -1857,6 +1959,10 @@ def refine_placement(
                     board_layers,
                     ctx,
                     crossing_objective,
+                    hpwl_objective=hpwl_objective,
+                    hpwl_nets=hpwl_nets,
+                    hpwl_weights=hpwl_weights,
+                    overlap_objective=overlap_objective,
                 )
                 if not _is_better(current_score, trial_score):
                     continue
@@ -1892,6 +1998,10 @@ def refine_placement(
                 degrees,
                 ctx,
                 crossing_objective,
+                hpwl_objective=hpwl_objective,
+                hpwl_nets=hpwl_nets,
+                hpwl_weights=hpwl_weights,
+                overlap_objective=overlap_objective,
             )
             if legalized is None:
                 break
@@ -1927,6 +2037,10 @@ def refine_candidate_placement(
     ctx=None,
     progress=None,
     crossing_objective: str = DEFAULT_CROSSING_OBJECTIVE,
+    hpwl_objective: str = DEFAULT_HPWL_OBJECTIVE,
+    hpwl_nets: str = DEFAULT_HPWL_NETS,
+    hpwl_weights: str = DEFAULT_HPWL_WEIGHTS,
+    overlap_objective: str = DEFAULT_OVERLAP_OBJECTIVE,
     rescue_blocked_moves: bool = False,
 ) -> RefinementResult:
     result = refine_placement(
@@ -1941,6 +2055,10 @@ def refine_candidate_placement(
         ctx=ctx,
         progress=progress,
         crossing_objective=crossing_objective,
+        hpwl_objective=hpwl_objective,
+        hpwl_nets=hpwl_nets,
+        hpwl_weights=hpwl_weights,
+        overlap_objective=overlap_objective,
         rescue_blocked_moves=rescue_blocked_moves,
     )
     if result.accepted_count == 0:
