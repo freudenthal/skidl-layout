@@ -79,7 +79,18 @@ __all__ = [
     "SIZES",
     "Arrangement",
     "arrangements",
+    "COURTYARD_MARGIN_MM",
+    "arrangement_signature",
+    "cell_pad_hpwl",
     "chain_order",
+    "classify_three_part_topology",
+    "courtyard_overhangs",
+    "junction_gap_mm",
+    "member_courtyard_gap",
+    "member_relation",
+    "missing_courtyards",
+    "enumerate_chain_arrangements",
+    "enumerate_junction_arrangements",
     "generate_all",
     "generate_family",
     "junction_net",
@@ -509,6 +520,554 @@ def _bus_net(spec: FamilySpec) -> str | None:
     ranked = sorted(((-len({str(r) for r, _p in pins}), str(net))
                      for net, pins in spec.nets.items()))
     return ranked[0][1] if ranked else None
+
+
+# --------------------------------------------------------------------------- #
+# THE ARRANGEMENT OBJECTIVE (cell-arrangement-objective plan, WS-A2)
+#
+# ⛔⛔ Everything below this line is a PARALLEL entry point. ``_meets``,
+# :func:`arrangements`, :func:`generate_family` and :func:`generate_all` are
+# untouched, no default moves, and the 54 ``family_cache`` digests recompile
+# byte-identical -- gate ``A2`` asserts exactly that. Winner SELECTION lives in
+# the driver (the ``propose_pair_cells`` precedent: policy in the driver,
+# mechanism in the library).
+# --------------------------------------------------------------------------- #
+
+#: The three arrangements the human's rule permits for a **junction** -- three
+#: 2-pin devices sharing one net. ⛔ A LINE is not among them, and that is the
+#: whole content of the rule (``canaries/ideal_arrangements.py`` is the answer
+#: key; this is the enumeration that has to rediscover it).
+JUNCTION_SHAPES = ("bus3", "ell_a", "ell_b")
+
+#: How much room a junction arrangement leaves between two members whose
+#: **facing pads carry the same net**, on top of whichever floor binds.
+#: ⭐ Deliberately small, and it is the opposite of what :data:`GAP_LADDER`
+#: does. The shape generator widens the gap to open a *channel a stranger can
+#: cross*; the human's rule closes it, because two facing same-net pads already
+#: block that space and the connection between them is then a stub that costs
+#: no channel at all. ⚠ Measured consequence, and it is the finding that made
+#: this enumeration necessary: every shipped winner in ``family_cache`` is at
+#: ``gap1.00`` (24 ``long``, 24 ``short``, 6 ``stack``) -- the contract test
+#: drove the whole library to the widest rung of the ladder.
+#:
+#: ⛔⛔⛔ **THIS IS NO LONGER THE ONLY FLOOR, AND THE FIRST CUT SHIPPED SEVEN
+#: UNBUILDABLE CELLS BECAUSE IT WAS.** Reported by the human 2026-08-03 from
+#: the rendered cells: **7 of 7** ``family_cache_junction`` winners overlapped
+#: their neighbours' **COURTYARDS** by 0.100-0.310 mm. The acceptance criterion
+#: (``min_member_gap`` -> ``CellAcceptance.members_legal``) measures the
+#: **body-plus-pads** envelope (``transformed_physical_bounds``); a KiCad
+#: courtyard is a *separate, larger* outline, and nothing in this stack was
+#: comparing it. See :func:`junction_gap_mm`.
+JUNCTION_GAP_EXTRA_MM = 0.05
+
+#: Extra clearance demanded between two courtyards, on top of touching.
+#: ⚠ 0.0 means "may touch, may not overlap", which is what KiCad's own
+#: courtyard rule tests. Kept nameable so a fab that wants daylight can ask.
+COURTYARD_MARGIN_MM = 0.0
+
+#: The pairwise relations :func:`arrangement_signature` classifies.
+MEMBER_RELATIONS = ("INLINE", "OFFSET", "SIDE", "T")
+
+
+# --------------------------------------------------------------------------- #
+# The objective's own HPWL term
+# --------------------------------------------------------------------------- #
+def cell_pad_hpwl(cell) -> float:
+    """Half-perimeter wire length over the cell's **own pad positions**, in mm.
+
+    ⛔⛔ **This is NOT the parked board-level ``hpwl_objective="pads"`` knob and
+    it does not read ``scoring.py``.** That knob changes how a *board* placer
+    scores a *placement*; this is a number about one cell's internal geometry,
+    used at GENERATION time to choose between arrangements of the same parts.
+    The two never meet, and the board knob stays parked and default OFF.
+
+    ⭐⭐ **Why pads and not centroids, measured on the 0805 junction cell
+    2026-08-02.** A centroid HPWL cannot tell two shapes apart when the parts
+    sit at the same centres, and on the five authored arrangements it ranks
+    ``short`` (9.25 by pads) *above* ``stack`` (6.96) -- the wrong way round.
+    Over pads the five come out ``ell_b`` 4.86 < ``ell_a`` 5.11 < ``stack``
+    6.96 < ``short`` 9.25 < ``long`` 9.73, which is exactly the human's
+    ordering. ⚠ Single-pad nets contribute nothing by construction: a net with
+    one pad in the box owns no in-cell wiring.
+    """
+    by_net: dict[str, list] = {}
+    for pad in cell.pads:
+        if pad.local_net:
+            by_net.setdefault(str(pad.local_net), []).append((pad.x, pad.y))
+    total = 0.0
+    for _net, points in sorted(by_net.items()):
+        if len(points) < 2:
+            continue
+        xs = [x for x, _y in points]
+        ys = [y for _x, y in points]
+        total += (max(xs) - min(xs)) + (max(ys) - min(ys))
+    return round(total, 6)
+
+
+# --------------------------------------------------------------------------- #
+# Reading a three-part topology
+# --------------------------------------------------------------------------- #
+def classify_three_part_topology(nets) -> str:
+    """``"junction"`` | ``"chain"`` | ``"other"`` from connectivity alone.
+
+    ⭐⭐ **The one distinction the whole plan turns on.** A *junction* is one
+    net every member touches with exactly one pad -- a divider's ``MID`` -- and
+    a line is the one arrangement it must never take, because the two end
+    members' junction pads are then separated by the middle member's foreign
+    pad and the hop has to go around the outside. A *chain* is three parts in
+    series, and there the line is the **right** answer. ⛔ Same three
+    footprints, different netlist, different winner: an objective that returns
+    the same geometry for both has not read the topology.
+
+    ``nets`` is ``{net: [(local_ref, pad), ...]}``. Junction is tested first --
+    a topology that is both is a junction, since the junction net is the
+    stronger statement.
+    """
+    pins = [(str(ref), str(pad)) for pin_list in nets.values()
+            for ref, pad in pin_list]
+    refs = sorted({ref for ref, _pad in pins})
+    if len(refs) != 3:
+        return "other"
+    for _net, pin_list in sorted(nets.items()):
+        touched = [str(ref) for ref, _pad in pin_list]
+        if sorted(set(touched)) == refs and len(touched) == 3:
+            return "junction"
+    links = []
+    for _net, pin_list in sorted(nets.items()):
+        members = {str(ref) for ref, _pad in pin_list}
+        if len(pin_list) == 2 and len(members) == 2:
+            links.append(tuple(sorted(members)))
+    if len(links) == 2 and len(set(links)) == 2:
+        degree: dict[str, int] = {}
+        for a, b in links:
+            degree[a] = degree.get(a, 0) + 1
+            degree[b] = degree.get(b, 0) + 1
+        if len(degree) == 3 and sorted(degree.values()) == [1, 1, 2]:
+            return "chain"
+    return "other"
+
+
+# --------------------------------------------------------------------------- #
+# A rotation- and reflection-invariant description of a three-part arrangement
+# --------------------------------------------------------------------------- #
+def _overlap_fraction(c1: float, e1: float, c2: float, e2: float) -> float:
+    """How much two centred 1-D extents overlap, as a fraction of the smaller."""
+    lo = max(c1 - e1 / 2.0, c2 - e2 / 2.0)
+    hi = min(c1 + e1 / 2.0, c2 + e2 / 2.0)
+    smaller = min(e1, e2)
+    if smaller <= 0:                                           # pragma: no cover
+        return 0.0
+    return max(0.0, min(1.0, (hi - lo) / smaller))
+
+
+def courtyard_overhangs(spec: FamilySpec, size: str,
+                        fp_lib_dirs) -> dict[str, tuple[float, float]]:
+    """``{local_ref: (over_x, over_y)}`` -- how far each member's **courtyard**
+    sticks out past its body-plus-pads envelope, MEASURED from the library.
+
+    ⛔⛔ **The number this codebase was missing, and its absence shipped seven
+    unbuildable cells.** ``FootprintGeometry.physical_bounds`` is body ∪ pads;
+    ``.bounds`` prefers ``courtyard_bounds`` when the footprint declares one.
+    ``min_member_gap`` -- and therefore ``CellAcceptance.members_legal``, and
+    therefore every legality gate this stack has -- compares the **first**.
+    So an arrangement can sit at exactly the design clearance, pass every gate,
+    and still overlap its neighbour's courtyard.
+
+    Measured on the stock KiCad libraries: **0.175 mm** per side at 0402 and
+    **0.275-0.280 mm** at 0603/0805, on R, C and L alike. ⛔ **Do not table
+    those numbers** -- that is trap 13, and this function is the reason it does
+    not need to be re-learned a fourth time.
+
+    ⚠ A footprint with **no** declared courtyard contributes ``(0.0, 0.0)``:
+    nothing to overlap is not the same as an overlap of zero, and the caller
+    that needs to know reads :func:`missing_courtyards`.
+    """
+    from .geometry import load_footprint_geometries
+
+    footprints = {ref: footprint_for(kind, size) for ref, kind in spec.parts}
+    geometries = load_footprint_geometries(set(footprints.values()),
+                                           list(fp_lib_dirs or []))
+    out: dict[str, tuple[float, float]] = {}
+    for ref, footprint in footprints.items():
+        geometry = geometries.get(footprint)
+        if geometry is None or geometry.courtyard_bounds is None:
+            out[ref] = (0.0, 0.0)
+            continue
+        px0, py0, px1, py1 = geometry.physical_bounds
+        cx0, cy0, cx1, cy1 = geometry.courtyard_bounds
+        out[ref] = (round(max(px0 - cx0, cx1 - px1), 6),
+                    round(max(py0 - cy0, cy1 - py1), 6))
+    return out
+
+
+def missing_courtyards(spec: FamilySpec, size: str, fp_lib_dirs) -> list[str]:
+    """The footprints that declare **no** courtyard at all.
+
+    ⛔ Rule 3 at the seam where it belongs: a courtyard gate run over a
+    footprint with no courtyard would pass by observing nothing, which is
+    indistinguishable from passing because the geometry is clear.
+    """
+    from .geometry import load_footprint_geometries
+
+    footprints = sorted({footprint_for(kind, size) for _ref, kind in spec.parts})
+    geometries = load_footprint_geometries(set(footprints),
+                                           list(fp_lib_dirs or []))
+    return [name for name in footprints
+            if geometries.get(name) is None
+            or geometries[name].courtyard_bounds is None]
+
+
+def junction_gap_mm(spec: FamilySpec, size: str, *, clearance_mm: float,
+                    fp_lib_dirs, margin_mm: float = COURTYARD_MARGIN_MM
+                    ) -> float:
+    """The gap an authored arrangement is built at -- **derived, never tabled**.
+
+    Two floors, and the second is the one the first cut did not have:
+
+    1. the design **clearance** plus :data:`JUNCTION_GAP_EXTRA_MM`;
+    2. ⛔⛔ **the two members' courtyard overhangs plus** ``margin_mm`` -- so
+       the courtyards touch at worst and never overlap.
+
+    Measured consequence at ``oshpark-2l`` (clearance 0.25): floor 1 gives
+    0.30 at every size, while floor 2 demands **0.350** at 0402 and **0.555-
+    0.560** at 0603/0805. Floor 2 binds everywhere, which is exactly why the
+    seven cells shipped on 2026-08-02 overlapped.
+
+    ⚠ The worst pair over the family is used, not a per-pair value, so one
+    arrangement has one gap and the shape stays uniform.
+    """
+    overhangs = courtyard_overhangs(spec, size, fp_lib_dirs)
+    refs = sorted(spec.refs)
+    worst = 0.0
+    for index, a in enumerate(refs):
+        for b in refs[index + 1:]:
+            worst = max(worst,
+                        overhangs[a][0] + overhangs[b][0],
+                        overhangs[a][1] + overhangs[b][1])
+    return round(max(float(clearance_mm) + JUNCTION_GAP_EXTRA_MM,
+                     worst + float(margin_mm)), 6)
+
+
+def member_courtyard_gap(cell, fp_lib_dirs) -> float:
+    """Smallest **courtyard** separation between any two part members, in mm.
+
+    ⭐ Deliberately the same rule as
+    :func:`~skidl_layout.cells_compile.min_member_gap` -- two parts clear each
+    other if **either** axis separates them, so the per-pair gap is
+    ``max(gap_x, gap_y)`` and the cell's is the minimum over pairs. The only
+    difference is the box: the courtyard, not body ∪ pads. Negative means two
+    courtyards overlap and KiCad's own courtyard rule would object.
+
+    ⛔⛔ **And KiCad's DRC will NOT tell you.** Verified 2026-08-03 on a board
+    with two 0805 courtyards deliberately driven ~1 mm into each other:
+    ``kicad-cli pcb drc --severity-all`` returned **15 violations** --
+    ``shorting_items``, ``silk_over_copper``, ``silk_overlap``, ``clearance``,
+    ``track_dangling`` -- and **not one courtyard type**. So on the boards this
+    stack writes the courtyard test does not run, DRC cannot be the guard, and
+    this function is the guard.
+
+    ``inf`` for a cell with fewer than two members -- nothing to collide with.
+    """
+    from .geometry import load_footprint_geometries
+    from .writer import PlacedPart
+
+    members = list(cell.part_members)
+    if len(members) < 2:
+        return float("inf")
+    geometries = load_footprint_geometries({m.footprint for m in members},
+                                           list(fp_lib_dirs or []))
+    boxes = {}
+    for member in members:
+        geometry = geometries.get(member.footprint)
+        if geometry is None:
+            continue
+        placed = PlacedPart(ref=member.local_ref, x_mm=member.dx,
+                            y_mm=member.dy, rot_deg=float(member.rotation),
+                            footprint=member.footprint, side="front")
+        # ⭐ ``transformed_bounds`` prefers the courtyard; ``transformed_
+        # physical_bounds`` is body u pads. That one-word difference IS the bug
+        # this function exists to catch.
+        boxes[member.local_ref] = geometry.transformed_bounds(placed)
+    if len(boxes) < 2:
+        return float("inf")
+    refs = sorted(boxes)
+    worst = float("inf")
+    for index, a in enumerate(refs):
+        ax0, ay0, ax1, ay1 = boxes[a]
+        for b in refs[index + 1:]:
+            bx0, by0, bx1, by1 = boxes[b]
+            worst = min(worst, max(max(bx0 - ax1, ax0 - bx1),
+                                   max(by0 - ay1, ay0 - by1)))
+    return round(worst, 6)
+
+
+def member_relation(a, b, *, overlap_min: float = 0.6) -> str:
+    """How two members sit against each other, independent of the frame.
+
+    ``SIDE``    separated along **both** members' short axis, well overlapped --
+                long sides shared (the pair in ``bus3`` / ``ell_*``).
+    ``INLINE``  separated along **both** members' long axis, well overlapped --
+                end to end, which is what a chain hop wants and what a junction
+                must not be built from.
+    ``T``       separated along one member's long axis and the other's short --
+                the ``ell_a`` tee.
+    ``OFFSET``  separated, but the projections barely overlap -- diagonal.
+
+    ⛔ Deliberately **not** a distance. Two arrangements that differ only by a
+    gap are the same *shape*, and that is the point: the enumeration's real
+    contribution over the shipped generator turns out to be the gap and the
+    facing rotations, not new topologies, and a signature that folded the gap in
+    would hide that.
+    """
+    gap_x = abs(a.dx - b.dx) - (a.w + b.w) / 2.0
+    gap_y = abs(a.dy - b.dy) - (a.h + b.h) / 2.0
+    if gap_x >= gap_y:
+        along = (a.w >= a.h, b.w >= b.h)
+        overlap = _overlap_fraction(a.dy, a.h, b.dy, b.h)
+    else:
+        along = (a.h >= a.w, b.h >= b.w)
+        overlap = _overlap_fraction(a.dx, a.w, b.dx, b.w)
+    if overlap < overlap_min:
+        return "OFFSET"
+    if all(along):
+        return "INLINE"
+    if not any(along):
+        return "SIDE"
+    return "T"
+
+
+def arrangement_signature(cell, *, overlap_min: float = 0.6) -> tuple:
+    """The sorted multiset of :func:`member_relation` over every member pair.
+
+    ⭐⭐ **This is what "the winner landed on one of the shapes the human
+    named" means machine-checkably**, and it has to be structural rather than
+    coordinate-wise for two independent reasons: the answer key measures its
+    envelopes from the footprint library while the recorded calibration table
+    was authored against a hardcoded 0805 envelope (the two differ by
+    ~0.02-0.05 mm and **that difference is intended**), and two arrangements
+    that differ only by their gap are the same shape.
+
+    Measured on the 0805 junction, and the four are distinct:
+    ``bus3`` ``(SIDE, SIDE, SIDE)``, ``ell_a`` ``(SIDE, T, T)``,
+    ``ell_b`` ``(INLINE, OFFSET, SIDE)``, the forbidden ``line``
+    ``(INLINE, INLINE, INLINE)``.
+    ⭐ The shipped shapes fold onto them exactly -- ``short`` -> ``bus3``'s,
+    ``stack`` -> ``ell_b``'s, and ``long`` -> the **line**'s -- which is the
+    structural statement that ``long`` *is* the forbidden arrangement.
+    """
+    members = sorted(cell.part_members, key=lambda m: m.local_ref)
+    return tuple(sorted(
+        member_relation(a, b, overlap_min=overlap_min)
+        for index, a in enumerate(members) for b in members[index + 1:]))
+
+
+# --------------------------------------------------------------------------- #
+# The junction / chain enumerations
+# --------------------------------------------------------------------------- #
+def _along_y(spec: FamilySpec, size: str, order, extents, offsets, gap: float,
+             bus: str | None, want: str):
+    """Members side by side along +y, each turned so its ``bus`` pad faces
+    ``want``. ⚠ 0/180 only, so the axis-aligned envelope never changes and the
+    cursor arithmetic stays valid (:func:`_facing_rotation`'s own reason)."""
+    kinds = dict(spec.parts)
+    members, cursor = [], 0.0
+    for index, ref in enumerate(order):
+        pad = spec.pad_on(ref, bus) if bus else None
+        rotation = _facing_rotation(offsets[ref], pad, want)
+        if index:
+            cursor += (extents[order[index - 1]][1] + extents[ref][1]) / 2.0 + gap
+        members.append((ref, footprint_for(kinds[ref], size), 0.0,
+                        round(cursor, 6), rotation))
+    return members
+
+
+def _ell_b(spec: FamilySpec, size: str, pair, odd: str, extents, offsets,
+           gap: float, bus: str | None):
+    """The pair long-sides-together; the odd member **in line** with the pair's
+    second, pin-side to pin-side across the gap."""
+    kinds = dict(spec.parts)
+    members = _along_y(spec, size, pair, extents, offsets, gap, bus, "E")
+    _anchor_ref, _fp, _ax, anchor_y, _rot = members[-1]
+    # ⛔⛔ The MAX width over the pair, not the anchor's. The odd member sits on
+    # the anchor's row but must also clear the pair's OTHER member diagonally,
+    # and using the anchor's width under-spaces it whenever the other member is
+    # wider. MEASURED at 0402, where ``C_0402`` is 1.52 wide against ``R_0402``
+    # 1.56: ``ell_b-oddR1-R2C1`` came out with its courtyards **0.01 mm** into
+    # each other -- the same defect as the shipped cells, surviving one round of
+    # fixing because the gap was right and the reference box was not.
+    x = (max(extents[r][0] for r in pair) + extents[odd][0]) / 2.0 + gap
+    pad = spec.pad_on(odd, bus) if bus else None
+    members.append((odd, footprint_for(kinds[odd], size), round(x, 6),
+                    anchor_y, _facing_rotation(offsets[odd], pad, "W")))
+    return members
+
+
+def _ell_a(spec: FamilySpec, size: str, pair, odd: str, extents, turned,
+           offsets, gap: float, bus: str | None, turn: int):
+    """The tee: the pair long-sides-together, the odd member turned across them.
+
+    ⚠ The odd member's rotation is **enumerated** (90 and 270) rather than
+    derived: turned across the pair it presents both its pads to the pair's
+    midline, so which one carries the junction net is a genuine choice and not
+    something the netlist decides. ⛔ That is the honest treatment -- deriving it
+    from a rule invented here would be the hardcoded-cycle trap in a new place.
+    """
+    kinds = dict(spec.parts)
+    members = _along_y(spec, size, pair, extents, offsets, gap, bus, "E")
+    span = [y for _r, _f, _x, y, _rot in members]
+    x = max(extents[r][0] for r in pair) / 2.0 + gap + turned[odd][0] / 2.0
+    members.append((odd, footprint_for(kinds[odd], size), round(x, 6),
+                    round((min(span) + max(span)) / 2.0, 6), int(turn)))
+    return members
+
+
+def _is_stack_diagonal(label: str) -> bool:
+    """``stack-gapA-rowB`` with ``A == B``. ⭐ The shipped generator's own
+    winner is on this diagonal on 6 of 6 (``stack-gap1.00-row1.00``), so the
+    sample keeps the incumbent it has to beat."""
+    if not label.startswith("stack-gap") or "-row" not in label:
+        return False
+    head, row = label.split("-row", 1)
+    return head[len("stack-gap"):] == row
+
+
+def _junction_candidates(spec: FamilySpec, size: str, *, gap: float,
+                         fp_lib_dirs, bus: str | None):
+    """The 15 authored non-line arrangements: 3 x ``bus3``, 6 x ``ell_a``,
+    6 x ``ell_b``.
+
+    ⛔ ``bus3`` enumerates only **which member is in the middle** (3, not 6):
+    reversing the row is a 180 degree rotation of the whole cell, and a cell is
+    already rotatable at placement time, so the other three are the same cell.
+    ``ell_b`` does enumerate both pair orders, because there the odd member
+    lines up with the pair's *second* member and swapping them is a reflection,
+    not a rotation.
+    """
+    kinds = dict(spec.parts)
+    extents = member_envelopes(spec, size, 0, fp_lib_dirs)
+    turned = member_envelopes(spec, size, 90, fp_lib_dirs)
+    offsets = {ref: pad_offsets(footprint_for(kinds[ref], size), fp_lib_dirs)
+               for ref in spec.refs}
+    refs = tuple(sorted(spec.refs))
+    out: list[Arrangement] = []
+    for middle in refs:
+        ends = [r for r in refs if r != middle]
+        order = (ends[0], middle, ends[1])
+        out.append(Arrangement(
+            label=f"bus3-mid{middle}-gap{gap:.2f}", shape="bus3",
+            members=tuple(_along_y(spec, size, order, extents, offsets, gap,
+                                   bus, "E"))))
+    for odd in refs:
+        rest = [r for r in refs if r != odd]
+        for pair in (tuple(rest), tuple(reversed(rest))):
+            out.append(Arrangement(
+                label=f"ell_b-odd{odd}-{pair[0]}{pair[1]}-gap{gap:.2f}",
+                shape="ell_b",
+                members=tuple(_ell_b(spec, size, pair, odd, extents, offsets,
+                                     gap, bus))))
+        for turn in (90, 270):
+            out.append(Arrangement(
+                label=f"ell_a-odd{odd}-r{turn}-gap{gap:.2f}", shape="ell_a",
+                members=tuple(_ell_a(spec, size, tuple(rest), odd, extents,
+                                     turned, offsets, gap, bus, turn))))
+    return out
+
+
+def _legacy_candidates(spec: FamilySpec, size: str, *, gap_mm: float,
+                       fp_lib_dirs, shapes=SHAPES):
+    """``(candidates, dropped)`` -- the shipped generator's own arrangements,
+    kept in the enumeration **deliberately**.
+
+    ⛔ The objective has to beat the incumbent, not be protected from it, and
+    ``long`` is the incumbent that a junction must never take. ⚠ ``stack``'s
+    5x5 cross-ladder is sampled on its diagonal (5 of 25); the 20 dropped rows
+    are counted and reported, never silently discarded.
+    """
+    out, dropped = [], 0
+    for shape in shapes:
+        kept, over = arrangements(spec, size, gap_mm=gap_mm,
+                                  fp_lib_dirs=fp_lib_dirs, shape=shape,
+                                  max_arrangements=64)
+        dropped += over
+        if shape == "stack":
+            diagonal = [a for a in kept if _is_stack_diagonal(a.label)]
+            dropped += len(kept) - len(diagonal)
+            kept = diagonal
+        out.extend(kept)
+    return out, dropped
+
+
+def enumerate_junction_arrangements(
+    spec: FamilySpec, size: str, *, gap_mm: float, fp_lib_dirs,
+    junction_gap: float | None = None, max_arrangements: int = 32,
+) -> tuple[list[Arrangement], int]:
+    """``(candidates, dropped)`` for a three-member **junction** family.
+
+    15 authored non-line arrangements at one tight, netlist-derived gap, plus
+    the shipped generator's ``long`` / ``short`` / ``stack`` ladders as foils --
+    30 in all, so the ``max_arrangements`` cap does not bind at the default.
+    ⛔ The authored shapes come **first**, so if a caller does lower the cap it
+    removes foils rather than the answers.
+
+    ⛔ Returns ``([], 0)`` for a family that is not a three-member junction --
+    that is data, not an error, and :func:`classify_three_part_topology` is how
+    a caller asks in advance.
+    """
+    junction = junction_net(spec)
+    if junction is None or len(spec.refs) != 3:
+        return [], 0
+    # ⛔⛔ DERIVED, not `gap_mm + 0.05`. The constant shipped seven cells whose
+    # courtyards overlapped -- see `junction_gap_mm`.
+    gap = float(junction_gap if junction_gap is not None
+                else junction_gap_mm(spec, size, clearance_mm=gap_mm,
+                                     fp_lib_dirs=fp_lib_dirs))
+    out = _junction_candidates(spec, size, gap=gap, fp_lib_dirs=fp_lib_dirs,
+                               bus=junction)
+    legacy, dropped = _legacy_candidates(spec, size, gap_mm=gap_mm,
+                                         fp_lib_dirs=fp_lib_dirs)
+    out.extend(legacy)
+    dropped += max(0, len(out) - int(max_arrangements))
+    return out[:int(max_arrangements)], dropped
+
+
+def enumerate_chain_arrangements(
+    spec: FamilySpec, size: str, *, gap_mm: float, fp_lib_dirs,
+    chain_gap: float | None = None, max_arrangements: int = 32,
+) -> tuple[list[Arrangement], int]:
+    """``(candidates, dropped)`` for a three-member **chain** family.
+
+    ⭐⭐ **The control the whole plan exists to earn.** Same three footprints as
+    :func:`enumerate_junction_arrangements`, different netlist -- and here the
+    line is the *right* answer, so it is authored explicitly at the tight gap
+    (``line-gapG``) alongside the shipped ``long`` ladder, with the same
+    non-line shapes as foils. An objective that prefers a non-line for the
+    junction and the line here has read the topology; one that returns the same
+    geometry for both has not.
+
+    ⚠ ``stack`` is absent by construction -- it needs a junction net, and a
+    chain has none. That is :func:`arrangements`' own answer, not a filter here.
+    """
+    order = chain_order(spec)
+    if order is None or len(spec.refs) != 3:
+        return [], 0
+    gap = float(chain_gap if chain_gap is not None
+                else junction_gap_mm(spec, size, clearance_mm=gap_mm,
+                                     fp_lib_dirs=fp_lib_dirs))
+    kinds = dict(spec.parts)
+    extents = member_envelopes(spec, size, 0, fp_lib_dirs)
+    offsets = {ref: pad_offsets(footprint_for(kinds[ref], size), fp_lib_dirs)
+               for ref in spec.refs}
+    out = [Arrangement(
+        label=f"line-gap{gap:.2f}", shape="line",
+        members=tuple(_long(spec, size, order, extents, offsets, gap)))]
+    out.extend(_junction_candidates(spec, size, gap=gap,
+                                    fp_lib_dirs=fp_lib_dirs,
+                                    bus=junction_net(spec) or _bus_net(spec)))
+    legacy, dropped = _legacy_candidates(spec, size, gap_mm=gap_mm,
+                                         fp_lib_dirs=fp_lib_dirs)
+    out.extend(legacy)
+    dropped += max(0, len(out) - int(max_arrangements))
+    return out[:int(max_arrangements)], dropped
 
 
 # --------------------------------------------------------------------------- #
