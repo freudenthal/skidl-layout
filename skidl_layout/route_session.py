@@ -57,8 +57,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-__all__ = ["RouteSession", "PairResult", "StampToken", "Snapshot",
-           "RollbackError", "SessionError"]
+__all__ = ["RouteSession", "PairResult", "StampToken", "CommitToken",
+           "Snapshot", "RollbackError", "SessionError"]
 
 #: The KRT commit this module's private-API dependency was pinned against.
 #: ⚠ Named in the error message on purpose, so a future re-sync fails loudly
@@ -97,6 +97,22 @@ class PairResult:
     path_cells: int
     elapsed_s: float
     failure: str | None = None
+    #: ⭐⭐⭐ **S7 STAGE C1.** The copper the router actually produced, kept only
+    #: when :meth:`RouteSession.route_pair` was asked for it
+    #: (``keep_copper=True``). ⛔ Default ``None`` on every field, so every
+    #: consumer written before S7 is **byte-unchanged**.
+    #: ⛔ **ONE derivation, owned by its producer** (standing finding 29): these
+    #: are KRT's own ``new_segments`` / ``new_vias`` / ``path`` objects, passed
+    #: through. A ``PairResult`` still carries no INVENTED path -- the module
+    #: docstring's rule is *"never invent one"*, not *"never keep one"*.
+    segments: tuple | None = None
+    new_vias: tuple | None = None
+    path: tuple | None = None
+    net: str = ""
+
+    @property
+    def has_copper(self) -> bool:
+        return bool(self.segments) or bool(self.new_vias)
 
 
 @dataclass(frozen=True)
@@ -142,12 +158,48 @@ class StampToken:
 
 
 @dataclass(frozen=True)
+class CommitToken:
+    """⭐⭐⭐ **S7 STAGE C2 -- what :meth:`RouteSession.commit_pair` stamped.**
+
+    ⛔⛔ **It mirrors :class:`StampToken` deliberately and completely**, because
+    part 1 §7.5 deferred committed copper for exactly one reason -- *"a
+    committed route changes what 'rollback' means, and exact rollback is the
+    invariant the entire session rests on"* -- and lifting that deferral turns
+    the reason into a **design requirement**: a commit is tokened, LIFO-checked
+    and census-verified on the same discipline a stamp is, or it does not ship.
+    """
+
+    net: str
+    segments: tuple
+    vias: tuple
+    pre_census: tuple
+    post_census: tuple = ()
+    #: ⛔ The session's SHARED operation counter (the same one
+    #: :meth:`RouteSession.add_part` bumps), so "nothing has happened since"
+    #: is a structural fact across stamps *and* commits rather than a census
+    #: coincidence -- ``StampToken``'s docstring records what happened the two
+    #: times that distinction was got wrong.
+    ops_at_commit: int = -1
+
+    @property
+    def segment_count(self) -> int:
+        return int(len(self.segments))
+
+    @property
+    def via_count(self) -> int:
+        return int(len(self.vias))
+
+
+@dataclass(frozen=True)
 class Snapshot:
     """The session's state as a value: the census plus the live token list."""
 
     census: tuple
     tokens: tuple = ()
     routes: int = 0
+    #: ⛔ S7 C2: a snapshot that did not carry the commits would restore the
+    #: stamps and leave the copper, which is a rollback that is not one.
+    commits: tuple = ()
 
 
 class _FullRecorder:
@@ -290,6 +342,8 @@ class RouteSession:
     liftable_nets: tuple = ()
     warmup: dict = field(default_factory=dict)
     _tokens: list = field(default_factory=list)
+    #: ⛔ S7 C2: committed copper, kept in its own stack but sharing ``_ops``.
+    _commits: list = field(default_factory=list)
     _ops: int = 0
     _routes: int = 0
 
@@ -444,6 +498,40 @@ class RouteSession:
         """Whether ``pad`` is a routing terminal at all (see :meth:`terminals`)."""
         return bool(self.terminals(pad))
 
+    def is_liftable(self, net_name: str) -> bool:
+        """Whether :meth:`lift_net` can actually take ``net_name`` out.
+
+        ⭐⭐⭐ **S10 §1.** A net is liftable when its pads reached the map
+        through :meth:`add_part` -- which is true of a ``liftable_nets`` net
+        (stamped back in by :meth:`from_board`) and of an ``unstamped_nets`` net
+        during a constructive walk, and **false** of every other net, whose pads
+        the base map stamped with no per-pad record to remove.
+
+        ⛔ A net that is neither is not merely un-liftable; it is **walled in**,
+        because its own pads' copper plus clearance sits in the obstacle map
+        between its own endpoints. That is what :meth:`route_pair` refuses.
+        """
+        name = str(net_name)
+        return name in set(self.unstamped_nets) or name in set(self.liftable_nets)
+
+    def base_stamped_pads(self, net_name: str) -> int:
+        """How many pads of ``net_name`` the **base map** stamped, unremovably.
+
+        ⛔ Zero for a net named in ``unstamped_nets``/``liftable_nets``
+        (:meth:`from_board` excludes those net ids from
+        ``build_base_obstacle_map``), and zero for a net that is not on this
+        board at all -- which is why :meth:`route_pair`'s refusal below is
+        precise rather than a name test.
+        """
+        name = str(net_name)
+        if self.is_liftable(name) or self.pcb is None:
+            return 0
+        nid = next((i for i, net in self.pcb.nets.items()
+                    if str(net.name) == name), None)
+        if nid is None:
+            return 0
+        return len(self.pcb.pads_by_net.get(nid, ()) or ())
+
     def add_part(self, part_key: str, pads, *, recorder_cls=None) -> StampToken:
         """Stamp every pad of one part into the live map and return its token.
 
@@ -561,12 +649,236 @@ class RouteSession:
         except ValueError:                                     # pragma: no cover
             pass
 
+    # -- S7 C2 -- committed copper, on the SAME discipline as a stamp -------- #
+    def commit_pair(self, result: PairResult, *, net: str = "") -> CommitToken:
+        """⭐⭐⭐ Stamp an accepted pair's **copper** into the live map.
+
+        Part 1 §7.5 deferred this because *"a committed route changes what
+        'rollback' means"*. It does -- so a commit is a **token**, checked
+        exactly the way :meth:`add_part`'s is: pre-census recorded, structural
+        LIFO through the shared operation counter, and
+        :meth:`uncommit` **asserting** the census comes back.
+
+        ⛔ ``result`` must come from ``route_pair(..., keep_copper=True)``. A
+        committed route with no copper is an instrument defect, not a small
+        route, and it **raises** (rule 3) -- otherwise a loop that silently
+        committed nothing would look exactly like one that committed
+        everything.
+        ⚠ The copper is stamped as an obstacle for **every** net. Its own net's
+        tap must therefore lift it first, which is what
+        :meth:`route_pair`'s ``lift_own_net`` already does for pads and what
+        :meth:`committed_terminals` is for.
+        """
+        if not isinstance(result, PairResult):
+            raise SessionError(f"⛔ commit_pair got {type(result).__name__}, "
+                               f"not a PairResult")
+        if not result.routed:
+            raise SessionError(
+                "⛔ commit_pair was handed an UNROUTED pair. Committing a "
+                "failure would make the map disagree with the answer.")
+        if result.segments is None and result.new_vias is None:
+            raise SessionError(
+                "⛔ commit_pair needs a result from route_pair(..., "
+                "keep_copper=True) -- this one carries no copper fields at "
+                "all, and inventing them is forbidden.")
+        segments = tuple(result.segments or ())
+        vias = tuple(result.new_vias or ())
+        if not segments and not vias:
+            raise SessionError(
+                "⛔ commit_pair got a routed pair with ZERO segments and ZERO "
+                "vias. A commit that blocks nothing is indistinguishable from "
+                "one that blocked everything (rule 3).")
+        pre = self.census
+        self._ops += 1
+        self._stamp_copper(segments, vias)
+        token = CommitToken(net=str(net or result.net or ""),
+                            segments=segments, vias=vias, pre_census=pre,
+                            post_census=self.census,
+                            ops_at_commit=self._ops)
+        # ⛔⛔ **THIS IS WHERE A "the census must MOVE" CHECK USED TO BE, AND IT
+        # WAS WRONG.** It fired on the first real board (``ltc1871_sepic``,
+        # net ``VOUT``, one segment) and it was asserting something about the
+        # **instrument** rather than about the map -- exactly the mistake
+        # :meth:`remove_part`'s docstring records having made twice already.
+        # The census is a **five-number summary** and every pad is stamped by
+        # the base map, so a short stub between two already-stamped pads can
+        # raise real refcounts while leaving all five numbers pinned. ⭐ *A
+        # no-op census delta is a legitimate outcome of refcounting.* What
+        # proves a commit is real is the **round trip**, not a delta, and that
+        # is asserted in :meth:`uncommit`. The observation is kept on the token
+        # (``pre_census`` vs ``post_census``) so a caller that wants it can see
+        # it, and gate ``RT4`` reports how often it happens.
+        self._commits.append(token)
+        return token
+
+    def uncommit(self, token: CommitToken) -> None:
+        """Un-stamp exactly what :meth:`commit_pair` stamped, and **assert** it.
+
+        ⛔⛔ The two-claim discipline is :meth:`remove_part`'s, verbatim and for
+        the same measured reasons: a **LIFO** uncommit is held to the exact
+        ``pre_census``; an out-of-order one is held to the only universally
+        true claim -- a removal can only decrement, so **no field may grow**.
+        ⛔ A census mismatch **raises**. Exact rollback is the invariant the
+        session rests on and this stage is not allowed to weaken it, only to
+        extend what it covers (plan bail-out C).
+        """
+        if token not in self._commits:
+            raise RollbackError(
+                f"⛔ uncommit() was handed a token this session does not hold "
+                f"(net {token.net!r}, {token.segment_count} segment(s))")
+        before = self.census
+        lifo = (bool(self._commits) and self._commits[-1] is token
+                and self._ops == token.ops_at_commit)
+        self._ops += 1
+        self._unstamp_copper(token.segments, token.vias)
+        now = self.census
+        if lifo and now != token.pre_census:
+            raise RollbackError(
+                f"⛔⛔ un-committing net {token.net!r} (LIFO) did not restore "
+                f"the map: {_census_drift(token.pre_census, now)} "
+                f"(before={token.pre_census} after={now}). Do NOT paper this "
+                f"over -- this trace IS plan bail-out C, and it is worth more "
+                f"than the feature.")
+        if not lifo and any(a > b for b, a in zip(before, now)):
+            raise RollbackError(
+                f"⛔⛔ un-committing net {token.net!r} out of order made the "
+                f"map MORE blocked: {_census_drift(before, now)}.")
+        self._commits.remove(token)
+
+    def _stamp_copper(self, segments, vias) -> None:
+        """⛔ ONE place where copper enters the map (standing finding 29)."""
+        obstacle_map = self.krt["obstacle_map"]
+        if segments:
+            obstacle_map.add_segments_list_as_obstacles(
+                self.obstacles, list(segments), self.config)
+        if vias:
+            obstacle_map.add_vias_list_as_obstacles(
+                self.obstacles, list(vias), self.config)
+
+    def _unstamp_copper(self, segments, vias) -> None:
+        """⛔ ...and ONE place where it leaves, so the two cannot drift."""
+        obstacle_map = self.krt["obstacle_map"]
+        if segments:
+            obstacle_map.remove_segments_list_from_obstacles(
+                self.obstacles, list(segments), self.config)
+        if vias:
+            obstacle_map.remove_vias_list_from_obstacles(
+                self.obstacles, list(vias), self.config)
+
+    def committed_terminals(self, net: str) -> list:
+        """⭐ **S7 C3 -- the tap targets.** Every committed cell of one net, in
+        :meth:`terminals`' own row shape ``(gx, gy, layer_idx, x_mm, y_mm)``.
+
+        ⛔ Requirement 2 -- *"route cross-tier connections from the closest wire
+        if KRT can, or the closest pad"* -- is one A\\* call: the search is
+        multi-target and terminates at the nearest, so the union of
+        {committed copper} ∪ {pad terminals} answers it exactly.
+        ⚠ The rows are **path cells**, not pad centres, so the ``x_mm``/``y_mm``
+        columns are grid-cell centres. That is what ``targets_override``'s
+        ``orig_x``/``orig_y`` are used for and it is stated rather than implied.
+        """
+        wanted = str(net)
+        out, seen = [], set()
+        for token in self._commits:
+            if token.net != wanted:
+                continue
+            for segment in token.segments:
+                layer = self.layer_map.get(getattr(segment, "layer", None))
+                if layer is None:
+                    continue
+                for attr in ("start", "end"):
+                    point = getattr(segment, attr, None)
+                    if point is None:
+                        continue
+                    x_mm, y_mm = float(point[0]), float(point[1])
+                    gx, gy = self.coord.to_grid(x_mm, y_mm)
+                    key = (gx, gy, layer)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append((gx, gy, layer, x_mm, y_mm))
+        return out
+
+    @property
+    def commits(self) -> tuple:
+        """⛔ The live commit stack, read-only. S7 C4's consumer reads this
+        rather than keeping a second ledger (standing finding 29)."""
+        return tuple(self._commits)
+
+    def uncommit_all(self) -> dict:
+        """Pop **every** commit and prove the copper's rollback is exact.
+
+        ⛔⛔ **THE OBVIOUS CLAIM HERE IS THE WRONG ONE, AND A REAL BOARD SAID
+        SO.** The first version compared the end census against
+        ``self._commits[0].pre_census`` and reported ``exact=False`` on 4 of 4
+        subjects. Nothing was wrong with the map: between the first commit and
+        the last, the construction loop **stamps parts**, and those stamps are
+        still live when the copper comes off -- so that comparison was
+        asserting something about ``add_part`` while claiming to measure
+        ``commit_pair``. It is :meth:`remove_part`'s recorded mistake in a
+        third costume.
+
+        ⭐ **The claim that IS exact, and it is checkable on the live map with
+        every stamp present: a full round trip.** Take the census with the
+        copper on; take it off; put it *back* and require the first census
+        **exactly**; take it off again and require the second **exactly**. That
+        isolates the commits from everything else on the map, needs no
+        bookkeeping outside this method, and costs only obstacle operations.
+
+        ⛔⛔ ``exact=False`` is **plan bail-out C**: record the trace, do not
+        work around it.
+        """
+        if not self._commits:
+            return {"uncommitted": 0, "exact": True, "with_copper": [],
+                    "without_copper": [], "drift": ""}
+        tokens = list(self._commits)
+        with_copper = self.census
+        for token in reversed(tokens):
+            self._unstamp_copper(token.segments, token.vias)
+        without_copper = self.census
+        # -- put it back, and demand the SAME map ---------------------------- #
+        for token in tokens:
+            self._stamp_copper(token.segments, token.vias)
+        replayed = self.census
+        # -- and take it off again, and demand the same empty map ------------ #
+        for token in reversed(tokens):
+            self._unstamp_copper(token.segments, token.vias)
+        final = self.census
+        self._ops += 1
+        self._commits.clear()
+        exact = (replayed == with_copper and final == without_copper)
+        drift = ""
+        if replayed != with_copper:
+            drift = ("re-stamping: "
+                     + _census_drift(with_copper, replayed))
+        elif final != without_copper:
+            drift = ("second un-stamp: "
+                     + _census_drift(without_copper, final))
+        return {"uncommitted": len(tokens), "exact": exact,
+                "with_copper": list(with_copper),
+                "without_copper": list(without_copper),
+                "replayed": list(replayed), "final": list(final),
+                "drift": drift}
+
     def snapshot(self) -> Snapshot:
         return Snapshot(census=self.census, tokens=tuple(self._tokens),
-                        routes=self._routes)
+                        routes=self._routes, commits=tuple(self._commits))
 
     def restore(self, snapshot: Snapshot) -> None:
-        """Pop tokens back to ``snapshot`` in **reverse** order and assert."""
+        """Pop tokens back to ``snapshot`` in **reverse** order and assert.
+
+        ⛔ S7 C2: the **commits come off first**, in reverse, because they were
+        stamped last -- a restore that returned the token list and left the
+        copper would be a rollback that is not one.
+        """
+        keep_commits = list(snapshot.commits)
+        while len(self._commits) > len(keep_commits):
+            self.uncommit(self._commits[-1])
+        if self._commits != keep_commits:
+            raise RollbackError(
+                f"⛔⛔ restore() left a different commit list: "
+                f"{[t.net for t in self._commits]} vs "
+                f"{[t.net for t in keep_commits]}")
         keep = list(snapshot.tokens)
         while len(self._tokens) > len(keep):
             self.remove_part(self._tokens[-1])
@@ -652,7 +964,9 @@ class RouteSession:
 
     def route_pair(self, a, b, *, net_id: int | None = None,
                    lift_own_net: bool = True,
-                   max_iterations: int | None = None) -> PairResult:
+                   max_iterations: int | None = None,
+                   keep_copper: bool = False,
+                   extra_targets=None) -> PairResult:
         """Route from pad ``a`` to pad ``b`` against the current map.
 
         ⛔ **Both overrides are ALWAYS passed.** KRT's derivation path
@@ -664,25 +978,100 @@ class RouteSession:
         ⭐ ``lift_own_net`` reproduces what KRT's real router does by passing
         ``nets_to_route``: the pair's **own** net is taken out of the obstacle
         map for the duration of the question, so a pad cannot wall in its own
-        escape. It is a no-op unless the net was declared ``liftable_nets`` at
-        construction -- see :meth:`from_board` for the measurement that made it
+        escape. See :meth:`from_board` for the measurement that made it
         necessary.
+
+        ⛔⛔⛔ **S10 §1 -- and the reason this refuses instead of shrugging.**
+        ``lift_own_net`` used to be a **silent no-op** on a net the session
+        could not lift, and a silent no-op is exactly the failure mode gate
+        ``C1`` was built to catch: the pair's own pad copper plus clearance
+        walls the direct front-layer path, A\\* correctly dives to the far layer
+        and comes back, and **the answer carries a via on each pad.** MEASURED
+        2026-08-05, ``RFB1``-``RFB2`` on ``FBX``
+        (``lt3758_iso_flyback``, placed board), one pair, four session
+        configurations and nothing else changed:
+
+        =========================================== ==== ======== ======
+        session configuration                       vias length   layers
+        =========================================== ==== ======== ======
+        ``unstamped_nets=[]``, no ``liftable_nets``  **2** 3.60 mm ``B.Cu``
+        ``unstamped_nets=[]`` + ``liftable_nets``      0   3.60 mm ``F.Cu``
+        ``unstamped_nets=ALL`` (constructive loop)     0   3.60 mm ``F.Cu``
+        ``unstamped_nets=ALL`` + ``liftable_nets``     0   3.60 mm ``F.Cu``
+        =========================================== ==== ======== ======
+
+        ⛔ **KRT's A\\* is not making an odd choice** -- it is routing around an
+        obstacle we told it about. The defect is in the *question*, so the fix
+        is at the question's seam: a caller that asks for a lift the session
+        cannot give gets a :class:`SessionError` naming both kwargs, not a
+        plausible number. Gate ``C1`` caught this once in 2026-08-02 and it came
+        back in a **new** caller (``drive_hier_route._prelay_internal_segments``,
+        the only production path built with ``unstamped_nets=[]``), which is the
+        signature of an API-shape problem rather than a call-site one.
+
+        ⚠ **The rejected alternative, recorded so it is not re-derived.**
+        :meth:`from_board` could have *defaulted* to lifting, and
+        :meth:`lift_net` could have learned to lift a base-stamped net by
+        re-deriving its cells through ``_add_pad_obstacle``. Both were rejected:
+        the first changes every recorded arm's numbers silently (the thing this
+        stack's standing rules exist to prevent), and the second gives the map a
+        **second** way of computing which cells belong to a pad -- the drift
+        :meth:`lift_net` names in its own docstring, made worse by KRT's removal
+        saturating at zero. A loud refusal costs one kwarg at each call site and
+        cannot be wrong.
 
         ⚠ ``length_mm`` is a **routed** length over the grid, so it is quantised
         and can fall **below** the straight line by up to ``sqrt(2) *
         grid_step`` -- both endpoints snap to cell centres. Measured: a pair
         3.0004 mm apart routes as 3.0000 mm. Do not compare it to HPWL as if
         they were the same quantity.
+
+        ⭐ **S7 C1/C3, both default OFF so every pre-S7 call is unchanged.**
+        ``keep_copper`` puts KRT's own ``new_segments`` / ``new_vias`` /
+        ``path`` on the result, which is what :meth:`commit_pair` consumes.
+        ``extra_targets`` are additional ``targets_override`` rows -- typically
+        :meth:`committed_terminals` for this net -- so *"tap the closest wire,
+        else the closest pad"* is one multi-target A\\* call rather than two
+        questions and a comparison.
         """
         own_net = str(getattr(a, "net_name", "") or getattr(b, "net_name", "")
                       or "")
         if lift_own_net and own_net:
+            walled = self.base_stamped_pads(own_net)
+            if walled:
+                raise SessionError(
+                    f"⛔⛔⛔ route_pair was asked about net {own_net!r} with "
+                    f"lift_own_net=True, but that net is stamped in the BASE "
+                    f"map ({walled} pad(s)) and therefore cannot be lifted -- "
+                    f"so the pair's own pad copper plus clearance walls the "
+                    f"direct front-layer path between its own endpoints, A* "
+                    f"dives to the far layer and comes back, and the answer "
+                    f"carries A VIA ON EACH PAD. That is via-in-pad, and it is "
+                    f"an artefact of the question, not of the board.\n"
+                    f"    Declare the net at construction -- "
+                    f"RouteSession.from_board(..., unstamped_nets=[{own_net!r}, "
+                    f"...]) if you are building the board up part by part, or "
+                    f"liftable_nets=[{own_net!r}, ...] if the board is already "
+                    f"placed -- or ask with lift_own_net=False if you really "
+                    f"want the walls. (This session declared "
+                    f"unstamped_nets={list(self.unstamped_nets)[:4]}"
+                    f"{'...' if len(self.unstamped_nets) > 4 else ''}, "
+                    f"liftable_nets={list(self.liftable_nets)[:4]}"
+                    f"{'...' if len(self.liftable_nets) > 4 else ''}.)")
             with self.lift_net(own_net) as lifted:
                 if lifted:
                     return self.route_pair(a, b, net_id=net_id,
                                            lift_own_net=False,
-                                           max_iterations=max_iterations)
+                                           max_iterations=max_iterations,
+                                           keep_copper=keep_copper,
+                                           extra_targets=extra_targets)
         sources, targets = self.terminals(a), self.terminals(b)
+        if extra_targets:
+            seen = {row[:3] for row in targets}
+            for row in extra_targets:
+                if tuple(row[:3]) not in seen:
+                    seen.add(tuple(row[:3]))
+                    targets.append(tuple(row))
         # ⛔ Rule 3, at the seam where it belongs: a pad with no copper (a
         # paste-only aperture) cannot be an endpoint, and answering
         # "unroutable" would be a measurement of the instrument, not the board.
@@ -718,13 +1107,21 @@ class RouteSession:
                               iterations=int((result or {}).get("iterations") or 0),
                               vias=0, path_cells=0,
                               elapsed_s=round(elapsed, 6),
-                              failure=failure or "no path")
+                              failure=failure or "no path", net=own_net)
         path = list(result.get("path") or ())
         return PairResult(
             routed=True, length_mm=self.path_length_mm(path),
             iterations=int(result.get("iterations") or 0),
             vias=len(result.get("new_vias") or ()),
-            path_cells=len(path), elapsed_s=round(elapsed, 6), failure=None)
+            path_cells=len(path), elapsed_s=round(elapsed, 6), failure=None,
+            # ⛔ S7 C1: the copper only when it was ASKED for. A result that
+            # always carried it would move every recorded digest in the arc.
+            segments=(tuple(result.get("new_segments") or ())
+                      if keep_copper else None),
+            new_vias=(tuple(result.get("new_vias") or ())
+                      if keep_copper else None),
+            path=tuple(path) if keep_copper else None,
+            net=own_net)
 
     def probe_pair(self, a, b, **kwargs) -> PairResult:
         """:meth:`route_pair` with the map guaranteed untouched afterwards.
@@ -781,7 +1178,17 @@ class RouteSession:
 
     def _warm_up(self) -> dict:
         """Route and discard one pair so the first caller-visible answer is
-        steady state (defect 4). Records that it happened, and what it cost."""
+        steady state (defect 4). Records that it happened, and what it cost.
+
+        ⛔ ``lift_own_net`` is passed **explicitly**, and it is
+        :meth:`is_liftable`'s answer rather than ``True``: S10 §1 made
+        :meth:`route_pair` refuse an un-liftable lift, and a warm-up that
+        tripped that refusal would make :meth:`from_board` itself unusable on
+        every session built without ``unstamped_nets``/``liftable_nets``. ⭐ The
+        value is identical to the pre-S10 behaviour in **both** directions --
+        where the net was liftable the lift happened, and where it was not the
+        old code lifted nothing either -- so no recorded warm-up moves.
+        """
         by_net = self.pad_pairs_by_net()
         if not by_net:
             raise SessionError(
@@ -792,7 +1199,8 @@ class RouteSession:
         name = sorted(by_net)[0]
         pads = by_net[name]
         started = time.time()
-        result = self.route_pair(pads[0], pads[1])
+        result = self.route_pair(pads[0], pads[1],
+                                 lift_own_net=self.is_liftable(name))
         self._routes = 0
         return {"net": name, "discarded": True,
                 "elapsed_s": round(time.time() - started, 6),

@@ -13,6 +13,9 @@ gates caught, each of which now has a test so it cannot come back.
 
 from __future__ import annotations
 
+import os
+import re
+
 import pytest
 
 from skidl_layout.route_session import (
@@ -137,6 +140,147 @@ def test_add_part_refuses_zero_pads():
     session = _StubSession.build()
     with pytest.raises(SessionError):
         session.add_part("R1", [])
+
+
+# --------------------------------------------------------------------------- #
+# ⭐⭐⭐ S10 §1 -- a pad's own copper walls its own escape
+# --------------------------------------------------------------------------- #
+class _FakeNet:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakePcb:
+    """Just enough board for :meth:`base_stamped_pads` -- names and pad counts."""
+
+    def __init__(self, nets):
+        self.nets = {i: _FakeNet(name) for i, (name, _n) in enumerate(nets, 1)}
+        self.pads_by_net = {i: [object()] * count
+                            for i, (_name, count) in enumerate(nets, 1)}
+
+
+def _walled_session(**kwargs):
+    session = _StubSession.build()
+    session.pcb = _FakePcb([("FBX", 2), ("GND", 9), ("LONELY", 0)])
+    for key, value in kwargs.items():
+        setattr(session, key, tuple(value))
+    return session
+
+
+def test_a_net_is_liftable_only_when_it_was_DECLARED():
+    """⭐ The two ways a net's pads reach the map through ``add_part`` -- and
+    they are the only two ways :meth:`lift_net` can ever take it back out."""
+    assert _walled_session(liftable_nets=["FBX"]).is_liftable("FBX")
+    assert _walled_session(unstamped_nets=["FBX"]).is_liftable("FBX")
+    assert not _walled_session().is_liftable("FBX")
+
+
+def test_base_stamped_pads_counts_only_what_the_BASE_map_holds():
+    """⛔ A name test would be wrong in two directions, so this is a pad count.
+
+    A declared net has zero base-stamped pads because ``from_board`` excludes
+    its net id from ``build_base_obstacle_map``; a net that is not on the board
+    at all has zero because there is nothing to stamp. Only the third case --
+    real pads, undeclared -- is the walled one.
+    """
+    assert _walled_session().base_stamped_pads("FBX") == 2
+    assert _walled_session().base_stamped_pads("GND") == 9
+    assert _walled_session(liftable_nets=["FBX"]).base_stamped_pads("FBX") == 0
+    assert _walled_session(unstamped_nets=["FBX"]).base_stamped_pads("FBX") == 0
+    # ⛔ NOT an error and NOT a wall: a net with no pads cannot wall anything.
+    assert _walled_session().base_stamped_pads("LONELY") == 0
+    assert _walled_session().base_stamped_pads("NOT_ON_THE_BOARD") == 0
+
+
+def test_route_pair_REFUSES_a_lift_it_cannot_give():
+    """⛔⛔⛔ The defect S10 §1 measured, now unreachable.
+
+    ``lift_own_net=True`` used to be a **silent no-op** on an undeclared net,
+    and the resulting answer carried a via on each pad -- via-in-pad produced by
+    the question rather than by the board. The refusal must name **both** ways
+    out, because which one is right depends on whether the caller is building
+    the board up or reading a placed one.
+    """
+    session = _walled_session()
+    with pytest.raises(SessionError) as excinfo:
+        session.route_pair(_FakePad(["F.Cu"], net_name="FBX"),
+                           _FakePad(["F.Cu"], net_name="FBX", x=5.0))
+    message = str(excinfo.value)
+    assert "unstamped_nets" in message and "liftable_nets" in message
+    assert "lift_own_net=False" in message
+    assert "'FBX'" in message
+
+
+def test_the_refusal_is_ONLY_about_the_lift_and_not_about_the_net():
+    """⭐ ``lift_own_net=False`` is a legitimate question -- ``drive_route_session``
+    asks it on purpose -- so the refusal must not touch it. What it reaches
+    instead is the older no-copper refusal, which proves the guard was passed."""
+    session = _walled_session()
+    with pytest.raises(SessionError) as excinfo:
+        session.route_pair(_FakePad(["F.Paste"], net_name="FBX"),
+                           _FakePad(["F.Cu"], net_name="FBX"),
+                           lift_own_net=False)
+    assert "NO COPPER" in str(excinfo.value)
+
+
+def test_a_net_with_no_pads_on_the_board_does_not_trip_the_refusal():
+    """⛔ Rule 3 in the other direction: refusing here would make the guard
+    itself the defect, on every session that ever meets an unpopulated name."""
+    session = _walled_session()
+    with pytest.raises(SessionError) as excinfo:
+        session.route_pair(_FakePad(["F.Paste"], net_name="LONELY"),
+                           _FakePad(["F.Cu"], net_name="LONELY"))
+    assert "NO COPPER" in str(excinfo.value)
+
+
+_HAND_BOARD = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "skidl-eda", "canaries", "lt3844_buck", "lt3844_buck_manual.kicad_pcb")
+
+_HAND_FAB = dict(clearance_mm=0.25, track_width_mm=0.3, via_size_mm=0.6,
+                 via_drill_mm=0.3, grid_step_mm=0.1)
+
+
+def _hand_pair(session, net):
+    pads = session.pad_pairs_by_net().get(net, ())
+    assert len(pads) == 2, f"{net} has {len(pads)} pads, expected the 2-pad case"
+    return pads
+
+
+@needs_krt
+@pytest.mark.skipif(not os.path.isfile(_HAND_BOARD),
+                    reason="hand board not present")
+def test_a_two_pad_tap_routes_on_its_OWN_layer_with_zero_vias():
+    """⭐⭐⭐ S10 §1's claim, on a real placed board, both directions.
+
+    ``VC_C`` is ``RC.2``-``CC.1`` on ``lt3844_buck_manual`` -- two adjacent
+    passives, 2.2 mm apart, both pads ``F.Cu`` only. MEASURED 2026-08-05: with
+    the net declared it routes **2.2 mm on F.Cu with 0 vias**; asked with the
+    walls in place it routes **2.2 mm on B.Cu with 2 vias**, one on each pad.
+    Same board, same fab, same pair -- the difference is entirely the question.
+
+    ⛔ Both halves are asserted. Without the walled half this test would still
+    pass if the lift silently stopped mattering, and then the defect would be
+    back with a green suite.
+    """
+    lifted = RouteSession.from_board(_HAND_BOARD, layers=["F.Cu", "B.Cu"],
+                                     liftable_nets=["VC_C"], **_HAND_FAB)
+    a, b = _hand_pair(lifted, "VC_C")
+    answer = lifted.route_pair(a, b, keep_copper=True)
+    assert answer.routed and answer.vias == 0
+    assert sorted({s.layer for s in answer.segments}) == ["F.Cu"]
+
+    walled = RouteSession.from_board(_HAND_BOARD, layers=["F.Cu", "B.Cu"],
+                                     **_HAND_FAB)
+    c, d = _hand_pair(walled, "VC_C")
+    with pytest.raises(SessionError) as excinfo:
+        walled.route_pair(c, d)
+    assert "VIA ON EACH PAD" in str(excinfo.value)
+    # ⛔ and the mechanism itself, pinned: this is what the refusal is refusing.
+    wall = walled.route_pair(c, d, lift_own_net=False, keep_copper=True)
+    assert wall.routed and wall.vias == 2
+    assert sorted({s.layer for s in wall.segments}) == ["B.Cu"]
+    assert wall.length_mm == answer.length_mm
 
 
 # --------------------------------------------------------------------------- #
@@ -425,13 +569,82 @@ def test_import_krt_reports_a_moved_seam_with_an_actionable_message(monkeypatch)
     assert "divergence must stay ZERO" in message
 
 
+#: ⛔ Import statements only -- **never a bare substring scan.**
+#:
+#: This guard used to test ``"route_session" in path.read_text()``, which is a
+#: false-positive generator: a module that merely *names* this one in a
+#: **docstring** ("same leaf discipline as ``route_session``") failed it while
+#: importing nothing. MEASURED 2026-08-03 -- ``skidl_layout/escape_map.py`` was
+#: added, said exactly that in its module docstring, and cost a full ~9-minute
+#: suite run to diagnose. ⭐ The property being guarded is *"nothing imports
+#: it"*, so the guard should read imports; prose about a module is documentation
+#: and the arc wants more of it, not less.
+#:
+#: The four forms that are real imports, all covered and all self-tested below:
+#: ``from [pkg.]route_session import X`` · ``from . import route_session`` ·
+#: ``import [pkg.]route_session`` · ``importlib.import_module("...route_session")``.
+_ROUTE_SESSION_IMPORT_RE = re.compile(
+    r"^[ \t]*(?:"
+    r"from[ \t]+[.\w]*\broute_session\b[ \t]+import"
+    #: ⚠ ``[^#\n]`` and not ``[^\n]``: a **trailing comment** on an unrelated
+    #: import ("from typing import Literal  # route_session needs this") is
+    #: prose, and the whole point of this rewrite is that prose is allowed.
+    r"|from[ \t]+[.\w]+[ \t]+import[ \t]+[^#\n]*\broute_session\b"
+    r"|import[ \t]+[^#\n]*\broute_session\b"
+    r")"
+    r"|import_module\([^)]*\broute_session\b",
+    re.MULTILINE,
+)
+
+
 def test_route_session_is_a_leaf_module():
     """⛔ Nothing in the placement engine may import it, or an import-time KRT
     dependency reaches the engine and the "KRT absent" path breaks."""
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1] / "skidl_layout"
-    importers = [path.name for path in root.glob("*.py")
-                 if path.name != "route_session.py"
-                 and "route_session" in path.read_text(encoding="utf-8")]
+    importers = []
+    for path in sorted(root.glob("*.py")):
+        if path.name == "route_session.py":
+            continue
+        for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1):
+            if _ROUTE_SESSION_IMPORT_RE.search(line):
+                importers.append(f"{path.name}:{number}: {line.strip()}")
     assert importers == [], f"route_session is imported by {importers}"
+
+
+def test_the_leaf_guard_matches_imports_and_not_prose():
+    """⭐ The guard's own guard, and the thing whose absence cost a suite run.
+
+    ⛔ A pattern that is *too narrow* silently stops guarding, and a pattern
+    that is *too broad* fails on a comment -- so both directions are asserted
+    here rather than trusted.
+    """
+    imports = [
+        "from .route_session import RouteSession",
+        "from route_session import RouteSession",
+        "from skidl_layout.route_session import RouteSession",
+        "    from .route_session import RouteSession",      # function-local
+        "from . import route_session",
+        "from skidl_layout import route_session",
+        "import route_session",
+        "import skidl_layout.route_session",
+        "import skidl_layout.route_session as RS",
+        '    mod = importlib.import_module("skidl_layout.route_session")',
+    ]
+    prose = [
+        "# same leaf discipline as route_session",
+        '    """Same discipline as :mod:`~skidl_layout.route_session`."""',
+        "    # ⛔ do not import route_session here",
+        "ROUTE_SESSION_NOTE = 'route_session stays a leaf'",
+        "#: route_session is the sibling this mirrors",
+        "from typing import Literal  # route_session mirrors this vocabulary",
+        "import os  # route_session does its own path handling",
+    ]
+    missed = [line for line in imports
+              if not _ROUTE_SESSION_IMPORT_RE.search(line)]
+    tripped = [line for line in prose
+               if _ROUTE_SESSION_IMPORT_RE.search(line)]
+    assert not missed, f"the guard would MISS these real imports: {missed}"
+    assert not tripped, f"the guard falsely trips on this prose: {tripped}"
